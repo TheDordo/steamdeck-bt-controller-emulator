@@ -6,3 +6,7 @@
 # PSMs 0x11/0x13, which the kernel only permits with CAP_NET_BIND_SERVICE.
 # Adjust the path if the app is installed somewhere other than ~/steamdeck-bt-controller-emulator.
 %bluetooth ALL=(root) NOPASSWD: /usr/bin/python3 /home/deck/steamdeck-bt-controller-emulator/scripts/hid-l2cap-bridge.py *
+
+# Allow cleaning up orphaned bridges from previous crashed runs (they hold
+# PSM 0x11/0x13; without this the app cannot free the ports on its own).
+%bluetooth ALL=(root) NOPASSWD: /usr/bin/pkill -f hid-l2cap-bridge*

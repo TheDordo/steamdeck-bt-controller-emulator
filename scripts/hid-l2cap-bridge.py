@@ -42,6 +42,18 @@ def pump(a, b):
                 return
 
 
+def try_free_hidp():
+    """Best-effort unload of the kernel hidp module (HID host role)."""
+    try:
+        subprocess.run(
+            ["modprobe", "-r", "hidp"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def diagnose_busy():
     """Collect evidence about who holds the well-known HID PSMs."""
     parts = []
@@ -68,14 +80,43 @@ def diagnose_busy():
         )
     except Exception:
         parts.append("(could not run lsmod)")
+    try:
+        out = subprocess.run(
+            ["ss", "-f", "bluetooth", "-lpn"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [
+            l for l in out.stdout.splitlines()
+            if " 17 " in l or " 19 " in l or "psm" in l.lower() or "0x11" in l or "0x13" in l
+        ]
+        parts.append(
+            "ss bluetooth listeners (PIDs shown):\n"
+            + ("\n".join(lines) if lines else "  (none listed)")
+        )
+    except Exception:
+        parts.append("(ss -f bluetooth unsupported)")
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=5,
+        )
+        lines = [
+            l for l in out.stdout.splitlines()
+            if "hogp" in l or "hid-l2cap" in l
+        ]
+        parts.append(
+            "matching processes:\n" + ("\n".join(lines) if lines else "  (none)")
+        )
+    except Exception:
+        parts.append("(could not run ps)")
     return "\n".join(parts)
 
 
 def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
     """Bind one PSM, tolerating a briefly-busy port (a previous bridge
     instance still dying) and freeing the kernel hidp module's well-known
-    PSMs once if it holds them."""
+    PSMs if it holds them."""
     last_err = None
+    try_free_hidp()  # free the ports before the first attempt
     for attempt in range(attempts):
         try:
             listener.bind((bdaddr, psm))
@@ -85,18 +126,8 @@ def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
             if e.errno not in (errno.EADDRINUSE, errno.EACCES):
                 raise
             if attempt == 3 or attempt == attempts - 2:
-                # The kernel's hidp module (HID host role) holds 0x11/0x13
-                # while a Bluetooth keyboard/mouse is connected to this
-                # machine. Try unloading it; it fails harmlessly when a
-                # session is still active.
-                try:
-                    subprocess.run(
-                        ["modprobe", "-r", "hidp"],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                except Exception:
-                    pass
+                # hidp can be re-loaded by BlueZ mid-flight; retry unloading.
+                try_free_hidp()
             time.sleep(delay)
     print(
         "HID L2CAP bridge: PSM 0x%x is still busy (%s).\n%s\n"
