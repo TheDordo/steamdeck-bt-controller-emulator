@@ -32,6 +32,7 @@ from hogp.bluez import (
     get_primary_connected_device,
     set_adapter_alias,
     reset_adapter_to_default_state,
+    acquire_app_bus_name,
 )
 from hogp.gatt_app import GattApplication
 from hogp.adv import Advertisement
@@ -814,6 +815,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         try:
             # Get D-Bus connection
             self._bus = get_system_bus()
+            if not acquire_app_bus_name(self._bus):
+                logger.warning("D-Bus name com.steamdeck.hogp not acquired; re-run installer if BT fails")
             
             # Find adapter
             self._adapter_path = find_adapter_path(self._bus, "hci0")
@@ -868,16 +871,27 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 script_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'scripts')
                 script_path = os.path.join(script_dir, 'setup-usb-gadget.sh')
                 
-                # Run setup script with pkexec (GUI sudo prompt)
                 try:
-                    result = subprocess.run(
+                    result = None
+                    for cmd in (
+                        ['sudo', '-n', 'bash', script_path],
                         ['pkexec', 'bash', script_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=30
-                    )
-                    if result.returncode != 0:
-                        GLib.idle_add(self._show_error, f"USB gadget setup failed: {result.stderr}")
+                    ):
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        if result.returncode == 0:
+                            break
+                    if not result or result.returncode != 0:
+                        detail = (result.stderr or result.stdout or "unknown error").strip()
+                        GLib.idle_add(
+                            self._show_error,
+                            "USB gadget setup failed. Set a user password (passwd), enable "
+                            f"BIOS USB DRD, re-run install.sh, then retry. Details: {detail[:400]}",
+                        )
                         return
                     logger.info("USB gadget setup successful")
                 except subprocess.TimeoutExpired:
@@ -891,11 +905,20 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             self._usb_gadget = USBGadgetHID(verbose=False)
             
             if not self._usb_gadget.open():
-                GLib.idle_add(self._show_error, "Failed to open USB gadget devices. Setup may have failed.")
+                GLib.idle_add(
+                    self._show_error,
+                    "No /dev/hidg* devices. Run scripts/diagnose.sh in Konsole (BIOS DRD + data USB cable).",
+                )
                 return
             
             self._running = True
-            self._start_input_handler()
+            if not self._start_input_handler_sync():
+                GLib.idle_add(
+                    self._show_error,
+                    "USB gadget is up but no controller input found. Use Desktop Mode; quit Steam "
+                    "if the built-in controls are busy.",
+                )
+                return
             
             GLib.idle_add(self._update_status_wired_active)
             
@@ -967,8 +990,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
         return False
     
-    def _start_input_handler(self):
-        """Start forwarding physical controller input."""
+    def _start_input_handler_sync(self) -> bool:
+        """Start forwarding physical controller input; return whether a device was found."""
         self._input_handler = InputHandler(
             device_path=None,  # Auto-detect
             on_button_change=self._on_button,
@@ -977,13 +1000,21 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             on_hat_change=self._on_hat,
             verbose=False,
         )
-        
         if self._input_handler.start():
             logger.info("Input forwarding started")
+            return True
+        logger.warning("No input device detected")
+        return False
+
+    def _start_input_handler(self):
+        """Start forwarding physical controller input (Bluetooth path)."""
+        if self._start_input_handler_sync():
             GLib.idle_add(self._update_connection_label, "Input device connected")
         else:
-            logger.warning("No input device detected")
-            GLib.idle_add(self._update_connection_label, "No physical controller found")
+            GLib.idle_add(
+                self._update_connection_label,
+                "No gamepad evdev node — service up, input may be missing",
+            )
     
     def _on_button(self, index, pressed):
         """Handle button event from physical controller."""

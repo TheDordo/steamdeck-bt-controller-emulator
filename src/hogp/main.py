@@ -27,6 +27,7 @@ from .bluez import (
     get_adapter_index,
     set_adapter_alias,
     reset_adapter_to_default_state,
+    acquire_app_bus_name,
 )
 from .gatt_app import GattApplication
 from .adv import Advertisement
@@ -95,6 +96,7 @@ class HoGPeripheral:
         try:
             self._bus = get_system_bus()
             logger.info(f"Connected to system bus: {self._bus.get_unique_name()}")
+            acquire_app_bus_name(self._bus)
         except Exception as e:
             logger.error(f"Failed to connect to system bus: {e}")
             return 1

@@ -265,13 +265,48 @@ def unregister_advertisement_async(
 
 
 def ensure_adapter_powered_and_discoverable(bus: Gio.DBusConnection, adapter_path: str) -> bool:
-    """Ensure the adapter is powered on and set to be discoverable (for pairing)."""
-    # Power on
+    """Ensure the adapter is powered on and pairable/discoverable for HoG."""
     if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
         return False
-    # Make discoverable (optional for BLE, but helps)
+    set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True))
     set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", True))
+    # BlueZ 5.76+ on SteamOS uses a finite discoverable window (0 = no timeout).
+    set_adapter_property(
+        bus,
+        adapter_path,
+        "DiscoverableTimeout",
+        GLib.Variant("u", 0),
+    )
     return True
+
+
+def acquire_app_bus_name(bus: Gio.DBusConnection, name: str = "com.steamdeck.hogp") -> bool:
+    """Request a well-known D-Bus name (required by some BlueZ versions)."""
+    try:
+        flags = 0x1 | 0x4  # ALLOW_REPLACEMENT | DO_NOT_QUEUE
+        result = bus.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "RequestName",
+            GLib.Variant("(su)", (name, flags)),
+            GLib.VariantType("(u)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        reply_code = result.get_child_value(0).get_uint32()
+        if reply_code in (1, 2):
+            logger.info(f"D-Bus name acquired: {name}")
+            return True
+        if reply_code == 3:
+            logger.warning(f"D-Bus name {name} queued (unexpected)")
+            return True
+        logger.warning(f"RequestName for {name} returned code {reply_code}")
+        return False
+    except GLib.Error as e:
+        logger.warning(f"Could not acquire D-Bus name {name}: {e}")
+        return False
 
 
 def get_adapter_index(adapter_name: str = "hci0") -> int:

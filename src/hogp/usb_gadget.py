@@ -128,20 +128,6 @@ class USBGadgetHID:
                 logger.warning(f"Error closing gamepad device: {e}")
             self._gamepad_fd = None
         
-    def close(self) -> None:
-        """Close all HID gadget devices."""
-        if not self._active:
-            return
-        
-        logger.info("Closing USB gadget HID devices...")
-        
-        if self._gamepad_fd is not None:
-            try:
-                os.close(self._gamepad_fd)
-            except Exception as e:
-                logger.warning(f"Error closing gamepad device: {e}")
-            self._gamepad_fd = None
-        
         if self._keyboard_fd is not None:
             try:
                 os.close(self._keyboard_fd)

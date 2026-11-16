@@ -114,7 +114,22 @@ sudo cp "$INSTALL_DIR/config/bt-controller-emulator-sudoers" /etc/sudoers.d/bt-c
     exit 1
 }
 sudo chmod 0440 /etc/sudoers.d/bt-controller-emulator
+# Passwordless USB gadget setup/cleanup for this user (paths are install-specific)
+USB_SUDOERS="/etc/sudoers.d/bt-controller-emulator-usb-${CURRENT_USER}"
+sudo tee "$USB_SUDOERS" > /dev/null << EOF
+# BT Controller Emulator — USB gadget scripts for ${CURRENT_USER}
+${CURRENT_USER} ALL=(root) NOPASSWD: ${INSTALL_DIR}/scripts/setup-usb-gadget.sh
+${CURRENT_USER} ALL=(root) NOPASSWD: ${INSTALL_DIR}/scripts/cleanup-usb-gadget.sh
+EOF
+sudo chmod 0440 "$USB_SUDOERS"
 echo "✓ Sudoers rule installed"
+
+# udev: /dev/hidg* for input group
+echo "Installing udev rule for USB gadget HID nodes..."
+sudo cp "$INSTALL_DIR/config/99-steamdeck-hidg.rules" /etc/udev/rules.d/99-steamdeck-hidg.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+echo "✓ udev rule installed"
 
 # Reload D-Bus
 echo "Reloading D-Bus..."
@@ -175,6 +190,7 @@ echo "  2. Select Bluetooth or Wired USB mode"
 echo "  3. Click 'Start Service'"
 echo "  4. Connect from another device"
 echo
-echo "To update:  curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/install.sh | bash"
+echo "Diagnostics: $INSTALL_DIR/scripts/diagnose.sh"
+echo "To update:  curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash"
 echo "To uninstall: curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/uninstall.sh | bash"
 echo

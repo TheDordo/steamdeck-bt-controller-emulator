@@ -1,0 +1,2 @@
+# USB gadget HID nodes created by setup-usb-gadget.sh
+KERNEL=="hidg*", MODE="0660", GROUP="input"

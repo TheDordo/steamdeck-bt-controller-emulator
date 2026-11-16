@@ -94,39 +94,75 @@ class InputHandler:
         self._dpad_x = 0  # -1 left, 0 center, 1 right
         self._dpad_y = 0  # -1 up, 0 center, 1 down
 
-    def find_xbox_controller(self) -> Optional[str]:
+    def find_gamepad_device(self) -> Optional[str]:
         """
-        Auto-detect Xbox 360 controller device.
-        
+        Auto-detect the best local gamepad for forwarding (Steam Deck built-in first).
+
         Returns:
             Device path if found, None otherwise
         """
         try:
-            devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
-            for device in devices:
-                name = device.name.lower()
-                # Look for Xbox 360 controller or similar
-                if 'xbox' in name or '360 pad' in name or 'x-box' in name:
-                    logger.info(f"Found controller: {device.name} at {device.path}")
-                    return device.path
-            
-            # Fallback: look for any gamepad with the right capabilities
-            for device in devices:
+            candidates: list[tuple[int, str, str]] = []
+
+            for path in sorted(evdev.list_devices()):
+                try:
+                    device = InputDevice(path)
+                except (OSError, PermissionError) as e:
+                    logger.debug(f"Skipping {path}: {e}")
+                    continue
+
+                name = device.name
+                name_lower = name.lower()
                 caps = device.capabilities()
-                # Check if it has gamepad buttons and axes
-                if ecodes.EV_KEY in caps and ecodes.EV_ABS in caps:
-                    keys = caps[ecodes.EV_KEY]
-                    # Check for common gamepad buttons
-                    if ecodes.BTN_SOUTH in keys and ecodes.BTN_EAST in keys:
-                        logger.info(f"Found gamepad: {device.name} at {device.path}")
-                        return device.path
-            
-            logger.warning("No Xbox controller or suitable gamepad found")
-            return None
-            
+                keys = caps.get(ecodes.EV_KEY, [])
+                if ecodes.BTN_SOUTH not in keys or ecodes.BTN_EAST not in keys:
+                    device.close()
+                    continue
+
+                vendor = device.info.vendor
+                product = device.info.product
+                priority = 50
+
+                # Built-in Steam Deck controls (evdev), highest priority
+                if vendor == 0x28DE and product in (0x1205, 0x1206):
+                    priority = 0
+                elif "valve software steam deck" in name_lower or "steam deck controller" in name_lower:
+                    priority = 1
+                # Steam Input virtual Xbox pad (common in Desktop Mode)
+                elif vendor == 0x28DE and product == 0x11FF:
+                    priority = 2
+                elif "xbox" in name_lower or "360 pad" in name_lower or "x-box" in name_lower:
+                    priority = 3
+                else:
+                    priority = 10
+
+                candidates.append((priority, path, name))
+                device.close()
+
+            if not candidates:
+                logger.warning(
+                    "No gamepad input node found. Use Desktop Mode, set a user password "
+                    "for USB setup, and ensure Steam isn't exclusively holding the controller."
+                )
+                return None
+
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            best = candidates[0]
+            logger.info(f"Using gamepad [{best[0]}]: {best[2]} at {best[1]}")
+            if len(candidates) > 1:
+                logger.info(
+                    "Other candidates: %s",
+                    ", ".join(f"{n} ({p})" for _, p, n in candidates[1:4]),
+                )
+            return best[1]
+
         except Exception as e:
             logger.error(f"Error detecting controller: {e}")
             return None
+
+    def find_xbox_controller(self) -> Optional[str]:
+        """Backward-compatible alias for find_gamepad_device()."""
+        return self.find_gamepad_device()
 
     def start(self) -> bool:
         """
@@ -272,17 +308,30 @@ class InputHandler:
                 self.on_trigger_change(trigger_index, value)
         
         # Handle D-pad (HAT axes -> HAT switch direction)
-        elif axis_code == 16:  # ABS_HAT0X
+        elif axis_code in (16, ecodes.ABS_HAT0X):  # ABS_HAT0X
             old_x = self._dpad_x
             self._dpad_x = raw_value  # -1, 0, or 1
             
             if old_x != self._dpad_x:
                 self._update_hat()
         
-        elif axis_code == 17:  # ABS_HAT0Y
+        elif axis_code in (17, ecodes.ABS_HAT0Y):  # ABS_HAT0Y
             old_y = self._dpad_y
             self._dpad_y = raw_value  # -1, 0, or 1
             
+            if old_y != self._dpad_y:
+                self._update_hat()
+
+        # Steam Input virtual pad often uses separate ABS axes for D-pad
+        elif axis_code in (6,):  # ABS_* used as D-pad X on Steam virtual gamepad
+            old_x = self._dpad_x
+            self._dpad_x = max(-1, min(1, raw_value))
+            if old_x != self._dpad_x:
+                self._update_hat()
+
+        elif axis_code in (7,):  # ABS_* used as D-pad Y on Steam virtual gamepad
+            old_y = self._dpad_y
+            self._dpad_y = max(-1, min(1, raw_value))
             if old_y != self._dpad_y:
                 self._update_hat()
 

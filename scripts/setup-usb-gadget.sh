@@ -53,10 +53,16 @@ if ! mountpoint -q /sys/kernel/config; then
     mount -t configfs none /sys/kernel/config
 fi
 
-# Check if gadget already exists
+# Reuse or replace an existing gadget configuration
 if [ -d "${GADGET_DIR}" ]; then
-    echo "Warning: Gadget ${GADGET_NAME} already exists"
-    echo "Run cleanup-usb-gadget.sh first to remove it"
+    echo "Existing gadget found — cleaning up before re-creating..."
+    bash "${SCRIPT_DIR}/cleanup-usb-gadget.sh"
+fi
+
+if [ -z "$(ls -A /sys/class/udc 2>/dev/null)" ]; then
+    echo "Error: No UDC in /sys/class/udc."
+    echo "Enable BIOS: Advanced -> USB Configuration -> USB Dual Role Device -> DRD"
+    echo "Then cold boot, connect a data-capable USB-C cable, and retry."
     exit 1
 fi
 
