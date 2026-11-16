@@ -1,3 +1,8 @@
 # Allow bt-controller-emulator to run btmgmt without password
 # This is needed to set the static BLE address
 %bluetooth ALL=(root) NOPASSWD: /usr/bin/btmgmt
+
+# Allow the HID L2CAP bridge without password: it binds the well-known HID
+# PSMs 0x11/0x13, which the kernel only permits with CAP_NET_BIND_SERVICE.
+# Adjust the path if the app is installed somewhere other than ~/steamdeck-bt-controller-emulator.
+%bluetooth ALL=(root) NOPASSWD: /usr/bin/python3 /home/deck/steamdeck-bt-controller-emulator/scripts/hid-l2cap-bridge.py *

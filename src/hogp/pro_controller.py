@@ -22,8 +22,10 @@ Protocol references:
 """
 
 import logging
+import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -41,6 +43,12 @@ PRO_CLASS_OF_DEVICE = 0x002508  # Peripheral / Gamepad
 # L2CAP PSMs used by the HID profile
 HID_CTRL_PSM = 0x11
 HID_INTR_PSM = 0x13
+
+# Abstract unix sockets used between this app and the root L2CAP bridge.
+# The kernel requires CAP_NET_BIND_SERVICE for well-known PSMs, so the
+# bridge binds 0x11/0x13 and relays to us over these.
+UNIX_CTRL_NAME = "\0hogp-pro-ctrl"
+UNIX_INTR_NAME = "\0hogp-pro-intr"
 
 # HIDP transaction header byte for DATA packets
 HIDP_DATA = 0xA0
@@ -277,10 +285,11 @@ class ProControllerEmulator:
         self._connected = False
         self._streaming = False
 
-        self._ctl_sock: Optional[socket.socket] = None   # listening socket PSM 0x11
-        self._itr_sock: Optional[socket.socket] = None   # listening socket PSM 0x13
+        self._ctl_sock: Optional[socket.socket] = None   # unix listener, control channel
+        self._itr_sock: Optional[socket.socket] = None   # unix listener, interrupt channel
         self._ctl_conn: Optional[socket.socket] = None   # accepted control conn
         self._itr_conn: Optional[socket.socket] = None   # accepted interrupt conn
+        self._bridge_proc: Optional[subprocess.Popen] = None  # sudo L2CAP bridge
         self._conn_lock = threading.Lock()
 
         self._threads = []
@@ -323,23 +332,59 @@ class ProControllerEmulator:
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> bool:
-        """Bind L2CAP PSM sockets. Adapter/SDP setup happens via bluez helpers
-        before this is called (see bluez.configure_adapter_for_pro_controller
-        and bluez.register_hid_sdp_profile)."""
+        """Create the local channel sockets and spawn the privileged L2CAP
+        bridge (PSM 0x11/0x13 need CAP_NET_BIND_SERVICE). Adapter/SDP setup
+        happens via bluez helpers before this is called."""
         if self._running:
             return True
         try:
-            self._ctl_sock = self._bind_psm(HID_CTRL_PSM)
-            self._itr_sock = self._bind_psm(HID_INTR_PSM)
+            self._ctl_sock = self._bind_unix(UNIX_CTRL_NAME)
+            self._itr_sock = self._bind_unix(UNIX_INTR_NAME)
         except OSError as e:
-            logger.error(f"Could not bind HID L2CAP sockets: {e}")
+            logger.error(f"Could not create local channel sockets: {e}")
+            self.stop()
+            return False
+
+        bridge_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "scripts", "hid-l2cap-bridge.py",
+        )
+        try:
+            self._bridge_proc = subprocess.Popen(
+                [
+                    "sudo", "-n", "python3", bridge_path,
+                    "--ctrl", UNIX_CTRL_NAME,
+                    "--intr", UNIX_INTR_NAME,
+                    "--bdaddr", self.adapter_address,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.error("sudo is not available for the L2CAP bridge")
+            self.stop()
+            return False
+
+        # Fail fast when passwordless sudo is missing (bridge exits at once).
+        try:
+            _out, err = self._bridge_proc.communicate(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            err = b""  # still running — good
+        if err:
+            logger.error(
+                "HID L2CAP bridge failed to start: %s",
+                err.decode(errors="replace").strip(),
+            )
             self.stop()
             return False
 
         self._running = True
         self._spawn(self._accept_loop, (self._ctl_sock, "control"))
         self._spawn(self._accept_loop, (self._itr_sock, "interrupt"))
-        logger.info(f"Pro Controller emulator listening on PSM {HID_CTRL_PSM:#x}/{HID_INTR_PSM:#x}")
+        logger.info(
+            "Pro Controller emulator listening (PSM 0x%x/0x%x via sudo bridge)",
+            HID_CTRL_PSM, HID_INTR_PSM,
+        )
         return True
 
     def stop(self) -> None:
@@ -355,14 +400,28 @@ class ProControllerEmulator:
                 except OSError:
                     pass
         self._ctl_sock = self._itr_sock = self._ctl_conn = self._itr_conn = None
+        if self._bridge_proc is not None:
+            try:
+                self._bridge_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._bridge_proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self._bridge_proc.kill()
+                except Exception:
+                    pass
+            self._bridge_proc = None
         self._connected = False
         self._streaming = False
         self._threads = []
 
-    def _bind_psm(self, psm: int) -> socket.socket:
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.adapter_address, psm))
+    def _bind_unix(self, name: str) -> socket.socket:
+        """Listen on an abstract unix SOCK_SEQPACKET socket (no filesystem
+        cleanup needed); the root bridge connects here after accepting L2CAP."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.bind(name)
         sock.listen(1)
         return sock
 

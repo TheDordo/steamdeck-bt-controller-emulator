@@ -81,6 +81,8 @@ Switching between Gamepad and Keyboard profile requires **Stop Service → switc
 
 1. Select **Bluetooth** + **Gamepad (macOS)** profile
 2. **Start Service** — wait for **Active - Pro Controller**
+
+> Gamepad mode launches a tiny privileged bridge (`scripts/hid-l2cap-bridge.py`, passwordless sudo) that binds the HID L2CAP ports (the kernel only allows root to bind well-known PSMs). The installer installs the sudoers rule for it — re-run install.sh after updating if the app reports the bridge failed to start.
 3. On the Mac: **System Settings → Bluetooth** → find **Pro Controller** → **Connect**
 4. Accept the **Bluetooth Pairing Request** (Just Works, no PIN)
 5. The Deck UI shows **✓ Paired — streaming as Pro Controller**

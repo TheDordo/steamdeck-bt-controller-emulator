@@ -1059,9 +1059,10 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 unregister_hid_sdp_profile(self._bus)
                 self._pro_sdp_registered = False
                 self._show_error(
-                    "Could not bind HID L2CAP sockets (PSM 0x11/0x13). If the "
-                    "ports are in use, run 'sudo modprobe -r hidp' in Konsole "
-                    "and try again."
+                    "Could not start the HID L2CAP bridge (PSM 0x11/0x13). "
+                    "Re-run install.sh to install the sudoers rule, or add it "
+                    "manually (see config/bt-controller-emulator-sudoers). If "
+                    "the ports are in use, 'sudo modprobe -r hidp' may help."
                 )
                 return False
 
