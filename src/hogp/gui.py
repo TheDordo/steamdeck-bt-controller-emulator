@@ -1058,12 +1058,11 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             if not self._pro_controller.start():
                 unregister_hid_sdp_profile(self._bus)
                 self._pro_sdp_registered = False
-                self._show_error(
-                    "Could not start the HID L2CAP bridge (PSM 0x11/0x13). "
-                    "Re-run install.sh to install the sudoers rule, or add it "
-                    "manually (see config/bt-controller-emulator-sudoers). If "
-                    "the ports are in use, 'sudo modprobe -r hidp' may help."
+                detail = (
+                    getattr(self._pro_controller, "last_error", "")
+                    or "unknown reason (see /tmp/hogp-bridge.log)"
                 )
+                self._show_error(f"Could not start the HID L2CAP bridge: {detail}")
                 return False
 
             self._registered = True

@@ -42,6 +42,35 @@ def pump(a, b):
                 return
 
 
+def diagnose_busy():
+    """Collect evidence about who holds the well-known HID PSMs."""
+    parts = []
+    try:
+        out = subprocess.run(
+            ["cat", "/proc/net/l2cap"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [l for l in out.stdout.splitlines() if "0011" in l or "0013" in l]
+        parts.append(
+            "L2CAP listeners on PSM 0x11/0x13 (kernel 'hidp' lines mean a "
+            "Bluetooth keyboard/mouse session on this machine):\n"
+            + ("\n".join(lines) if lines else "  (none listed)")
+        )
+    except Exception:
+        parts.append("(could not read /proc/net/l2cap)")
+    try:
+        out = subprocess.run(
+            ["lsmod"], capture_output=True, text=True, timeout=5,
+        )
+        hidp = [l for l in out.stdout.splitlines() if l.startswith("hidp")]
+        parts.append(
+            "hidp module: " + ("LOADED: " + hidp[0] if hidp else "not loaded")
+        )
+    except Exception:
+        parts.append("(could not run lsmod)")
+    return "\n".join(parts)
+
+
 def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
     """Bind one PSM, tolerating a briefly-busy port (a previous bridge
     instance still dying) and freeing the kernel hidp module's well-known
@@ -55,11 +84,11 @@ def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
             last_err = e
             if e.errno not in (errno.EADDRINUSE, errno.EACCES):
                 raise
-            if attempt == 3:
+            if attempt == 3 or attempt == attempts - 2:
                 # The kernel's hidp module (HID host role) holds 0x11/0x13
                 # while a Bluetooth keyboard/mouse is connected to this
-                # machine. Try unloading it once; it fails harmlessly when
-                # a session is active.
+                # machine. Try unloading it; it fails harmlessly when a
+                # session is still active.
                 try:
                     subprocess.run(
                         ["modprobe", "-r", "hidp"],
@@ -70,10 +99,13 @@ def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
                     pass
             time.sleep(delay)
     print(
-        "HID L2CAP bridge: PSM 0x%x is still busy (%s). "
-        "Kill stray app instances (pgrep -af hogp) or disconnect Bluetooth "
-        "keyboards/mice from this machine, then restart."
-        % (psm, last_err),
+        "HID L2CAP bridge: PSM 0x%x is still busy (%s).\n%s\n"
+        "Recovery: pgrep -af 'hogp|hid-l2cap' to find strays, then\n"
+        "  sudo pkill -f 'hid-l2cap-bridg[e]'\n"
+        "and/or disconnect Bluetooth keyboards/mice from this machine\n"
+        "('bluetoothctl devices Connected' + 'bluetoothctl disconnect <MAC>'),\n"
+        "then start the service again."
+        % (psm, last_err, diagnose_busy()),
         file=sys.stderr,
     )
     return False

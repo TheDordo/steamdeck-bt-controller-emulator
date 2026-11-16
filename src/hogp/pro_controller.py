@@ -291,6 +291,8 @@ class ProControllerEmulator:
         self._ctl_conn: Optional[socket.socket] = None   # accepted control conn
         self._itr_conn: Optional[socket.socket] = None   # accepted interrupt conn
         self._bridge_proc: Optional[subprocess.Popen] = None  # sudo L2CAP bridge
+        self._bridge_log = None  # bridge stderr capture (GUI has no console)
+        self.last_error: Optional[str] = None  # detailed start failure reason
         self._conn_lock = threading.Lock()
 
         self._threads = []
@@ -336,13 +338,15 @@ class ProControllerEmulator:
         """Create the local channel sockets and spawn the privileged L2CAP
         bridge (PSM 0x11/0x13 need CAP_NET_BIND_SERVICE). Adapter/SDP setup
         happens via bluez helpers before this is called."""
+        self.last_error = None
         if self._running:
             return True
         try:
             self._ctl_sock = self._bind_unix(UNIX_CTRL_NAME)
             self._itr_sock = self._bind_unix(UNIX_INTR_NAME)
         except OSError as e:
-            logger.error(f"Could not create local channel sockets: {e}")
+            self.last_error = f"local channel sockets: {e}"
+            logger.error("Could not create local channel sockets: %s", e)
             self.stop()
             return False
 
@@ -350,6 +354,11 @@ class ProControllerEmulator:
             os.path.dirname(os.path.abspath(__file__)),
             "..", "..", "scripts", "hid-l2cap-bridge.py",
         )
+        bridge_log_path = "/tmp/hogp-bridge.log"
+        try:
+            self._bridge_log = open(bridge_log_path, "w")
+        except OSError:
+            self._bridge_log = None
         # Kill orphaned bridges from previous crashed runs (they hold the
         # well-known PSMs). The bracketed pattern avoids matching pkill's
         # own command line.
@@ -370,20 +379,22 @@ class ProControllerEmulator:
                     "--bdaddr", self.adapter_address,
                 ],
                 stdout=subprocess.DEVNULL,
+                stderr=self._bridge_log,
             )
         except (FileNotFoundError, ValueError, OSError) as e:
+            self.last_error = f"launch: {e}"
             logger.error("Could not launch the L2CAP bridge: %s", e)
             self.stop()
             return False
 
         # Fail fast when passwordless sudo is missing (bridge exits at once).
-        # Bridge stderr is inherited, so its errors show in the console.
         time.sleep(1.0)
         if self._bridge_proc.poll() not in (None, 0):
-            logger.error(
-                "HID L2CAP bridge exited immediately — passwordless sudo "
-                "missing or the bridge crashed (run from Konsole for details)"
+            self.last_error = (
+                "bridge exited immediately: "
+                + self._bridge_log_tail(bridge_log_path)
             )
+            logger.error("HID L2CAP bridge exited immediately: %s", self.last_error)
             self.stop()
             return False
 
@@ -423,6 +434,12 @@ class ProControllerEmulator:
                 except Exception:
                     pass
             self._bridge_proc = None
+        if self._bridge_log is not None:
+            try:
+                self._bridge_log.close()
+            except Exception:
+                pass
+            self._bridge_log = None
         self._connected = False
         self._streaming = False
         self._threads = []
@@ -440,6 +457,16 @@ class ProControllerEmulator:
         t.start()
         self._threads.append(t)
 
+    @staticmethod
+    def _bridge_log_tail(path: str, limit: int = 300) -> str:
+        """Last lines of the bridge's stderr log (surfaced in UI errors)."""
+        try:
+            with open(path, "r", errors="replace") as f:
+                text = f.read().strip()
+            return text[-limit:] if text else "(empty bridge log)"
+        except OSError:
+            return "(no bridge log)"
+
     def _monitor_bridge(self) -> None:
         """Warn when the privileged bridge dies unexpectedly."""
         proc = self._bridge_proc
@@ -448,9 +475,10 @@ class ProControllerEmulator:
         proc.wait()
         if self._running and self._bridge_proc is proc:
             logger.error(
-                "HID L2CAP bridge exited unexpectedly — if the PSMs were "
+                "HID L2CAP bridge exited unexpectedly: %s — if the PSMs were "
                 "busy: pgrep -af hogp (kill stray app instances) or "
-                "'sudo modprobe -r hidp' (disconnect BT keyboards/mice first)"
+                "'sudo modprobe -r hidp' (disconnect BT keyboards/mice first)",
+                self._bridge_log_tail("/tmp/hogp-bridge.log"),
             )
             self._connected = False
             self._streaming = False

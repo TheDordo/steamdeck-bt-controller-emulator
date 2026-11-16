@@ -25,8 +25,13 @@ if [ -d "$INSTALL_DIR/.git" ]; then
     echo "Updating existing installation..."
     cd "$INSTALL_DIR"
     git remote set-url origin "$REPO_URL"
-    git stash push -u -m "install.sh stash $(date -Iseconds)" 2>/dev/null || git stash -u
-    git pull --rebase origin main
+    if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+        git pull --rebase origin main
+    else
+        echo "⚠ Local changes detected — skipping the git update so your work"
+        echo "  is not stashed away. Your current local files (including"
+        echo "  config/) are what get installed below."
+    fi
 else
     echo "Installing to $INSTALL_DIR..."
     git clone "$REPO_URL" "$INSTALL_DIR"
