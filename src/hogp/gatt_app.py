@@ -10,7 +10,8 @@ Implements:
 
 import logging
 import struct
-from typing import Dict, List, Any, Optional, Callable
+import time
+from typing import Dict, List, Any, Optional, Callable, Tuple
 
 from gi.repository import Gio, GLib
 
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # Default configuration
 DEFAULT_REPORT_RATE_HZ = 10
+# BlueZ ATT drops notifications if flooded; gwyntel/bt-keyboard-adapter uses 30ms.
+NOTIFY_MIN_INTERVAL_MS = 30
 
 # macOS bonds when the central reads/notifies encrypted GATT attributes.
 HID_INFO_FLAGS = ["read", "encrypt-read"]
@@ -48,6 +51,9 @@ DEVICE_INFO_SERVICE_UUID = "0000180a-0000-1000-8000-00805f9b34fb"
 MANUFACTURER_NAME_UUID = "00002a29-0000-1000-8000-00805f9b34fb"
 MODEL_NUMBER_UUID = "00002a24-0000-1000-8000-00805f9b34fb"
 PNP_ID_UUID = "00002a50-0000-1000-8000-00805f9b34fb"
+BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
+BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+BATTERY_LEVEL_FLAGS = ["read"]
 
 # D-Bus interfaces
 GATT_SERVICE_IFACE = "org.bluez.GattService1"
@@ -194,7 +200,8 @@ REPORT_MAP = bytes([
 ])
 
 # HID Information: bcdHID=1.11, bCountryCode=0, Flags=0x02 (normally connectable)
-HID_INFO = bytes([0x11, 0x01, 0x00, 0x02])
+# bcdHID, country, flags (0x01 = remote wake / normally connectable per working HoG servers)
+HID_INFO = bytes([0x11, 0x01, 0x00, 0x01])
 
 # Device Information values
 MANUFACTURER_NAME = b"SteamDeck"
@@ -213,8 +220,8 @@ class GattApplication:
     - APP_PATH/service0/char0..char2 (HID Information, Report Map, Control Point)
     - APP_PATH/service0/char3 (Report + Report Reference)
     - APP_PATH/service0/char4 (Protocol Mode — appended; stable for BlueZ/macOS)
-    HID service only in the exported GATT tree. GAP (0x1800) and DIS (0x180a)
-    are owned by bluetoothd; registering them causes "Failed to create entry in database".
+    HID (service0), Device Information (service1), and Battery (service2).
+    Do not register GAP (0x1800) — BlueZ already owns adapter GAP.
     """
 
     APP_PATH = "/com/steamdeck/hogp"
@@ -269,9 +276,17 @@ class GattApplication:
         self._on_notify_start: Optional[Callable[[], None]] = None
         self._on_notify_stop: Optional[Callable[[], None]] = None
 
+        # ATT notify throttle (shared across all HID report characteristics)
+        self._last_notify_send_ms = 0
+        self._pending_notify: Dict[str, Tuple[int, bytes]] = {}
+        self._notify_flush_source_id: Optional[int] = None
+        self._last_gamepad_report: Optional[bytes] = None
+        self._battery_level = 100
+
     def set_report_rate(self, hz: int) -> None:
         """Set the notification rate in Hz."""
-        self._report_rate_hz = max(1, min(hz, 125))
+        max_hz = 1000 // NOTIFY_MIN_INTERVAL_MS
+        self._report_rate_hz = max(1, min(hz, max_hz))
         logger.info(f"Report rate set to {self._report_rate_hz} Hz")
 
     REPORT_CHAR_PATH = "service0/char3"
@@ -337,15 +352,14 @@ class GattApplication:
         self._kbd_modifiers = modifiers
         slot = key_code if key_code else 0
         self._kbd_keys = [slot, 0, 0, 0, 0, 0]
-        self._send_keyboard_notification()
-        # Repeat once — some hosts sample notify irregularly over BLE.
-        GLib.timeout_add(12, self._resend_keyboard_press)
+        self._send_keyboard_notification(force=True)
+        GLib.timeout_add(NOTIFY_MIN_INTERVAL_MS, self._resend_keyboard_press)
 
         self._kbd_release_timeout_id = GLib.timeout_add(hold_ms, self._release_key)
 
     def _resend_keyboard_press(self) -> bool:
         if any(self._kbd_keys) or self._kbd_modifiers:
-            self._send_keyboard_notification()
+            self._send_keyboard_notification(force=True)
         return False
 
     def _release_key(self) -> bool:
@@ -353,13 +367,13 @@ class GattApplication:
         self._kbd_release_timeout_id = None
         self._kbd_modifiers = 0
         self._kbd_keys = [0, 0, 0, 0, 0, 0]
-        self._send_keyboard_notification()
-        GLib.timeout_add(12, self._resend_keyboard_release)
+        self._send_keyboard_notification(force=True)
+        GLib.timeout_add(NOTIFY_MIN_INTERVAL_MS, self._resend_keyboard_release)
         return False
 
     def _resend_keyboard_release(self) -> bool:
         if not any(self._kbd_keys) and not self._kbd_modifiers:
-            self._send_keyboard_notification()
+            self._send_keyboard_notification(force=True)
         return False
     
     def get_keyboard_report(self) -> bytes:
@@ -401,7 +415,13 @@ class GattApplication:
             self._register_keyboard_report_char()
             self._register_keyboard_descriptors()
             self._register_protocol_mode_char()
-            # Do not register GAP (0x1800) or DIS (0x180a) — BlueZ already owns these.
+            self._register_hid_pnp_char()
+            # Custom DIS/Battery (not adapter GAP); required by macOS/iOS HoG peers.
+            self._register_device_info_service()
+            self._register_dis_manufacturer_char()
+            self._register_dis_model_char()
+            self._register_battery_service()
+            self._register_battery_level_char()
             logger.info(f"GATT objects registered under {self.APP_PATH}")
             return True
         except Exception as e:
@@ -412,6 +432,10 @@ class GattApplication:
     def unregister(self) -> None:
         """Unregister all D-Bus objects."""
         self.stop_notify()
+        if self._notify_flush_source_id is not None:
+            GLib.source_remove(self._notify_flush_source_id)
+            self._notify_flush_source_id = None
+        self._pending_notify.clear()
         for reg_id in self._registrations:
             try:
                 self.bus.unregister_object(reg_id)
@@ -472,12 +496,18 @@ class GattApplication:
         char3_path = f"{service_path}/char3"
         char4_path = f"{service_path}/char4"
         char5_path = f"{service_path}/char5"
+        char6_path = f"{service_path}/char6"
         gp_desc_ref = f"{char3_path}/desc0"
         gp_desc_cud = f"{char3_path}/desc1"
         kb_desc_ref = f"{char4_path}/desc0"
         kb_desc_cud = f"{char4_path}/desc1"
+        dis_service_path = f"{self.APP_PATH}/service1"
+        dis_char0 = f"{dis_service_path}/char0"
+        dis_char1 = f"{dis_service_path}/char1"
+        bat_service_path = f"{self.APP_PATH}/service2"
+        bat_char0 = f"{bat_service_path}/char0"
 
-        return {
+        objects = {
             service_path: {
                 GATT_SERVICE_IFACE: {
                     "UUID": GLib.Variant("s", HID_SERVICE_UUID),
@@ -491,6 +521,7 @@ class GattApplication:
                             char3_path,
                             char4_path,
                             char5_path,
+                            char6_path,
                         ],
                     ),
                 },
@@ -543,6 +574,14 @@ class GattApplication:
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
+            char6_path: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", PNP_ID_UUID),
+                    "Service": GLib.Variant("o", service_path),
+                    "Flags": GLib.Variant("as", HID_INFO_FLAGS),
+                    "Descriptors": GLib.Variant("ao", []),
+                },
+            },
             gp_desc_ref: {
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
@@ -571,7 +610,46 @@ class GattApplication:
                     "Flags": GLib.Variant("as", CHAR_USER_DESC_FLAGS),
                 },
             },
+            dis_service_path: {
+                GATT_SERVICE_IFACE: {
+                    "UUID": GLib.Variant("s", DEVICE_INFO_SERVICE_UUID),
+                    "Primary": GLib.Variant("b", True),
+                    "Characteristics": GLib.Variant("ao", [dis_char0, dis_char1]),
+                },
+            },
+            dis_char0: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", MANUFACTURER_NAME_UUID),
+                    "Service": GLib.Variant("o", dis_service_path),
+                    "Flags": GLib.Variant("as", ["read"]),
+                    "Descriptors": GLib.Variant("ao", []),
+                },
+            },
+            dis_char1: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", MODEL_NUMBER_UUID),
+                    "Service": GLib.Variant("o", dis_service_path),
+                    "Flags": GLib.Variant("as", ["read"]),
+                    "Descriptors": GLib.Variant("ao", []),
+                },
+            },
+            bat_service_path: {
+                GATT_SERVICE_IFACE: {
+                    "UUID": GLib.Variant("s", BATTERY_SERVICE_UUID),
+                    "Primary": GLib.Variant("b", True),
+                    "Characteristics": GLib.Variant("ao", [bat_char0]),
+                },
+            },
+            bat_char0: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", BATTERY_LEVEL_UUID),
+                    "Service": GLib.Variant("o", bat_service_path),
+                    "Flags": GLib.Variant("as", BATTERY_LEVEL_FLAGS),
+                    "Descriptors": GLib.Variant("ao", []),
+                },
+            },
         }
+        return objects
 
     def _register_gatt_service(
         self,
@@ -659,7 +737,7 @@ class GattApplication:
     def _register_service(self) -> None:
         """Register HID Service object."""
         service_path = f"{self.APP_PATH}/service0"
-        char_paths = [f"{service_path}/char{i}" for i in range(6)]
+        char_paths = [f"{service_path}/char{i}" for i in range(7)]
         self._register_gatt_service(
             service_path,
             HID_SERVICE_UUID,
@@ -935,7 +1013,11 @@ class GattApplication:
         reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
         self._registrations.append(reg_id)
 
+    def _now_ms(self) -> int:
+        return time.monotonic_ns() // 1_000_000
+
     def _emit_hid_value_notification(self, char_path: str, report: bytes) -> None:
+        """Immediate PropertiesChanged — BlueZ forwards this as an ATT notification."""
         try:
             self.bus.emit_signal(
                 None,
@@ -946,13 +1028,64 @@ class GattApplication:
                     "(sa{sv}as)",
                     (
                         GATT_CHAR_IFACE,
-                        {"Value": GLib.Variant("ay", report)},
+                        {"Value": GLib.Variant("ay", list(report))},
                         [],
                     ),
                 ),
             )
         except Exception as e:
             logger.error(f"HID notify failed for {char_path}: {e}")
+
+    def _queue_hid_notification(
+        self,
+        char_path: str,
+        report: bytes,
+        *,
+        priority: int = 0,
+        force: bool = False,
+    ) -> None:
+        """Throttle/coalesce ATT notifications (macOS + BlueZ drop bursts)."""
+        if force or char_path not in self._pending_notify:
+            self._pending_notify[char_path] = (priority, report)
+        else:
+            prev_pri, _ = self._pending_notify[char_path]
+            if priority >= prev_pri:
+                self._pending_notify[char_path] = (priority, report)
+        self._try_flush_notify_queue()
+
+    def _try_flush_notify_queue(self) -> None:
+        if not self._pending_notify:
+            return
+        now = self._now_ms()
+        elapsed = now - self._last_notify_send_ms
+        if elapsed < NOTIFY_MIN_INTERVAL_MS:
+            if self._notify_flush_source_id is None:
+                delay = max(1, NOTIFY_MIN_INTERVAL_MS - elapsed)
+                self._notify_flush_source_id = GLib.timeout_add(
+                    delay, self._on_notify_flush_timeout
+                )
+            return
+
+        char_path = max(
+            self._pending_notify.keys(),
+            key=lambda p: self._pending_notify[p][0],
+        )
+        _priority, report = self._pending_notify.pop(char_path)
+        self._last_notify_send_ms = now
+        self._emit_hid_value_notification(char_path, report)
+
+        if self._pending_notify:
+            self._notify_flush_source_id = GLib.timeout_add(
+                NOTIFY_MIN_INTERVAL_MS, self._on_notify_flush_timeout
+            )
+        elif self._notify_flush_source_id is not None:
+            GLib.source_remove(self._notify_flush_source_id)
+            self._notify_flush_source_id = None
+
+    def _on_notify_flush_timeout(self) -> bool:
+        self._notify_flush_source_id = None
+        self._try_flush_notify_queue()
+        return False
 
     def _register_readonly_descriptor(
         self,
@@ -1183,16 +1316,25 @@ class GattApplication:
             char_path,
         )
 
+    def _register_hid_pnp_char(self) -> None:
+        """PnP ID inside HID service (bt-keyboard-adapter / Apple HoG expectation)."""
+        self._register_read_char(
+            f"{self.APP_PATH}/service0/char6",
+            PNP_ID_UUID,
+            PNP_ID,
+            "HID PnP ID",
+            flags=HID_INFO_FLAGS,
+        )
+
     def _register_device_info_service(self) -> None:
         """Register Device Information Service."""
         service_path = f"{self.APP_PATH}/service1"
         char0_path = f"{service_path}/char0"
         char1_path = f"{service_path}/char1"
-        char2_path = f"{service_path}/char2"
         self._register_gatt_service(
             service_path,
             DEVICE_INFO_SERVICE_UUID,
-            [char0_path, char1_path, char2_path],
+            [char0_path, char1_path],
         )
 
     def _register_dis_manufacturer_char(self) -> None:
@@ -1217,14 +1359,23 @@ class GattApplication:
             service_path=dis_service_path,
         )
 
-    def _register_dis_pnp_id_char(self) -> None:
-        """Register Device Information Service - PnP ID characteristic."""
-        dis_service_path = f"{self.APP_PATH}/service1"
+    def _register_battery_service(self) -> None:
+        service_path = f"{self.APP_PATH}/service2"
+        char0_path = f"{service_path}/char0"
+        self._register_gatt_service(
+            service_path,
+            BATTERY_SERVICE_UUID,
+            [char0_path],
+        )
+
+    def _register_battery_level_char(self) -> None:
+        dis_service_path = f"{self.APP_PATH}/service2"
         self._register_read_char(
-            f"{dis_service_path}/char2",
-            PNP_ID_UUID,
-            PNP_ID,
-            "DIS PnP ID",
+            f"{dis_service_path}/char0",
+            BATTERY_LEVEL_UUID,
+            bytes([self._battery_level]),
+            "Battery Level",
+            flags=BATTERY_LEVEL_FLAGS,
             service_path=dis_service_path,
         )
 
@@ -1299,27 +1450,35 @@ class GattApplication:
     def _send_gamepad_notification(self) -> bool:
         if not self._gamepad_notifying:
             return False
-        self._emit_hid_value_notification(
+        report = self.get_current_report()
+        if report == self._last_gamepad_report:
+            return True
+        self._last_gamepad_report = report
+        self._queue_hid_notification(
             f"{self.APP_PATH}/service0/char3",
-            self.get_current_report(),
+            report,
+            priority=0,
         )
         return True
 
-    def _send_keyboard_notification(self) -> None:
+    def _send_keyboard_notification(self, force: bool = False) -> None:
         if not self._keyboard_notifying:
             logger.debug("Keyboard notify skipped — host has not subscribed")
             return
-        self._emit_hid_value_notification(
+        self._queue_hid_notification(
             f"{self.APP_PATH}/service0/char4",
             self.get_keyboard_report(),
+            priority=10,
+            force=force,
         )
 
     def _send_mouse_notification(self) -> None:
         if not self._keyboard_notifying:
             return
-        self._emit_hid_value_notification(
+        self._queue_hid_notification(
             f"{self.APP_PATH}/service0/char4",
             self.get_mouse_report(),
+            priority=5,
         )
         self._mouse_x = 0
         self._mouse_y = 0

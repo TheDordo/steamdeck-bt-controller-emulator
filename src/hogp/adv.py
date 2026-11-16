@@ -18,6 +18,7 @@ DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
 # Standard 16-bit UUIDs
 HID_SERVICE_UUID_16 = "1812"
 DEVICE_INFO_SERVICE_UUID_16 = "180a"
+BATTERY_SERVICE_UUID_16 = "180f"
 GAP_SERVICE_UUID_16 = "1800"
 
 
@@ -45,8 +46,12 @@ class Advertisement:
         
         # Advertisement properties
         self._type = "peripheral"
-        # Advertise HID only; GAP/DIS are provided internally by bluetoothd.
-        self._service_uuids = [HID_SERVICE_UUID_16]
+        # HID + DIS + Battery (macOS/iOS HoG expectations; not adapter-owned GAP).
+        self._service_uuids = [
+            HID_SERVICE_UUID_16,
+            DEVICE_INFO_SERVICE_UUID_16,
+            BATTERY_SERVICE_UUID_16,
+        ]
         self._appearance = 0x03C4  # Gamepad appearance
         self._discoverable = True
         # Do not list "appearance" here when Appearance property is set — BlueZ errors.
