@@ -36,6 +36,8 @@ REPORT_MAP_UUID = "00002a4b-0000-1000-8000-00805f9b34fb"
 HID_CONTROL_POINT_UUID = "00002a4c-0000-1000-8000-00805f9b34fb"
 REPORT_UUID = "00002a4d-0000-1000-8000-00805f9b34fb"
 REPORT_REFERENCE_UUID = "00002908-0000-1000-8000-00805f9b34fb"
+CHAR_USER_DESC_UUID = "00002901-0000-1000-8000-00805f9b34fb"
+CHAR_USER_DESC_FLAGS = ["read"]
 
 # Generic Access Profile (GAP) UUIDs
 GAP_SERVICE_UUID = "00001800-0000-1000-8000-00805f9b34fb"
@@ -222,7 +224,8 @@ class GattApplication:
         self.device_name = device_name
         self.verbose = verbose
         self._registrations: List[int] = []
-        self._notifying = False
+        self._gamepad_notifying = False
+        self._keyboard_notifying = False
         self._notify_timeout_id: Optional[int] = None
         self._report_rate_hz = DEFAULT_REPORT_RATE_HZ
         
@@ -279,8 +282,8 @@ class GattApplication:
 
     def _flush_gamepad_notify(self) -> bool:
         self._gamepad_notify_pending = False
-        if self._notifying:
-            self._send_notification()
+        if self._gamepad_notifying:
+            self._send_gamepad_notification()
         return False
 
     def set_button(self, button_index: int, pressed: bool) -> None:
@@ -372,8 +375,10 @@ class GattApplication:
             self._register_hid_info_char()
             self._register_report_map_char()
             self._register_hid_control_point_char()
-            self._register_report_char()
-            self._register_report_reference_desc()
+            self._register_gamepad_report_char()
+            self._register_gamepad_descriptors()
+            self._register_keyboard_report_char()
+            self._register_keyboard_descriptors()
             self._register_protocol_mode_char()
             # Do not register GAP (0x1800) or DIS (0x180a) — BlueZ already owns these.
             logger.info(f"GATT objects registered under {self.APP_PATH}")
@@ -445,7 +450,11 @@ class GattApplication:
         char2_path = f"{service_path}/char2"
         char3_path = f"{service_path}/char3"
         char4_path = f"{service_path}/char4"
-        desc0_path = f"{char3_path}/desc0"
+        char5_path = f"{service_path}/char5"
+        gp_desc_ref = f"{char3_path}/desc0"
+        gp_desc_cud = f"{char3_path}/desc1"
+        kb_desc_ref = f"{char4_path}/desc0"
+        kb_desc_cud = f"{char4_path}/desc1"
 
         return {
             service_path: {
@@ -454,7 +463,14 @@ class GattApplication:
                     "Primary": GLib.Variant("b", True),
                     "Characteristics": GLib.Variant(
                         "ao",
-                        [char0_path, char1_path, char2_path, char3_path, char4_path],
+                        [
+                            char0_path,
+                            char1_path,
+                            char2_path,
+                            char3_path,
+                            char4_path,
+                            char5_path,
+                        ],
                     ),
                 },
             },
@@ -487,10 +503,18 @@ class GattApplication:
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [desc0_path]),
+                    "Descriptors": GLib.Variant("ao", [gp_desc_ref, gp_desc_cud]),
                 },
             },
             char4_path: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", REPORT_UUID),
+                    "Service": GLib.Variant("o", service_path),
+                    "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
+                    "Descriptors": GLib.Variant("ao", [kb_desc_ref, kb_desc_cud]),
+                },
+            },
+            char5_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", PROTOCOL_MODE_UUID),
                     "Service": GLib.Variant("o", service_path),
@@ -498,11 +522,32 @@ class GattApplication:
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
-            desc0_path: {
+            gp_desc_ref: {
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
                     "Characteristic": GLib.Variant("o", char3_path),
                     "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
+                },
+            },
+            gp_desc_cud: {
+                GATT_DESC_IFACE: {
+                    "UUID": GLib.Variant("s", CHAR_USER_DESC_UUID),
+                    "Characteristic": GLib.Variant("o", char3_path),
+                    "Flags": GLib.Variant("as", CHAR_USER_DESC_FLAGS),
+                },
+            },
+            kb_desc_ref: {
+                GATT_DESC_IFACE: {
+                    "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
+                    "Characteristic": GLib.Variant("o", char4_path),
+                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
+                },
+            },
+            kb_desc_cud: {
+                GATT_DESC_IFACE: {
+                    "UUID": GLib.Variant("s", CHAR_USER_DESC_UUID),
+                    "Characteristic": GLib.Variant("o", char4_path),
+                    "Flags": GLib.Variant("as", CHAR_USER_DESC_FLAGS),
                 },
             },
         }
@@ -593,7 +638,7 @@ class GattApplication:
     def _register_service(self) -> None:
         """Register HID Service object."""
         service_path = f"{self.APP_PATH}/service0"
-        char_paths = [f"{service_path}/char{i}" for i in range(5)]
+        char_paths = [f"{service_path}/char{i}" for i in range(6)]
         self._register_gatt_service(
             service_path,
             HID_SERVICE_UUID,
@@ -631,7 +676,7 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char4"
+        path = f"{self.APP_PATH}/service0/char5"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
@@ -869,8 +914,111 @@ class GattApplication:
         reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
         self._registrations.append(reg_id)
 
-    def _register_report_char(self) -> None:
-        """Register Report characteristic (read + notify)."""
+    def _emit_hid_value_notification(self, char_path: str, report: bytes) -> None:
+        try:
+            self.bus.emit_signal(
+                None,
+                char_path,
+                DBUS_PROPS_IFACE,
+                "PropertiesChanged",
+                GLib.Variant(
+                    "(sa{sv}as)",
+                    (
+                        GATT_CHAR_IFACE,
+                        {"Value": GLib.Variant("ay", report)},
+                        [],
+                    ),
+                ),
+            )
+        except Exception as e:
+            logger.error(f"HID notify failed for {char_path}: {e}")
+
+    def _register_readonly_descriptor(
+        self,
+        path: str,
+        uuid: str,
+        value: bytes,
+        flags: List[str],
+        parent_char: str,
+    ) -> None:
+        xml = f"""
+        <node>
+            <interface name="{GATT_DESC_IFACE}">
+                <method name="ReadValue">
+                    <arg type="a{{sv}}" direction="in"/>
+                    <arg type="ay" direction="out"/>
+                </method>
+                <property name="UUID" type="s" access="read"/>
+                <property name="Characteristic" type="o" access="read"/>
+                <property name="Flags" type="as" access="read"/>
+            </interface>
+            <interface name="{DBUS_PROPS_IFACE}">
+                <method name="Get">
+                    <arg type="s" direction="in"/>
+                    <arg type="s" direction="in"/>
+                    <arg type="v" direction="out"/>
+                </method>
+                <method name="GetAll">
+                    <arg type="s" direction="in"/>
+                    <arg type="a{{sv}}" direction="out"/>
+                </method>
+            </interface>
+        </node>
+        """
+        node_info = Gio.DBusNodeInfo.new_for_xml(xml)
+
+        def handler(conn, sender, obj_path, iface, method, params, invoc):
+            if iface == GATT_DESC_IFACE:
+                if method == "ReadValue":
+                    invoc.return_value(GLib.Variant("(ay)", (value,)))
+                else:
+                    invoc.return_dbus_error(
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        f"Unknown method: {method}",
+                    )
+            elif iface == DBUS_PROPS_IFACE:
+                props = {
+                    "UUID": GLib.Variant("s", uuid),
+                    "Characteristic": GLib.Variant("o", parent_char),
+                    "Flags": GLib.Variant("as", flags),
+                }
+                if method == "Get":
+                    _, prop = params.unpack()
+                    if prop in props:
+                        invoc.return_value(GLib.Variant("(v)", (props[prop],)))
+                    else:
+                        invoc.return_dbus_error(
+                            "org.freedesktop.DBus.Error.InvalidArgs",
+                            f"Unknown property: {prop}",
+                        )
+                elif method == "GetAll":
+                    invoc.return_value(GLib.Variant("(a{sv})", (props,)))
+                else:
+                    invoc.return_dbus_error(
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        f"Unknown method: {method}",
+                    )
+            else:
+                invoc.return_dbus_error(
+                    "org.freedesktop.DBus.Error.UnknownInterface",
+                    f"Unknown interface: {iface}",
+                )
+
+        reg_id = self.bus.register_object(path, node_info.interfaces[0], handler, None, None)
+        self._registrations.append(reg_id)
+        reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
+        self._registrations.append(reg_id)
+
+    def _register_hid_report_channel(
+        self,
+        char_path: str,
+        descriptor_paths: List[str],
+        read_report: Callable[[], bytes],
+        on_start_notify: Callable[[], None],
+        on_stop_notify: Callable[[], None],
+        is_notifying: Callable[[], bool],
+        label: str,
+    ) -> None:
         xml = f"""
         <node>
             <interface name="{GATT_CHAR_IFACE}">
@@ -899,27 +1047,20 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char3"
-        desc0_path = f"{path}/desc0"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
         def handler(conn, sender, obj_path, iface, method, params, invoc):
             if iface == GATT_CHAR_IFACE:
                 if method == "ReadValue":
-                    if self.verbose:
-                        logger.info(f"Report ReadValue called by {sender}")
-                    report = self.get_current_report()
-                    invoc.return_value(GLib.Variant("(ay)", (report,)))
+                    invoc.return_value(GLib.Variant("(ay)", (read_report(),)))
                 elif method == "StartNotify":
-                    if self.verbose:
-                        logger.info(f"Report StartNotify called by {sender}")
-                    self.start_notify()
+                    logger.info(f"{label} StartNotify from {sender}")
+                    on_start_notify()
                     invoc.return_value(None)
                 elif method == "StopNotify":
-                    if self.verbose:
-                        logger.info(f"Report StopNotify called by {sender}")
-                    self.stop_notify()
+                    logger.info(f"{label} StopNotify from {sender}")
+                    on_stop_notify()
                     invoc.return_value(None)
                 else:
                     invoc.return_dbus_error(
@@ -931,8 +1072,8 @@ class GattApplication:
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [desc0_path]),
-                    "Notifying": GLib.Variant("b", self._notifying),
+                    "Descriptors": GLib.Variant("ao", descriptor_paths),
+                    "Notifying": GLib.Variant("b", is_notifying()),
                 }
                 if method == "Get":
                     _, prop = params.unpack()
@@ -956,83 +1097,70 @@ class GattApplication:
                     f"Unknown interface: {iface}",
                 )
 
-        reg_id = self.bus.register_object(path, node_info.interfaces[0], handler, None, None)
+        reg_id = self.bus.register_object(char_path, node_info.interfaces[0], handler, None, None)
         self._registrations.append(reg_id)
-        reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
+        reg_id = self.bus.register_object(char_path, node_info.interfaces[1], handler, None, None)
         self._registrations.append(reg_id)
 
-    def _register_report_reference_desc(self) -> None:
-        """Register Report Reference descriptors for gamepad, keyboard, and mouse."""
-        xml = f"""
-        <node>
-            <interface name="{GATT_DESC_IFACE}">
-                <method name="ReadValue">
-                    <arg type="a{{sv}}" direction="in"/>
-                    <arg type="ay" direction="out"/>
-                </method>
-                <property name="UUID" type="s" access="read"/>
-                <property name="Characteristic" type="o" access="read"/>
-                <property name="Flags" type="as" access="read"/>
-            </interface>
-            <interface name="{DBUS_PROPS_IFACE}">
-                <method name="Get">
-                    <arg type="s" direction="in"/>
-                    <arg type="s" direction="in"/>
-                    <arg type="v" direction="out"/>
-                </method>
-                <method name="GetAll">
-                    <arg type="s" direction="in"/>
-                    <arg type="a{{sv}}" direction="out"/>
-                </method>
-            </interface>
-        </node>
-        """
+    def _register_gamepad_report_char(self) -> None:
         char_path = f"{self.APP_PATH}/service0/char3"
-        path = f"{char_path}/desc0"
-        node_info = Gio.DBusNodeInfo.new_for_xml(xml)
-        report_ref_value = bytes([0x01, 0x01])
+        desc_paths = [f"{char_path}/desc0", f"{char_path}/desc1"]
+        self._register_hid_report_channel(
+            char_path,
+            desc_paths,
+            self.get_current_report,
+            self.start_gamepad_notify,
+            self.stop_gamepad_notify,
+            lambda: self._gamepad_notifying,
+            "Gamepad report",
+        )
 
-        def handler(conn, sender, obj_path, iface, method, params, invoc):
-            if iface == GATT_DESC_IFACE:
-                if method == "ReadValue":
-                    invoc.return_value(GLib.Variant("(ay)", (report_ref_value,)))
-                else:
-                    invoc.return_dbus_error(
-                        "org.freedesktop.DBus.Error.UnknownMethod",
-                        f"Unknown method: {method}",
-                    )
-            elif iface == DBUS_PROPS_IFACE:
-                props = {
-                    "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                    "Characteristic": GLib.Variant("o", char_path),
-                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
-                }
-                if method == "Get":
-                    _, prop = params.unpack()
-                    if prop in props:
-                        invoc.return_value(GLib.Variant("(v)", (props[prop],)))
-                    else:
-                        invoc.return_dbus_error(
-                            "org.freedesktop.DBus.Error.InvalidArgs",
-                            f"Unknown property: {prop}",
-                        )
-                elif method == "GetAll":
-                    invoc.return_value(GLib.Variant("(a{sv})", (props,)))
-                else:
-                    invoc.return_dbus_error(
-                        "org.freedesktop.DBus.Error.UnknownMethod",
-                        f"Unknown method: {method}",
-                    )
-            else:
-                invoc.return_dbus_error(
-                    "org.freedesktop.DBus.Error.UnknownInterface",
-                    f"Unknown interface: {iface}",
-                )
+    def _register_keyboard_report_char(self) -> None:
+        char_path = f"{self.APP_PATH}/service0/char4"
+        desc_paths = [f"{char_path}/desc0", f"{char_path}/desc1"]
+        self._register_hid_report_channel(
+            char_path,
+            desc_paths,
+            self.get_keyboard_report,
+            self.start_keyboard_notify,
+            self.stop_keyboard_notify,
+            lambda: self._keyboard_notifying,
+            "Keyboard report",
+        )
 
-        reg_id = self.bus.register_object(path, node_info.interfaces[0], handler, None, None)
-        self._registrations.append(reg_id)
-        reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
-        self._registrations.append(reg_id)
+    def _register_gamepad_descriptors(self) -> None:
+        char_path = f"{self.APP_PATH}/service0/char3"
+        self._register_readonly_descriptor(
+            f"{char_path}/desc0",
+            REPORT_REFERENCE_UUID,
+            bytes([0x01, 0x01]),
+            REPORT_REFERENCE_FLAGS,
+            char_path,
+        )
+        self._register_readonly_descriptor(
+            f"{char_path}/desc1",
+            CHAR_USER_DESC_UUID,
+            b"Gamepad",
+            CHAR_USER_DESC_FLAGS,
+            char_path,
+        )
+
+    def _register_keyboard_descriptors(self) -> None:
+        char_path = f"{self.APP_PATH}/service0/char4"
+        self._register_readonly_descriptor(
+            f"{char_path}/desc0",
+            REPORT_REFERENCE_UUID,
+            bytes([0x02, 0x01]),
+            REPORT_REFERENCE_FLAGS,
+            char_path,
+        )
+        self._register_readonly_descriptor(
+            f"{char_path}/desc1",
+            CHAR_USER_DESC_UUID,
+            b"Keyboard",
+            CHAR_USER_DESC_FLAGS,
+            char_path,
+        )
 
     def _register_device_info_service(self) -> None:
         """Register Device Information Service."""
@@ -1100,122 +1228,79 @@ class GattApplication:
             service_path=gap_service_path,
         )
 
-    def start_notify(self) -> None:
-        """Start sending notifications."""
-        if self._notifying:
-            return
-        self._notifying = True
-        logger.info("Notifications started")
-        
-        if self._on_notify_start:
-            self._on_notify_start()
-        
-        interval_ms = 1000 // self._report_rate_hz
-        self._notify_timeout_id = GLib.timeout_add(interval_ms, self._send_notification)
+    def _ensure_notify_timer(self) -> None:
+        if self._notify_timeout_id is None and self._gamepad_notifying:
+            interval_ms = max(1, 1000 // self._report_rate_hz)
+            self._notify_timeout_id = GLib.timeout_add(interval_ms, self._send_gamepad_notification)
 
-    def stop_notify(self) -> None:
-        """Stop sending notifications."""
-        if not self._notifying:
-            return
-        self._notifying = False
-        logger.info("Notifications stopped")
-        
-        if self._notify_timeout_id is not None:
+    def _clear_notify_timer_if_idle(self) -> None:
+        if not self._gamepad_notifying and self._notify_timeout_id is not None:
             GLib.source_remove(self._notify_timeout_id)
             self._notify_timeout_id = None
-        
+
+    def start_gamepad_notify(self) -> None:
+        if self._gamepad_notifying:
+            return
+        self._gamepad_notifying = True
+        logger.info("Gamepad notifications enabled")
+        if self._on_notify_start:
+            self._on_notify_start()
+        self._ensure_notify_timer()
+        self._keyboard_notifying = True
+
+    def stop_gamepad_notify(self) -> None:
+        if not self._gamepad_notifying:
+            return
+        self._gamepad_notifying = False
+        self._keyboard_notifying = False
+        logger.info("Gamepad notifications disabled")
+        self._clear_notify_timer_if_idle()
         if self._on_notify_stop:
             self._on_notify_stop()
 
-    def _send_notification(self) -> bool:
-        """Send a notification with the current gamepad report value."""
-        if not self._notifying:
+    def start_keyboard_notify(self) -> None:
+        self._keyboard_notifying = True
+        logger.info("Keyboard notifications enabled")
+
+    def stop_keyboard_notify(self) -> None:
+        self._keyboard_notifying = False
+        logger.info("Keyboard notifications disabled")
+
+    def start_notify(self) -> None:
+        self.start_gamepad_notify()
+
+    def stop_notify(self) -> None:
+        self.stop_gamepad_notify()
+
+    def _send_gamepad_notification(self) -> bool:
+        if not self._gamepad_notifying:
             return False
-        
-        report = self.get_current_report()
-        char_path = f"{self.APP_PATH}/service0/char3"
-        
-        try:
-            self.bus.emit_signal(
-                None,
-                char_path,
-                DBUS_PROPS_IFACE,
-                "PropertiesChanged",
-                GLib.Variant(
-                    "(sa{sv}as)",
-                    (
-                        GATT_CHAR_IFACE,
-                        {"Value": GLib.Variant("ay", report)},
-                        [],
-                    ),
-                ),
-            )
-        except Exception as e:
-            logger.error(f"Error sending gamepad notification: {e}")
-        
-        return True  # Continue the timeout
-    
+        self._emit_hid_value_notification(
+            f"{self.APP_PATH}/service0/char3",
+            self.get_current_report(),
+        )
+        return True
+
     def _send_keyboard_notification(self) -> None:
-        """Send a keyboard report notification immediately."""
-        if not self._notifying:
-            logger.debug("Not sending keyboard notification - not notifying")
+        if not self._keyboard_notifying:
+            logger.debug("Keyboard notify skipped — host has not subscribed")
             return
-        
-        report = self.get_keyboard_report()
-        char_path = f"{self.APP_PATH}/service0/char3"
-        
-        logger.debug(f"Sending keyboard notification: modifiers={self._kbd_modifiers:#04x}, keys={[f'{k:#04x}' for k in self._kbd_keys]}")
-        
-        try:
-            self.bus.emit_signal(
-                None,
-                char_path,
-                DBUS_PROPS_IFACE,
-                "PropertiesChanged",
-                GLib.Variant(
-                    "(sa{sv}as)",
-                    (
-                        GATT_CHAR_IFACE,
-                        {"Value": GLib.Variant("ay", report)},
-                        [],
-                    ),
-                ),
-            )
-            logger.debug("Keyboard notification sent successfully")
-        except Exception as e:
-            logger.error(f"Error sending keyboard notification: {e}")
-    
+        self._emit_hid_value_notification(
+            f"{self.APP_PATH}/service0/char4",
+            self.get_keyboard_report(),
+        )
+
     def _send_mouse_notification(self) -> None:
-        """Send a mouse report notification immediately."""
-        if not self._notifying:
+        if not self._keyboard_notifying:
             return
-        
-        report = self.get_mouse_report()
-        char_path = f"{self.APP_PATH}/service0/char3"
-        
-        try:
-            self.bus.emit_signal(
-                None,
-                char_path,
-                DBUS_PROPS_IFACE,
-                "PropertiesChanged",
-                GLib.Variant(
-                    "(sa{sv}as)",
-                    (
-                        GATT_CHAR_IFACE,
-                        {"Value": GLib.Variant("ay", report)},
-                        [],
-                    ),
-                ),
-            )
-            # Reset mouse delta after sending
-            self._mouse_x = 0
-            self._mouse_y = 0
-            self._mouse_wheel = 0
-        except Exception as e:
-            logger.error(f"Error sending mouse notification: {e}")
+        self._emit_hid_value_notification(
+            f"{self.APP_PATH}/service0/char4",
+            self.get_mouse_report(),
+        )
+        self._mouse_x = 0
+        self._mouse_y = 0
+        self._mouse_wheel = 0
 
     @property
     def notifying(self) -> bool:
-        """Check if notifications are active."""
-        return self._notifying
+        return self._gamepad_notifying or self._keyboard_notifying
