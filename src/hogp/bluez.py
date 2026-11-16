@@ -813,7 +813,7 @@ def clear_static_ble_address(adapter_index: int = 0) -> bool:
 
 PRO_CONTROLLER_NAME = "Pro Controller"
 PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
-HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
+HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon"  # D-Bus paths forbid '-' in elements
 _HID_SDP_STATE = {"last_error": None}  # last RegisterProfile failure detail
 
 _OBJECT_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]*$")

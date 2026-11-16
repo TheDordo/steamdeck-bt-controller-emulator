@@ -14,7 +14,7 @@ import traceback
 
 from gi.repository import GLib, Gio
 
-PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
+PROFILE_PATH = "/com/steamdeck/hogp/procon"
 TEST_UUID = "00000000-0000-0000-0000-000000000000"
 SDP_XML = (
     '<?xml version="1.0" encoding="UTF-8" ?>'
