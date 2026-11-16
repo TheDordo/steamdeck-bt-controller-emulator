@@ -265,18 +265,13 @@ def unregister_advertisement_async(
 
 
 def ensure_adapter_powered_and_discoverable(bus: Gio.DBusConnection, adapter_path: str) -> bool:
-    """Ensure the adapter is powered on and pairable/discoverable for HoG."""
+    """Power on adapter and allow pairing; LE discoverability comes from our advertisement."""
     if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
         return False
     set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True))
-    set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", True))
-    # BlueZ 5.76+ on SteamOS uses a finite discoverable window (0 = no timeout).
-    set_adapter_property(
-        bus,
-        adapter_path,
-        "DiscoverableTimeout",
-        GLib.Variant("u", 0),
-    )
+    set_adapter_property(bus, adapter_path, "Bondable", GLib.Variant("b", True))  # may be unsupported on some stacks
+    # BR/EDR discoverable off — LE advertisement sets Discoverable for centrals.
+    set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", False))
     return True
 
 

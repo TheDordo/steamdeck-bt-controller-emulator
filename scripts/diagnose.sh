@@ -16,6 +16,12 @@ if groups | grep -qw bluetooth; then echo "  OK bluetooth group"; else echo "  M
 if groups | grep -qw input; then echo "  OK input group"; else echo "  MISSING input group"; fi
 echo
 
+echo "--- Pairing agent (optional) ---"
+if busctl --system status org.bluez 2>/dev/null | grep -q org.bluez; then
+    busctl --system tree org.bluez 2>/dev/null | grep -i steamdeck | sed 's/^/  /' || echo "  (no com.steamdeck paths visible — start the app first)"
+fi
+echo
+
 echo "--- Bluetooth (BlueZ) ---"
 if command -v bluetoothctl >/dev/null; then
     bluetoothctl show 2>/dev/null | sed -n '1,12p' | sed 's/^/  /'

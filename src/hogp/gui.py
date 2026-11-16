@@ -38,6 +38,7 @@ from hogp.gatt_app import GattApplication
 from hogp.adv import Advertisement
 from hogp.input_handler import InputHandler
 from hogp.usb_gadget import USBGadgetHID
+from hogp.pairing_agent import PairingAgent
 
 logger = logging.getLogger(__name__)
 
@@ -665,6 +666,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._adapter_path = None
         self._gatt_app = None
         self._advertisement = None
+        self._pairing_agent = None
         self._input_handler = None
         self._main_loop = None
         self._registered = False
@@ -803,11 +805,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     
     def _prepare_bluetooth_adapter(self):
         """Configure adapter (blocking); D-Bus work continues on main thread."""
-        try:
-            adapter_idx = get_adapter_index("hci0")
-            set_static_ble_address(adapter_idx, "C2:12:34:56:78:9A")
-        except Exception as e:
-            logger.warning(f"Static BLE address setup skipped: {e}")
+        if os.environ.get("HOGP_STATIC_ADDR", "").strip() not in ("", "0", "false"):
+            try:
+                adapter_idx = get_adapter_index("hci0")
+                addr = os.environ.get("HOGP_STATIC_ADDR", "C2:12:34:56:78:9A")
+                set_static_ble_address(adapter_idx, addr)
+            except Exception as e:
+                logger.warning(f"Static BLE address setup skipped: {e}")
         GLib.idle_add(self._start_bluetooth_service)
 
     def _start_bluetooth_service(self):
@@ -830,6 +834,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             # Ensure adapter is powered
             if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
                 self._show_error("Failed to power on Bluetooth")
+                return False
+
+            self._pairing_agent = PairingAgent(self._bus, verbose=False)
+            if not self._pairing_agent.register():
+                self._show_error(
+                    "Could not register Bluetooth pairing agent. Re-run install.sh and log out/in."
+                )
                 return False
             
             # Create GATT application

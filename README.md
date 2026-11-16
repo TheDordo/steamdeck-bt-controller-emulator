@@ -117,6 +117,12 @@ BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x1
 - Run from **Desktop Mode**
 - Run `diagnose.sh`; check BlueZ / D-Bus errors in Konsole when starting the service
 
+### Visible in discovery but never connects / pairs
+
+- Re-run **install.sh** and log out/in (registers an auto-accept **pairing agent**).
+- On the **host**, start the pairing flow from Bluetooth settings (don’t rely only on “scan”).
+- If Android pairs then disconnects: on the Deck (Developer mode), try in `/etc/bluetooth/main.conf` under `[General]`: `ReverseServiceDiscovery = false`, then `sudo systemctl restart bluetooth`. This stops BlueZ from probing the phone as a GATT client during connect.
+
 ### Pairs but no input (Bluetooth)
 
 - Forget device on both sides and pair again

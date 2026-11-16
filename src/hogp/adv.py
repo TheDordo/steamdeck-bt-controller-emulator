@@ -49,7 +49,9 @@ class Advertisement:
         self._service_uuids = [HID_SERVICE_UUID_16]
         self._appearance = 0x03C4  # Gamepad appearance
         self._discoverable = True
-        self._includes = ["tx-power"]
+        self._includes = ["tx-power", "appearance"]
+        self._timeout = 0  # 0 = no advertisement lifetime limit
+        self._discoverable_timeout = 0
 
     def register(self) -> bool:
         """Register advertisement object on D-Bus."""
@@ -82,6 +84,8 @@ class Advertisement:
             "Appearance": GLib.Variant("q", self._appearance),
             "Discoverable": GLib.Variant("b", self._discoverable),
             "Includes": GLib.Variant("as", self._includes),
+            "Timeout": GLib.Variant("q", self._timeout),
+            "DiscoverableTimeout": GLib.Variant("q", self._discoverable_timeout),
         }
 
     def _register_advertisement(self) -> None:
@@ -96,6 +100,8 @@ class Advertisement:
                 <property name="Appearance" type="q" access="read"/>
                 <property name="Discoverable" type="b" access="read"/>
                 <property name="Includes" type="as" access="read"/>
+                <property name="Timeout" type="q" access="read"/>
+                <property name="DiscoverableTimeout" type="q" access="read"/>
             </interface>
         </node>
         """
