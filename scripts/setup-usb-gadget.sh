@@ -142,7 +142,7 @@ echo 6 > functions/hid.usb2/report_length  # Mouse report size (6 bytes without 
 # (f_hid poll_interval sysfs attribute, ms; ignored on kernels without it).
 for f in functions/hid.usb0/poll_interval functions/hid.usb1/poll_interval functions/hid.usb2/poll_interval; do
     if [ -f "$f" ]; then
-        echo 1 > "$f"
+        echo 1 > "$f" 2>/dev/null || true
     fi
 done
 
@@ -176,6 +176,7 @@ echo "${UDC_DEVICE}" > UDC
 
 # Wait for devices to appear
 sleep 1
+echo "UDC bound to: $(cat UDC 2>/dev/null || echo 'NONE — check the cable and BIOS DRD')"
 
 # Check if HID devices were created
 if [ -c /dev/hidg0 ] && [ -c /dev/hidg1 ] && [ -c /dev/hidg2 ]; then
@@ -192,6 +193,9 @@ fi
 echo "Setting permissions on /dev/hidg*..."
 sleep 1
 chmod 666 /dev/hidg* 2>/dev/null || echo "Note: Run 'sudo chmod 666 /dev/hidg*' after devices appear"
+
+# Record the active profile so the app can detect stale gadget configs
+echo "${PROFILE}" > /tmp/steamdeck_hid.profile
 
 echo
 echo "=== USB Gadget HID Setup Complete ==="

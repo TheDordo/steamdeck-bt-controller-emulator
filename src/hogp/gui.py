@@ -730,6 +730,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._profile = "gamepad"  # "gamepad" | "keyboard"
         self._pro_controller = None
         self._pro_sdp_registered = False
+        self._start_watchdog_id = None
         self._bond_in_progress = False
         self._bond_attempted_for: Optional[str] = None
         self._last_bond_attempt_at = 0.0
@@ -884,6 +885,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.gamepad_radio.set_sensitive(False)
         self.keyboard_radio.set_sensitive(False)
         self.status_label.set_markup("<big><b>Status: Starting...</b></big>")
+        # Watchdog: surface diagnostics instead of hanging on "Starting..."
+        self._start_watchdog_id = GLib.timeout_add(35000, self._on_start_watchdog)
         
         if self._mode == "bluetooth" and self._profile == "gamepad":
             # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
@@ -900,6 +903,19 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         else:
             threading.Thread(target=self._start_wired_service, daemon=True).start()
     
+    def _on_start_watchdog(self):
+        """Surface diagnostics when a start step never completes."""
+        self._start_watchdog_id = None
+        if self._running or self._shutting_down:
+            return False
+        self.status_label.set_markup(
+            "<big><b>Status: Starting timed out — run scripts/view-logs.sh</b></big>"
+        )
+        self.connection_label.set_label(
+            "Check Konsole/journal for the stalled step (Pro Controller start: ...)"
+        )
+        return False
+
     def _on_stop_clicked(self, button):
         """Stop the controller service."""
         if self._stop_in_progress:
@@ -988,6 +1004,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         """Start the Pro Controller (BR/EDR HID) gamepad service on the main thread."""
         self._shutting_down = False
         self._stop_in_progress = False
+        logger.info("Pro Controller start: begin (bus + adapter discovery)")
         try:
             self._bus = get_system_bus()
             if not acquire_app_bus_name(self._bus):
@@ -1013,11 +1030,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 )
                 return False
 
+            logger.info("Pro Controller start: registering HID SDP record")
             if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
                 self._show_error("Could not register HID SDP record (ProfileManager1)")
                 return False
             self._pro_sdp_registered = True
 
+            logger.info("Pro Controller start: binding L2CAP sockets (PSM 0x11/0x13)")
             self._pro_controller = ProControllerEmulator(adapter_address=adapter_address)
             self._pro_controller.on_state_change = self._on_pro_controller_state
             if not self._pro_controller.start():
@@ -1026,7 +1045,6 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
             self._registered = True
             self._running = True
-            self._start_input_handler()
             self.status_label.set_markup("<big><b>Status: Active - Pro Controller</b></big>")
             self.connection_label.set_label("Waiting for Mac to connect…")
             self.device_info_label.set_label(
@@ -1035,6 +1053,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
             self.stop_button.set_sensitive(True)
             self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
+            # evdev discovery can be slow (Steam holds the controller) — keep it
+            # off the UI thread so "Active" shows immediately.
+            threading.Thread(target=self._start_input_handler, daemon=True).start()
             return False
         except Exception as e:
             logger.error(f"Failed to start Pro Controller service: {e}")
@@ -1067,8 +1088,24 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             # Check if USB gadget is already set up
             import os
             import subprocess
-            if not (os.path.exists('/dev/hidg0') and os.path.exists('/dev/hidg1') and os.path.exists('/dev/hidg2')):
-                logger.info("USB gadget not configured, running setup script...")
+            gamepad_profile = "ds4" if self._profile == "gamepad" else "generic"
+            need_setup = not (
+                os.path.exists('/dev/hidg0')
+                and os.path.exists('/dev/hidg1')
+                and os.path.exists('/dev/hidg2')
+            )
+            if not need_setup:
+                # The gadget survives app restarts but not Deck reboots. Verify
+                # the requested profile matches what is actually configured so
+                # a stale or half-configured gadget is rebuilt instead of
+                # silently presenting the wrong device to the Mac.
+                try:
+                    with open('/tmp/steamdeck_hid.profile') as f:
+                        need_setup = f.read().strip() != gamepad_profile
+                except OSError:
+                    need_setup = True  # old install / reboot: rebuild once
+            if need_setup:
+                logger.info("USB gadget missing or stale (%s), running setup...", gamepad_profile)
                 GLib.idle_add(self._show_info, "Setting up USB gadget (requires password)...")
                 
                 # Find script directory (relative to this file)
@@ -1116,6 +1153,17 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                     self._show_error,
                     "No /dev/hidg* devices. Run scripts/diagnose.sh in Konsole (BIOS DRD + data USB cable).",
                 )
+                return
+
+            if self._usb_gadget._gamepad_fd is None:
+                GLib.idle_add(
+                    self._show_error,
+                    "Gamepad HID function (/dev/hidg0) is missing. Run "
+                    "scripts/cleanup-usb-gadget.sh in Konsole, then start again "
+                    "so the gadget is rebuilt.",
+                )
+                self._usb_gadget.close()
+                self._usb_gadget = None
                 return
             
             self._running = True
@@ -1225,11 +1273,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return False
 
     def _start_input_handler(self):
-        """Start forwarding physical controller input (Bluetooth path)."""
-        if self._start_input_handler_sync():
-            GLib.idle_add(self._on_input_handler_ready, True)
-        else:
-            GLib.idle_add(self._on_input_handler_ready, False)
+        """Start forwarding physical controller input (off the UI thread)."""
+
+        def work():
+            ok = self._start_input_handler_sync()
+            GLib.idle_add(self._on_input_handler_ready, ok)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_input_handler_ready(self, ok: bool):
         if ok and self._input_handler:
@@ -1517,6 +1567,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._bond_attempted_for = None
         self._last_bond_attempt_at = 0.0
         self._last_bond_error = None
+        if self._start_watchdog_id:
+            GLib.source_remove(self._start_watchdog_id)
+            self._start_watchdog_id = None
         self._shutting_down = False
         self._stop_in_progress = False
         self.start_button.set_sensitive(True)

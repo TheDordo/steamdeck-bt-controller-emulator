@@ -165,6 +165,16 @@ Usually a bad combination of `LEAdvertisement1` properties (e.g. `Appearance` se
 
 BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x180a). This fork registers **only the HID service (0x1812)**. Update to the latest fork build if you still see this after an older install.
 
+### Stuck on “Starting...” (Bluetooth gamepad)
+
+The GUI switches to **Active** before scanning input devices, and a 35 s watchdog shows a hint if a start step stalls. To find the stalled step, launch from Konsole:
+
+```bash
+cd ~/steamdeck-bt-controller-emulator && ./scripts/run-gui.sh
+```
+
+Watch for **Pro Controller start:** lines — they log each stage (bus/adapter, pairing agent, SDP record, L2CAP sockets). If it stops at the SDP step, BlueZ rejected the profile registration; run `journalctl -u bluetooth -n 50` and share the output.
+
 ### Status stuck on “Starting...” (Bluetooth)
 
 - Re-run the [install command](#installation), then **log out / in**
@@ -186,6 +196,12 @@ GATT notify can start **before** macOS finishes SMP bonding. Latest builds **cal
 3. If the Mac stalls on pairing: accept any **“Bluetooth Pairing Request”** dialog (Just Works / confirm).
 4. Deck UI should show **Paired — sending HID data** with **Paired: yes** and **Trusted: yes**. If **Paired** stays `no`, run `diagnose.sh` and check `journalctl -u bluetooth` while connecting.
 5. If macOS shows the Deck as a **laptop** or adds a **Bluetooth audio output**: remove **every** “Steam Deck” / **SteamDeckPad** entry on the Mac, update the app, start the service (it switches the adapter to **LE-only** while running), then pair **only SteamDeckPad**. Stop the service before using Deck Bluetooth headphones again.
+
+### Wired shows Active but the Mac doesn't see the device
+
+- Re-plug the USB-C cable (the Mac re-enumerates on a fresh plug)
+- On the Mac: **System Report → USB** — the composite device should appear as **054C:05C4** (Gamepad profile) or **1209:0001** (Keyboard profile)
+- The app rebuilds the gadget whenever the configured profile doesn't match (tracked in `/tmp/steamdeck_hid.profile`); if it still says Active but the Mac sees nothing, run on the Deck: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh`, start again, then check `dmesg | tail -50` for `configfs-gadget` errors. A wedged dwc3 UDC only recovers on a Deck reboot
 
 ### Wired USB fails immediately
 

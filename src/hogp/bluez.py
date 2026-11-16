@@ -811,6 +811,7 @@ PRO_CONTROLLER_NAME = "Pro Controller"
 PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
 HID_SERVICE_UUID_FULL = "00001124-0000-1000-8000-00805f9b34fb"
 HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
+_HID_SDP_STATE = {"object_reg": None}  # Gio registration id while the profile is exported
 
 
 def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
@@ -888,8 +889,12 @@ def register_hid_sdp_profile(
     </node>
     """
     try:
+        # Clear a stale record from a previous run/crash so a second Start in
+        # the same session cannot fail with AlreadyExists.
+        unregister_hid_sdp_profile(bus, profile_path)
+
         node_info = Gio.DBusNodeInfo.new_for_xml(profile_xml)
-        bus.register_object(
+        _HID_SDP_STATE["object_reg"] = bus.register_object(
             profile_path,
             node_info.interfaces[0],
             lambda *args, **kwargs: None,  # method calls are no-ops
@@ -921,8 +926,15 @@ def register_hid_sdp_profile(
         )
         logger.info("HID SDP record registered with BlueZ")
         return True
-    except GLib.Error as e:
+    except Exception as e:
         logger.error(f"Could not register HID SDP record: {e}")
+        reg = _HID_SDP_STATE.get("object_reg")
+        if reg is not None:
+            try:
+                bus.unregister_object(reg)
+            except Exception:
+                pass
+        _HID_SDP_STATE["object_reg"] = None
         return False
 
 
@@ -946,5 +958,13 @@ def unregister_hid_sdp_profile(
         logger.info("HID SDP record unregistered")
         return True
     except GLib.Error as e:
-        logger.warning(f"UnregisterProfile: {e}")
+        logger.debug(f"UnregisterProfile: {e}")
         return False
+    finally:
+        reg = _HID_SDP_STATE.get("object_reg")
+        if reg is not None:
+            try:
+                bus.unregister_object(reg)
+            except Exception:
+                pass
+        _HID_SDP_STATE["object_reg"] = None
