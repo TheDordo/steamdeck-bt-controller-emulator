@@ -73,7 +73,8 @@ SUBCMD_ENABLE_VIBRATION = 0x48
 INPUT_STANDARD_FULL = 0x30
 INPUT_SUBCMD_REPLY = 0x21
 
-INPUT_REPORT_INTERVAL_S = 0.016  # ~60 Hz stream, matches the real controller
+INPUT_REPORT_INTERVAL_S = 0.008  # ~125 Hz baseline (real Pro streams at 120 Hz)
+MIN_SEND_INTERVAL_S = 0.004     # event-driven sends are not throttled below this
 
 # ---------------------------------------------------------------------------
 # HID report map (the real Pro Controller's Bluetooth HID descriptor,
@@ -285,6 +286,8 @@ class ProControllerEmulator:
         self._threads = []
         self._timer = 0
         self._input_report_mode = None
+        self._send_lock = threading.Lock()
+        self._last_send_s = 0.0
         self._vibrator_cycle = [0x00, 0x70, 0xC0, 0xB0]
         self._vibrator_idx = 0
 
@@ -299,19 +302,23 @@ class ProControllerEmulator:
                 self._buttons |= (1 << index)
             else:
                 self._buttons &= ~(1 << index)
+            self._trigger_send()
 
     def set_axis(self, index: int, value: int) -> None:
         if 0 <= index < 4:
             self._axes[index] = max(-32768, min(32767, value))
+            self._trigger_send()
 
     def set_trigger(self, index: int, value: int) -> None:
         if 0 <= index < 2:
             self._triggers[index] = max(0, min(255, value))
+            self._trigger_send()
 
     def set_hat(self, value: int) -> None:
         if value == 0x0F:
             value = 0x08
         self._hat = value if 0 <= value <= 8 else 0x08
+        self._trigger_send()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -592,8 +599,25 @@ class ProControllerEmulator:
             (raw_y >> 4) & 0xFF,
         ])
 
+    def _trigger_send(self) -> None:
+        """Send the current state right away (buttons/hat/axes changed)."""
+        if not self._streaming:
+            return
+        self._send_now(self._build_standard_report())
+
+    def _send_now(self, report: bytes) -> bool:
+        """Write one input report, rate-limited to MIN_SEND_INTERVAL_S."""
+        with self._send_lock:
+            now = time.monotonic()
+            if now - self._last_send_s < MIN_SEND_INTERVAL_S:
+                return True  # too soon; state goes out on the next tick
+            if self._write_interrupt(bytes([HIDP_DATA_INPUT]) + report):
+                self._last_send_s = now
+                return True
+            return False
+
     def _stream_loop(self) -> None:
-        """Stream 0x30 input reports at ~60 Hz on the interrupt channel."""
+        """Baseline 0x30 stream; state changes also trigger immediate sends."""
         logger.info("Pro Controller: streaming input reports")
         last = 0.0
         while self._running and self._streaming:
@@ -601,8 +625,7 @@ class ProControllerEmulator:
             if now - last >= INPUT_REPORT_INTERVAL_S:
                 last = now
                 self._timer = (self._timer + 1) & 0xFF
-                report = self._build_standard_report()
-                if not self._write_interrupt(bytes([HIDP_DATA_INPUT]) + report):
+                if not self._send_now(self._build_standard_report()):
                     break
             time.sleep(0.002)
         self._streaming = False

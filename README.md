@@ -105,6 +105,16 @@ Teardown: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh
 
 ---
 
+## Latency
+
+Input is forwarded event-driven with a ~4 ms floor and no batching beyond a short stick/trigger coalesce:
+
+- **Wired (DS4):** every state change writes a report to `/dev/hidg0` immediately; the host polls the USB interrupt endpoint at its native interval (sub-millisecond on high-speed links)
+- **Bluetooth (Pro Controller):** buttons/sticks/hat changes trigger an immediate `0x30` report, with a 125 Hz baseline stream keeping the link alive between changes
+- The GUI batches only stick/trigger axes (~4 ms) — buttons and the D-pad apply on the next main-loop idle
+
+---
+
 ## Diagnostics
 
 If anything fails, run this and share the output when asking for help:

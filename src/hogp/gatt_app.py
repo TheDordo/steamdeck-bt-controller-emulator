@@ -21,8 +21,9 @@ from .battery import read_battery_percent
 
 # Default configuration
 DEFAULT_REPORT_RATE_HZ = 10
-# BlueZ ATT drops notifications if flooded; gwyntel/bt-keyboard-adapter uses 30ms.
-NOTIFY_MIN_INTERVAL_MS = 30
+# BlueZ ATT drops notifications if flooded; keep a floor for bursts but stay
+# snappy (50 Hz cap is plenty for the keyboard/gamepad over LE).
+NOTIFY_MIN_INTERVAL_MS = 20
 
 # macOS bonds when the central reads/notifies encrypted GATT attributes.
 HID_INFO_FLAGS = ["read", "encrypt-read"]

@@ -737,7 +737,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._shutting_down = False
         self._stop_in_progress = False
         self._input_coalesce_id: Optional[int] = None
-        self._input_coalesce_ms = 20
+        self._input_coalesce_ms = 4  # stick/trigger batching only (latency)
         self._pending_buttons: Dict[int, bool] = {}
         self._pending_axes: Dict[int, int] = {}
         self._pending_triggers: Dict[int, int] = {}
@@ -1251,8 +1251,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
 
     def _on_button(self, index, pressed):
-        self._pending_buttons[index] = pressed
-        self._schedule_input_coalesce()
+        # Buttons are latency-critical: apply on the next main-loop idle
+        # instead of waiting for the axis-coalescing window.
+        GLib.idle_add(self._apply_button, index, pressed)
 
     def _apply_button(self, index, pressed):
         if self._pro_controller:
@@ -1290,8 +1291,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return False
 
     def _on_hat(self, direction):
-        self._pending_hat = direction
-        self._schedule_input_coalesce()
+        # D-pad is latency-critical: apply on the next main-loop idle.
+        GLib.idle_add(self._apply_hat, direction)
 
     def _apply_hat(self, direction):
         if self._pro_controller:

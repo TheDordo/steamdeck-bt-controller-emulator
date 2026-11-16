@@ -22,8 +22,10 @@ from .ds4 import Ds4ReportBuilder
 
 logger = logging.getLogger(__name__)
 
-# Match BLE throttle — axis/button floods can fill the USB HID queue.
-USB_GAMEPAD_MIN_INTERVAL_MS = 30
+# Absolute floor between gamepad writes. The host polls the interrupt endpoint
+# at sub-millisecond intervals on high-speed links, so 1 ms is only a guard
+# against pathological event floods.
+USB_GAMEPAD_MIN_INTERVAL_MS = 1
 
 
 class USBGadgetHID:
@@ -85,7 +87,6 @@ class USBGadgetHID:
         self._mouse_wheel = 0  # Wheel movement (signed 8-bit)
         self._mouse_h_wheel = 0  # Horizontal wheel (signed 8-bit)
         self._last_gamepad_send_ms = 0
-        self._gamepad_write_pending = False
 
         # DualShock 4 report builder (used when gamepad_profile == "ds4")
         self._ds4: Optional[Ds4ReportBuilder] = None
@@ -297,9 +298,7 @@ class USBGadgetHID:
 
         now = self._now_ms()
         if now - self._last_gamepad_send_ms < USB_GAMEPAD_MIN_INTERVAL_MS:
-            self._gamepad_write_pending = True
-            return
-        self._gamepad_write_pending = False
+            return  # later state changes supersede; nothing is dropped
         self._last_gamepad_send_ms = now
 
         try:

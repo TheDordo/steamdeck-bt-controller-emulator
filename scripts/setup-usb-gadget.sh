@@ -138,6 +138,14 @@ echo 2 > functions/hid.usb2/protocol  # 2 = mouse
 echo 1 > functions/hid.usb2/subclass  # 1 = boot interface
 echo 6 > functions/hid.usb2/report_length  # Mouse report size (6 bytes without Report ID)
 
+# Reduce the interrupt endpoint polling interval where the kernel supports it
+# (f_hid poll_interval sysfs attribute, ms; ignored on kernels without it).
+for f in functions/hid.usb0/poll_interval functions/hid.usb1/poll_interval functions/hid.usb2/poll_interval; do
+    if [ -f "$f" ]; then
+        echo 1 > "$f"
+    fi
+done
+
 # Write HID report descriptors using Python script
 echo "Writing HID report descriptors..."
 python3 "${SCRIPT_DIR}/write-hid-descriptors.py" --profile "${PROFILE}" \
