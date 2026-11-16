@@ -158,6 +158,16 @@ Current builds use **one HoG Report characteristic (char3)** with **gamepad + ke
 - Confirm `evtest` shows a gamepad node (see [Diagnostics](#diagnostics))
 - On the host (e.g. Steam), map the new controller once
 
+### macOS Game Controllers shows “Disconnected” in USB mode
+
+That screen tracks **Bluetooth game controllers** (your paired **SteamDeckPad** BLE entry). **Wired USB does not keep that Bluetooth session alive**, so the same listing often shows **Disconnected** even when the cable is fine.
+
+USB mode exposes **three plain HID interfaces** (gamepad, keyboard, mouse), not an MFi/Xbox-style controller. Check cable connectivity here:
+
+**Option** → **System Settings** → **General** → **About** → **System Report** → **USB** — look for **SteamDeckPad** / **USB HID Gamepad** (vendor `1209`).
+
+Games that only use Apple’s **GameController** framework may ignore this pad; use **Steam**’s controller settings, emulators with raw HID mapping, or test keyboard tab + **hidtest**-style tools. Generic USB HID often **never** appears as “connected” under Game Controllers.
+
 ### Wired USB fails immediately
 
 - BIOS **DRD** enabled, **cold boot**

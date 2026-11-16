@@ -26,8 +26,8 @@ USB_BCD="0x0200"     # USB 2.0
 
 # Strings
 SERIAL="steamdeck001"
-MANUFACTURER="Steam Deck"
-PRODUCT="HID Controller"
+MANUFACTURER="SteamDeckPad"
+PRODUCT="USB HID Gamepad"
 
 # Configuration
 CONFIG_NAME="c.1"

@@ -1007,8 +1007,12 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _update_status_wired_active(self):
         """Update UI for wired mode active state."""
         self.status_label.set_markup("<big><b>Status: Active - Wired USB</b></big>")
-        self.connection_label.set_label("Connected via USB")
-        self.device_info_label.set_label("HID devices: /dev/hidg0 (gamepad), /dev/hidg1 (keyboard), /dev/hidg2 (mouse)")
+        self.connection_label.set_label("Connected via USB (cable)")
+        self.device_info_label.set_label(
+            "Mac: Game Controllers tracks Bluetooth only — SteamDeckPad may show Disconnected "
+            "here. USB gamepad is separate: System Settings → General → About → System Report → USB. "
+            "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
+        )
         self.stop_button.set_sensitive(True)
         # Start update loop
         self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
