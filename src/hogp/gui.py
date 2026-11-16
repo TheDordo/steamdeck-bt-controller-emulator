@@ -1124,6 +1124,10 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         if self._gatt_app:
             self._gatt_app.unregister()
             self._gatt_app = None
+
+        if self._pairing_agent:
+            self._pairing_agent.unregister()
+            self._pairing_agent = None
         
         # Reset adapter to default state (restore normal Bluetooth operation)
         if self._bus and self._adapter_path:
