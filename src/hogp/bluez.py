@@ -7,6 +7,7 @@ deadlocks with GDBus on older glib versions.
 
 import logging
 import subprocess
+import uuid
 from typing import Optional, Callable, Any, List, Dict
 
 from gi.repository import Gio, GLib
@@ -321,7 +322,9 @@ def ensure_adapter_powered_and_discoverable(bus: Gio.DBusConnection, adapter_pat
     if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
         return False
     set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True))
-    set_adapter_property(bus, adapter_path, "Bondable", GLib.Variant("b", True))  # may be unsupported on some stacks
+    # NOTE: BlueZ Adapter1 has no "Bondable" property (that is a btmgmt-only
+    # setting); setting it logs "No such property 'Bondable'" and must be
+    # avoided.
     # BR/EDR discoverable off — LE advertisement sets Discoverable for centrals.
     set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", False))
     return True
@@ -809,7 +812,6 @@ def clear_static_ble_address(adapter_index: int = 0) -> bool:
 
 PRO_CONTROLLER_NAME = "Pro Controller"
 PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
-HID_SERVICE_UUID_FULL = "00001124-0000-1000-8000-00805f9b34fb"
 HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
 _HID_SDP_STATE = {"object_reg": None, "last_error": None}  # Gio registration id while the profile is exported
 
@@ -909,8 +911,13 @@ def register_hid_sdp_profile(
             GLib.Variant(
                 "(osa{sv})",
                 (
+                    # Use a unique UUID so we never collide with BlueZ's
+                    # built-in HID host profile (0x1124), which rejects the
+                    # registration with "UUID already registered". The
+                    # advertised service class comes from the ServiceRecord
+                    # XML, exactly like joycontrol does.
                     profile_path,
-                    HID_SERVICE_UUID_FULL,
+                    str(uuid.uuid4()),
                     {
                         "ServiceRecord": GLib.Variant("s", sdp_xml),
                         "Role": GLib.Variant("s", "server"),

@@ -1056,7 +1056,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             self._pro_controller = ProControllerEmulator(adapter_address=adapter_address)
             self._pro_controller.on_state_change = self._on_pro_controller_state
             if not self._pro_controller.start():
-                self._show_error("Could not bind HID L2CAP sockets (PSM 0x11/0x13)")
+                unregister_hid_sdp_profile(self._bus)
+                self._pro_sdp_registered = False
+                self._show_error(
+                    "Could not bind HID L2CAP sockets (PSM 0x11/0x13). If the "
+                    "ports are in use, run 'sudo modprobe -r hidp' in Konsole "
+                    "and try again."
+                )
                 return False
 
             self._registered = True
