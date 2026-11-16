@@ -463,11 +463,111 @@ def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Di
                         "name": props_dict.get("Name", GLib.Variant("s", "Unknown")).get_string(),
                         "address": props_dict.get("Address", GLib.Variant("s", "")).get_string(),
                         "connected": connected,
+                        "paired": props_dict.get("Paired", GLib.Variant("b", False)).get_boolean(),
+                        "trusted": props_dict.get("Trusted", GLib.Variant("b", False)).get_boolean(),
+                        "bonded": props_dict.get("Bonded", GLib.Variant("b", False)).get_boolean(),
                     })
     except GLib.Error as e:
         logger.error(f"Error getting connected devices: {e}")
     
     return devices
+
+
+DEVICE_IFACE = "org.bluez.Device1"
+
+
+def get_device_property(bus: Gio.DBusConnection, device_path: str, prop_name: str) -> Any:
+    """Read one org.bluez.Device1 property."""
+    try:
+        result = bus.call_sync(
+            BLUEZ_SERVICE,
+            device_path,
+            DBUS_PROPS_IFACE,
+            "Get",
+            GLib.Variant("(ss)", (DEVICE_IFACE, prop_name)),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return result.get_child_value(0).get_variant()
+    except GLib.Error as e:
+        logger.debug(f"Get {prop_name} on {device_path}: {e}")
+        return None
+
+
+def set_device_trusted(bus: Gio.DBusConnection, device_path: str, trusted: bool = True) -> bool:
+    """Mark remote central trusted (auto-reconnect on macOS/Linux)."""
+    try:
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            device_path,
+            DBUS_PROPS_IFACE,
+            "Set",
+            GLib.Variant("(ssv)", (DEVICE_IFACE, "Trusted", GLib.Variant("b", trusted))),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        logger.info(f"Set Trusted={trusted} on {device_path}")
+        return True
+    except GLib.Error as e:
+        logger.warning(f"Could not set Trusted on {device_path}: {e}")
+        return False
+
+
+def pair_device_sync(
+    bus: Gio.DBusConnection,
+    device_path: str,
+    timeout_ms: int = 90000,
+) -> tuple[bool, Optional[str]]:
+    """Complete SMP pairing with connected central (e.g. Mac)."""
+    try:
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            device_path,
+            DEVICE_IFACE,
+            "Pair",
+            None,
+            None,
+            Gio.DBusCallFlags.NONE,
+            timeout_ms,
+            None,
+        )
+        logger.info(f"Paired with {device_path}")
+        return True, None
+    except GLib.Error as e:
+        msg = str(e)
+        if "AlreadyExists" in msg or "Already Paired" in msg:
+            return True, None
+        logger.warning(f"Pair failed for {device_path}: {e}")
+        return False, msg
+
+
+def complete_bond_with_central(
+    bus: Gio.DBusConnection,
+    adapter_path: str,
+) -> Optional[Dict]:
+    """
+    If a central is connected but not bonded, run Pair and Trust.
+    Returns updated device info dict or None.
+    """
+    device = get_primary_connected_device(bus, adapter_path)
+    if not device:
+        return None
+    path = device["path"]
+    paired = device.get("paired", False)
+    bonded = device.get("bonded", False)
+    if not paired and not bonded:
+        ok, err = pair_device_sync(bus, path)
+        if not ok:
+            logger.warning(f"Bond incomplete: {err}")
+        else:
+            paired = True
+    if paired or bonded:
+        set_device_trusted(bus, path, True)
+    return get_primary_connected_device(bus, adapter_path)
 
 
 def get_primary_connected_device(bus: Gio.DBusConnection, adapter_path: str) -> Optional[Dict]:

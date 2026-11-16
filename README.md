@@ -127,6 +127,16 @@ BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x1
 - On the **host**, start the pairing flow from Bluetooth settings (don’t rely only on “scan”).
 - If Android pairs then disconnects: on the Deck (Developer mode), try in `/etc/bluetooth/main.conf` under `[General]`: `ReverseServiceDiscovery = false`, then `sudo systemctl restart bluetooth`. This stops BlueZ from probing the phone as a GATT client during connect.
 
+### macOS shows connected but not “Paired” / no game controller
+
+GATT notify can start **before** macOS finishes SMP bonding. Latest builds **call `Device1.Pair()` and set `Trusted`** when HID notify starts, and the UI shows **Paired / Trusted** (not only “sending data”).
+
+1. Re-run [install.sh](#installation) and **log out / in** (D-Bus policy + pairing agent).
+2. On the Mac: **System Settings → Bluetooth** — remove old **SteamDeckPad** entries, then connect again from the list (don’t use only a quick-connect chip).
+3. If the Mac stalls on pairing: accept any **“Bluetooth Pairing Request”** dialog (Just Works / confirm).
+4. Deck UI should show **Paired — sending HID data** with **Paired: yes** and **Trusted: yes**. If **Paired** stays `no`, run `diagnose.sh` and check `journalctl -u bluetooth` while connecting.
+5. For controller input in games, open **System Settings → Game Controllers** (or Steam) and confirm **SteamDeckPad** appears; map buttons once if needed.
+
 ### Pairs but no input (Bluetooth)
 
 - Forget device on both sides and pair again

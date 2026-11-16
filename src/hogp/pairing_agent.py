@@ -19,10 +19,11 @@ DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 
 class PairingAgent:
-    """Auto-accept inbound BLE pairing as a NoInputNoOutput agent."""
+    """Auto-accept inbound BLE pairing (default agent for peripheral mode)."""
 
     AGENT_PATH = "/com/steamdeck/hogp/agent"
-    CAPABILITY = "NoInputNoOutput"
+    # KeyboardDisplay works better with macOS/iOS (passkey / confirm pairing).
+    CAPABILITY = "KeyboardDisplay"
 
     def __init__(self, bus: Gio.DBusConnection, verbose: bool = False):
         self.bus = bus
@@ -134,7 +135,11 @@ class PairingAgent:
             device = params.unpack()[0] if params.n_children() else ""
             if method == "Release":
                 invoc.return_value(None)
-            elif method in ("RequestConfirmation", "RequestAuthorization", "AuthorizeService"):
+            elif method == "RequestConfirmation":
+                passkey = params.unpack()[1] if params.n_children() > 1 else 0
+                logger.info(f"Agent pairing confirmation for {device} (passkey {passkey:06d}) — accepting")
+                invoc.return_value(None)
+            elif method in ("RequestAuthorization", "AuthorizeService"):
                 if self.verbose:
                     logger.info(f"Agent {method} for {device} — accepting")
                 invoc.return_value(None)
