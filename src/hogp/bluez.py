@@ -813,7 +813,7 @@ def clear_static_ble_address(adapter_index: int = 0) -> bool:
 PRO_CONTROLLER_NAME = "Pro Controller"
 PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
 HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
-_HID_SDP_STATE = {"object_reg": None, "last_error": None}  # Gio registration id while the profile is exported
+_HID_SDP_STATE = {"last_error": None}  # last RegisterProfile failure detail
 
 
 def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
@@ -870,39 +870,16 @@ def register_hid_sdp_profile(
     map) with BlueZ so the Mac can discover and pair the gamepad.
 
     Modern BlueZ (>=5.10) accepts a raw ServiceRecord XML via
-    ProfileManager1.RegisterProfile; no sdptool needed. We implement a
-    minimal org.bluez.Profile1 object because BlueZ requires the profile
-    object to exist, but our own L2CAP sockets handle the connections
-    (same design as joycontrol).
-    """
-    profile_xml = """
-    <node>
-        <interface name="org.bluez.Profile1">
-            <method name="Release"/>
-            <method name="NewConnection">
-                <arg type="o" direction="in"/>
-                <arg type="h" direction="in"/>
-                <arg type="a{sv}" direction="in"/>
-            </method>
-            <method name="RequestDisconnection">
-                <arg type="o" direction="in"/>
-            </method>
-        </interface>
-    </node>
+    ProfileManager1.RegisterProfile; no sdptool needed. No Profile1 object
+    is exported: BlueZ only consults it when a client connects to a PSM it
+    manages, and we pass no PSM option, so our own L2CAP sockets own both
+    HID channels (same design as joycontrol). The UUID argument is random
+    so it never collides with BlueZ's built-in HID (input) profile.
     """
     try:
         # Clear a stale record from a previous run/crash so a second Start in
         # the same session cannot fail with AlreadyExists.
         unregister_hid_sdp_profile(bus, profile_path)
-
-        node_info = Gio.DBusNodeInfo.new_for_xml(profile_xml)
-        _HID_SDP_STATE["object_reg"] = bus.register_object(
-            profile_path,
-            node_info.interfaces[0],
-            lambda *args, **kwargs: None,  # method calls are no-ops
-            None,
-            None,
-        )
         bus.call_sync(
             BLUEZ_SERVICE,
             "/org/bluez",
@@ -937,13 +914,6 @@ def register_hid_sdp_profile(
     except Exception as e:
         _HID_SDP_STATE["last_error"] = str(e)
         logger.error(f"Could not register HID SDP record: {e}")
-        reg = _HID_SDP_STATE.get("object_reg")
-        if reg is not None:
-            try:
-                bus.unregister_object(reg)
-            except Exception:
-                pass
-        _HID_SDP_STATE["object_reg"] = None
         return False
 
 
@@ -969,14 +939,6 @@ def unregister_hid_sdp_profile(
     except GLib.Error as e:
         logger.debug(f"UnregisterProfile: {e}")
         return False
-    finally:
-        reg = _HID_SDP_STATE.get("object_reg")
-        if reg is not None:
-            try:
-                bus.unregister_object(reg)
-            except Exception:
-                pass
-        _HID_SDP_STATE["object_reg"] = None
 
 
 def get_last_sdp_error() -> Optional[str]:
