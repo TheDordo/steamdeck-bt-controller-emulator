@@ -66,6 +66,10 @@ CLI mode available for testing without `--gui` flag. Use `--forward /dev/input/e
 
 ## Troubleshooting
 
+### SteamOS 3.7+ (Preview / Main / Beta)
+
+BlueZ **5.76+** on recent SteamOS builds enforces the full GATT D-Bus tree during `RegisterApplication`. Older builds of this app could hang on **Starting...** or pair without passing input. **Re-run the install script** to pick up fixes, then **log out and back in** (group + D-Bus policy). If Bluetooth mode still fails on a bleeding-edge image, use **Wired USB** mode as a fallback.
+
 - if you make the connection to the computer but steam does not recognize any controller, first try a reboot (especially if you have not logged out/rebooted since first install). If you still have issues, try forgetting both the deck from the PC and the pc from the deck in their respective bluetooth settings.
 
 - When pairing, be sure on both devices to affirm the pin matches when asked, generally I find acknowledging on the PC first, then steam deck second is the best way to go, but it shouldn't matter much

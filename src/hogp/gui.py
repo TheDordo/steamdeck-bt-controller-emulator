@@ -669,6 +669,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._registered = False
         self._running = False
         self._update_timeout_id = None
+        self._mode = "bluetooth"
         
         # Build UI
         self._build_ui()
@@ -785,7 +786,11 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.status_label.set_markup("<big><b>Status: Starting...</b></big>")
         
         if self._mode == "bluetooth":
-            threading.Thread(target=self._start_bluetooth_service, daemon=True).start()
+            # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
+            threading.Thread(
+                target=self._prepare_bluetooth_adapter,
+                daemon=True,
+            ).start()
         else:
             threading.Thread(target=self._start_wired_service, daemon=True).start()
     
@@ -795,8 +800,17 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.status_label.set_markup("<big><b>Status: Stopping...</b></big>")
         GLib.idle_add(self._stop_service)
     
+    def _prepare_bluetooth_adapter(self):
+        """Configure adapter (blocking); D-Bus work continues on main thread."""
+        try:
+            adapter_idx = get_adapter_index("hci0")
+            set_static_ble_address(adapter_idx, "C2:12:34:56:78:9A")
+        except Exception as e:
+            logger.warning(f"Static BLE address setup skipped: {e}")
+        GLib.idle_add(self._start_bluetooth_service)
+
     def _start_bluetooth_service(self):
-        """Start the BLE HoG service (runs in thread)."""
+        """Start the BLE HoG service on the GTK/GLib main thread."""
         try:
             # Get D-Bus connection
             self._bus = get_system_bus()
@@ -804,41 +818,39 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             # Find adapter
             self._adapter_path = find_adapter_path(self._bus, "hci0")
             if not self._adapter_path:
-                GLib.idle_add(self._show_error, "Bluetooth adapter not found")
-                return
+                self._show_error("Bluetooth adapter not found")
+                return False
             
             # Set adapter alias to match our device name
             set_adapter_alias(self._bus, self._adapter_path, "SteamDeckPad")
             
-            # Set static address
-            adapter_idx = get_adapter_index("hci0")
-            set_static_ble_address(adapter_idx, "C2:12:34:56:78:9A")
-            
             # Ensure adapter is powered
             if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
-                GLib.idle_add(self._show_error, "Failed to power on Bluetooth")
-                return
+                self._show_error("Failed to power on Bluetooth")
+                return False
             
             # Create GATT application
             self._gatt_app = GattApplication(self._bus, device_name="SteamDeckPad", verbose=False)
             self._gatt_app.set_report_rate(60)
             
             if not self._gatt_app.register():
-                GLib.idle_add(self._show_error, "Failed to register GATT service")
-                return
+                self._show_error("Failed to register GATT service")
+                return False
             
             # Create advertisement
             self._advertisement = Advertisement(self._bus, "SteamDeckPad", verbose=False)
             if not self._advertisement.register():
-                GLib.idle_add(self._show_error, "Failed to register advertisement")
-                return
+                self._show_error("Failed to register advertisement")
+                return False
             
-            # Register with BlueZ
-            GLib.idle_add(self._register_with_bluez)
+            # Register with BlueZ (async; keeps main loop processing D-Bus)
+            self._register_with_bluez()
+            return False
             
         except Exception as e:
             logger.error(f"Failed to start bluetooth service: {e}")
-            GLib.idle_add(self._show_error, f"Error: {e}")
+            self._show_error(f"Error: {e}")
+            return False
     
     def _start_wired_service(self):
         """Start the USB Gadget wired mode service (runs in thread)."""
@@ -902,8 +914,16 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     
     def _register_with_bluez(self):
         """Register application and advertisement with BlueZ."""
+        self._reg_timeout_id = GLib.timeout_add(35000, self._on_bluez_registration_timeout)
+
+        def clear_reg_timeout():
+            if getattr(self, "_reg_timeout_id", None):
+                GLib.source_remove(self._reg_timeout_id)
+                self._reg_timeout_id = None
+
         def on_app_registered(success, error):
             if not success:
+                clear_reg_timeout()
                 self._show_error(f"GATT registration failed: {error}")
                 return
             
@@ -915,6 +935,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
         
         def on_adv_registered(success, error):
+            clear_reg_timeout()
             if not success:
                 self._show_error(f"Advertisement failed: {error}")
                 return
@@ -935,6 +956,16 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             GattApplication.APP_PATH,
             on_app_registered,
         )
+
+    def _on_bluez_registration_timeout(self):
+        """Abort UI wait when BlueZ never completes registration."""
+        self._reg_timeout_id = None
+        if not self._registered:
+            self._show_error(
+                "BlueZ registration timed out. Re-run the installer to update "
+                "D-Bus policy, then log out and back in."
+            )
+        return False
     
     def _start_input_handler(self):
         """Start forwarding physical controller input."""
@@ -1078,6 +1109,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         logger.error(message)
         self.status_label.set_markup(f"<big><b>Error: {message}</b></big>")
         self.start_button.set_sensitive(True)
+        self.bluetooth_radio.set_sensitive(True)
+        self.wired_radio.set_sensitive(True)
+        self._running = False
     
     def _show_info(self, message):
         """Show info message."""
