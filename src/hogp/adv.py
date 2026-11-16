@@ -45,7 +45,8 @@ class Advertisement:
         
         # Advertisement properties
         self._type = "peripheral"
-        self._service_uuids = [HID_SERVICE_UUID_16, DEVICE_INFO_SERVICE_UUID_16, GAP_SERVICE_UUID_16]
+        # Advertise HID only; GAP/DIS are provided internally by bluetoothd.
+        self._service_uuids = [HID_SERVICE_UUID_16]
         self._appearance = 0x03C4  # Gamepad appearance
         self._discoverable = True
         self._includes = ["tx-power"]

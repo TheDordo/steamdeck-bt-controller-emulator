@@ -203,12 +203,8 @@ class GattApplication:
     - APP_PATH/service0/char2 (HID Control Point)
     - APP_PATH/service0/char3 (Report - with notifications)
     - APP_PATH/service0/char3/desc0 (Report Reference)
-    - APP_PATH/service1 (Device Information Service)
-    - APP_PATH/service1/char0 (Manufacturer Name)
-    - APP_PATH/service1/char1 (Model Number)
-    - APP_PATH/service1/char2 (PnP ID)
-    - APP_PATH/service2 (Generic Access Profile)
-    - APP_PATH/service2/char0 (Device Name)
+    HID service only in the exported GATT tree. GAP (0x1800) and DIS (0x180a)
+    are owned by bluetoothd; registering them causes "Failed to create entry in database".
     """
 
     APP_PATH = "/com/steamdeck/hogp"
@@ -349,12 +345,7 @@ class GattApplication:
             self._register_hid_control_point_char()
             self._register_report_char()
             self._register_report_reference_desc()
-            self._register_device_info_service()
-            self._register_dis_manufacturer_char()
-            self._register_dis_model_char()
-            self._register_dis_pnp_id_char()
-            self._register_gap_service()
-            self._register_gap_device_name_char()
+            # Do not register GAP (0x1800) or DIS (0x180a) — BlueZ already owns these.
             logger.info(f"GATT objects registered under {self.APP_PATH}")
             return True
         except Exception as e:
@@ -424,15 +415,6 @@ class GattApplication:
         char2_path = f"{service_path}/char2"
         char3_path = f"{service_path}/char3"
         desc0_path = f"{char3_path}/desc0"
-        
-        # Device Information Service paths
-        dis_service_path = f"{self.APP_PATH}/service1"
-        dis_char0_path = f"{dis_service_path}/char0"
-        dis_char1_path = f"{dis_service_path}/char1"
-        dis_char2_path = f"{dis_service_path}/char2"
-
-        gap_service_path = f"{self.APP_PATH}/service2"
-        gap_char0_path = f"{gap_service_path}/char0"
 
         return {
             service_path: {
@@ -479,52 +461,6 @@ class GattApplication:
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
                     "Characteristic": GLib.Variant("o", char3_path),
                     "Flags": GLib.Variant("as", ["read"]),
-                },
-            },
-            dis_service_path: {
-                GATT_SERVICE_IFACE: {
-                    "UUID": GLib.Variant("s", DEVICE_INFO_SERVICE_UUID),
-                    "Primary": GLib.Variant("b", True),
-                    "Characteristics": GLib.Variant("ao", [dis_char0_path, dis_char1_path, dis_char2_path]),
-                },
-            },
-            dis_char0_path: {
-                GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", MANUFACTURER_NAME_UUID),
-                    "Service": GLib.Variant("o", dis_service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
-                    "Descriptors": GLib.Variant("ao", []),
-                },
-            },
-            dis_char1_path: {
-                GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", MODEL_NUMBER_UUID),
-                    "Service": GLib.Variant("o", dis_service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
-                    "Descriptors": GLib.Variant("ao", []),
-                },
-            },
-            dis_char2_path: {
-                GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", PNP_ID_UUID),
-                    "Service": GLib.Variant("o", dis_service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
-                    "Descriptors": GLib.Variant("ao", []),
-                },
-            },
-            gap_service_path: {
-                GATT_SERVICE_IFACE: {
-                    "UUID": GLib.Variant("s", GAP_SERVICE_UUID),
-                    "Primary": GLib.Variant("b", True),
-                    "Characteristics": GLib.Variant("ao", [gap_char0_path]),
-                },
-            },
-            gap_char0_path: {
-                GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", DEVICE_NAME_UUID),
-                    "Service": GLib.Variant("o", gap_service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
-                    "Descriptors": GLib.Variant("ao", []),
                 },
             },
         }

@@ -107,6 +107,10 @@ Other helpers:
 
 ## Troubleshooting
 
+### `GATT registration failed` / `Failed to create entry in database`
+
+BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x180a). This fork registers **only the HID service (0x1812)**. Update to the latest fork build if you still see this after an older install.
+
 ### Status stuck on “Starting...” (Bluetooth)
 
 - Re-run the [install command](#installation), then **log out / in**
