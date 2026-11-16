@@ -52,7 +52,7 @@ def serve_l2cap(psm, bdaddr, unix_name):
         for _ in range(50):
             try:
                 us = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-                us.connect(unix_name)
+                us.connect("\0" + unix_name)  # abstract namespace
                 break
             except OSError:
                 if us is not None:

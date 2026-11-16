@@ -46,9 +46,10 @@ HID_INTR_PSM = 0x13
 
 # Abstract unix sockets used between this app and the root L2CAP bridge.
 # The kernel requires CAP_NET_BIND_SERVICE for well-known PSMs, so the
-# bridge binds 0x11/0x13 and relays to us over these.
-UNIX_CTRL_NAME = "\0hogp-pro-ctrl"
-UNIX_INTR_NAME = "\0hogp-pro-intr"
+# bridge binds 0x11/0x13 and relays to us over these. Names are argv-safe
+# plain strings; the '\0' abstract-namespace prefix is added at bind/connect.
+UNIX_CTRL_NAME = "hogp-pro-ctrl"
+UNIX_INTR_NAME = "hogp-pro-intr"
 
 # HIDP transaction header byte for DATA packets
 HIDP_DATA = 0xA0
@@ -360,8 +361,8 @@ class ProControllerEmulator:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
-        except FileNotFoundError:
-            logger.error("sudo is not available for the L2CAP bridge")
+        except (FileNotFoundError, ValueError, OSError) as e:
+            logger.error("Could not launch the L2CAP bridge: %s", e)
             self.stop()
             return False
 
@@ -421,7 +422,7 @@ class ProControllerEmulator:
         """Listen on an abstract unix SOCK_SEQPACKET socket (no filesystem
         cleanup needed); the root bridge connects here after accepting L2CAP."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        sock.bind(name)
+        sock.bind("\0" + name)
         sock.listen(1)
         return sock
 
