@@ -6,6 +6,7 @@ deadlocks with GDBus on older glib versions.
 """
 
 import logging
+import re
 import subprocess
 import uuid
 from typing import Optional, Callable, Any, List, Dict
@@ -815,6 +816,14 @@ PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
 HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
 _HID_SDP_STATE = {"last_error": None}  # last RegisterProfile failure detail
 
+_OBJECT_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]*$")
+
+
+def _is_valid_object_path(path) -> bool:
+    """D-Bus object path validation, used defensively before building
+    GVariant('o') values (PyGObject aborts leaf constructors on bad paths)."""
+    return isinstance(path, str) and bool(_OBJECT_PATH_RE.match(path))
+
 
 def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
     """Read the adapter's BR/EDR public address (used in device-info replies)."""
@@ -876,33 +885,53 @@ def register_hid_sdp_profile(
     HID channels (same design as joycontrol). The UUID argument is random
     so it never collides with BlueZ's built-in HID (input) profile.
     """
+    if not _is_valid_object_path(profile_path):
+        _HID_SDP_STATE["last_error"] = f"invalid profile object path: {profile_path!r}"
+        logger.error("Invalid SDP profile object path: %r", profile_path)
+        return False
     try:
         # Clear a stale record from a previous run/crash so a second Start in
         # the same session cannot fail with AlreadyExists.
         unregister_hid_sdp_profile(bus, profile_path)
+
+        # Build the (osa{sv}) parameters with explicit leaf constructors.
+        # PyGObject's tuple-form GLib.Variant() marshalling can fail on 'o'
+        # members with an opaque "constructor returned NULL", so avoid it.
+        # The UUID is random so it never collides with BlueZ's built-in HID
+        # host profile (0x1124), which would reject the registration with
+        # "UUID already registered"; the advertised service class comes from
+        # the ServiceRecord XML, exactly like joycontrol does.
+        params = GLib.Variant.new_tuple(
+            GLib.Variant.new_object_path(profile_path),
+            GLib.Variant.new_string(str(uuid.uuid4())),
+            GLib.Variant.new_array(
+                GLib.VariantType.new("{sv}"),
+                [
+                    GLib.Variant.new_dict_entry(
+                        GLib.Variant.new_string("ServiceRecord"),
+                        GLib.Variant.new_variant(GLib.Variant.new_string(sdp_xml)),
+                    ),
+                    GLib.Variant.new_dict_entry(
+                        GLib.Variant.new_string("Role"),
+                        GLib.Variant.new_variant(GLib.Variant.new_string("server")),
+                    ),
+                    GLib.Variant.new_dict_entry(
+                        GLib.Variant.new_string("RequireAuthentication"),
+                        GLib.Variant.new_variant(GLib.Variant.new_boolean(False)),
+                    ),
+                    GLib.Variant.new_dict_entry(
+                        GLib.Variant.new_string("RequireAuthorization"),
+                        GLib.Variant.new_variant(GLib.Variant.new_boolean(False)),
+                    ),
+                ],
+            ),
+        )
         bus.call_sync(
             BLUEZ_SERVICE,
             "/org/bluez",
             "org.bluez.ProfileManager1",
             "RegisterProfile",
-            GLib.Variant(
-                "(osa{sv})",
-                (
-                    # Use a unique UUID so we never collide with BlueZ's
-                    # built-in HID host profile (0x1124), which rejects the
-                    # registration with "UUID already registered". The
-                    # advertised service class comes from the ServiceRecord
-                    # XML, exactly like joycontrol does.
-                    profile_path,
-                    str(uuid.uuid4()),
-                    {
-                        "ServiceRecord": GLib.Variant("s", sdp_xml),
-                        "Role": GLib.Variant("s", "server"),
-                        "RequireAuthentication": GLib.Variant("b", False),
-                        "RequireAuthorization": GLib.Variant("b", False),
-                    },
-                ),
-            ),
+            params,
             None,
             Gio.DBusCallFlags.NONE,
             10000,
@@ -912,8 +941,10 @@ def register_hid_sdp_profile(
         logger.info("HID SDP record registered with BlueZ")
         return True
     except Exception as e:
-        _HID_SDP_STATE["last_error"] = str(e)
-        logger.error(f"Could not register HID SDP record: {e}")
+        _HID_SDP_STATE["last_error"] = (
+            f"{type(e).__name__}: {e} (profile path {profile_path!r})"
+        )
+        logger.error("Could not register HID SDP record: %s", _HID_SDP_STATE["last_error"])
         return False
 
 
@@ -922,13 +953,18 @@ def unregister_hid_sdp_profile(
     profile_path: str = HID_SDP_PROFILE_PATH,
 ) -> bool:
     """Remove the HID SDP record registered by register_hid_sdp_profile()."""
+    if not _is_valid_object_path(profile_path):
+        return False
     try:
+        params = GLib.Variant.new_tuple(
+            GLib.Variant.new_object_path(profile_path)
+        )
         bus.call_sync(
             BLUEZ_SERVICE,
             "/org/bluez",
             "org.bluez.ProfileManager1",
             "UnregisterProfile",
-            GLib.Variant("(o)", (profile_path,)),
+            params,
             None,
             Gio.DBusCallFlags.NONE,
             5000,
