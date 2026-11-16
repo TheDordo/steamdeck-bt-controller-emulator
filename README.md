@@ -107,6 +107,10 @@ Other helpers:
 
 ## Troubleshooting
 
+### `Advertisement failed` / `Failed to parse advertisement`
+
+Usually a bad combination of `LEAdvertisement1` properties (e.g. `Appearance` set twice). Update to the latest fork build.
+
 ### `GATT registration failed` / `Failed to create entry in database`
 
 BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x180a). This fork registers **only the HID service (0x1812)**. Update to the latest fork build if you still see this after an older install.
