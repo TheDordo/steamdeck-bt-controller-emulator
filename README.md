@@ -1,85 +1,156 @@
 # Steamin Ma HoG
 
-Emulates a Bluetooth LE or **Wired USB** gamepad peripheral that forwards controller input from a Steam Deck to other devices. Not only that, but you also get full keyboard, trackpad, and media controls tabs. 
+Emulates a Bluetooth LE or **Wired USB** gamepad peripheral that forwards controller input from a Steam Deck to other devices. Not only that, but you also get full keyboard, trackpad, and media controls tabs.
 
 ![controller view](assets/controller-tab.png) ![keyboard view](assets/keyboard-tab.png) ![media view](assets/media-tab.png) ![trackpad view](assets/trackpad-tab.png)
 
-This is a HID-over-GATT profile implementation using BlueZ D-Bus APIs for Bluetooth, plus USB Gadget (configfs) support for wired connections. Primarily built with Steam Deck and Steam OS in mind, but other linux devices could take advantage too, just be sure to install any dependencies the install script may complain about not having.
+HID-over-GATT via BlueZ D-Bus, plus USB gadget (configfs) for wired connections. Built for **SteamOS 3.x** on Steam Deck; other Linux distros may work if dependencies are installed.
+
+> **Maintained fork (SteamOS 3.7+ fixes):** [TheDordo/steamdeck-bt-controller-emulator](https://github.com/TheDordo/steamdeck-bt-controller-emulator) — includes BlueZ 5.76+ registration fixes, Steam Deck evdev detection, USB setup improvements, and [`scripts/diagnose.sh`](scripts/diagnose.sh).  
+> Upstream: [xXJSONDeruloXx/steamdeck-bt-controller-emulator](https://github.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator).
+
+---
+
+## Before you install
+
+| Requirement | Bluetooth | Wired USB |
+|-------------|-----------|-----------|
+| **Mode** | Desktop Mode recommended (Konsole + app menu) | Desktop Mode |
+| **User password** | Optional (for `btmgmt`) | **Required** (`passwd`) for setup |
+| **BIOS** | — | **USB Dual Role Device → DRD** |
+| **Cable** | — | USB-C **data** cable (not charge-only) |
+| **After install** | **Log out and back in** | Same + cold boot after BIOS change |
+
+On **SteamOS Preview / Main / Beta** (BlueZ 5.76+), use this fork and re-run the installer after updates. Bleeding-edge OS builds can still break built-in controller evdev; run diagnostics if both modes fail.
+
+---
 
 ## Installation
 
-**Do Not Blindly Run Scripts You Find On The Internet!** Review the contents first: [install.sh](install.sh)
+Review the script before running: [install.sh](install.sh)
 
-Copy the following command and paste into your terminal (konsole on Steam Deck):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/install.sh | bash
-```
-
-- Installs to `~/steamdeck-bt-controller-emulator`
-- Creates desktop launcher and shortcuts
-- Configures Bluetooth and input permissions
-- **Log out and back in after first install** for group changes to take effect
-
-I recommend right clicking/long pressing on the app or desktop shortcut and adding to Steam. From there you can take advantage of Steam Input for gyro, back buttons, dual trackpads etc.
-
-Run the same installation command to update to the latest version:
+**One-line install / update** (Desktop Konsole):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash
 ```
+
+The installer will:
+
+- Clone or update `~/steamdeck-bt-controller-emulator`
+- Add you to `input` and `bluetooth` groups
+- Install D-Bus policy, sudoers (BlueZ + passwordless USB setup), and udev rules for `/dev/hidg*`
+- Create Desktop and application menu shortcuts
+
+**You must log out and log back in** (or reboot) after the first install so groups and D-Bus policy apply.
+
+Add the desktop shortcut to Steam as a non-Steam game if you want it from Gaming Mode — still prefer **Desktop Mode** when starting Bluetooth/USB service.
 
 ### Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/uninstall.sh | bash
 ```
 
+---
 
 ## Usage
 
-### Bluetooth Mode (Wireless)
+Launch **BT Controller Emulator** from the app menu, Desktop shortcut, or:
 
-Launch from application menu, desktop shortcut or run `python3 -m src.hogp` directly. GUI provides connection management and input monitoring. 
+```bash
+cd ~/steamdeck-bt-controller-emulator
+./scripts/run-gui.sh
+```
 
-1. Select **Bluetooth** mode in the GUI
-2. Press "Start Service"
-3. On the device you want to control, open bluetooth settings
-4. Look for "SteamDeckPad" or "BlueZ 597" and connect
-5. Follow pairing prompts on both devices
+### Bluetooth (wireless)
 
-After a few seconds, the device should now recognize an hid controller over bluetooth, as well as a keyboard and mouse hid device.
+1. Select **Bluetooth**
+2. **Start Service** — wait for **Active - Discoverable** (not stuck on *Starting...*)
+3. On the host (PC, TV, etc.), open Bluetooth settings
+4. Pair **SteamDeckPad** (or similar), confirm PIN on both sides
+5. Host should see a gamepad, keyboard, and mouse
 
-### Wired Mode
+CLI (no GUI): `python3 -m src.hogp` from the install directory (see `--help`).
 
-For wired connection:
+### Wired USB
 
-1. Go into bios (hold + while booting up or in terminal run `systemctl reboot --firmware`)
-2. in Utility > Advanced > USB Config > USB Dual Role and set to `DRD`.
-2. Connect Steam Deck to target device with data usb c cable
-3. Select **Wired USB** mode in the GUI
-4. Press "Start Service" (input pass if asked)
+1. **BIOS:** Shut down → hold **Volume +** + **Power** → Setup Utility → **Advanced** → **USB Configuration** → **USB Dual Role Device** → **DRD** → save and exit. Cold boot.
+2. Connect Deck to host with a **data** USB-C cable (Deck port toward host).
+3. In the app: **Wired USB** → **Start Service** (first run configures the gadget; no password prompt if install completed).
+4. Host should enumerate USB HID (gamepad, keyboard, mouse).
 
-Your Steam Deck will appear as a USB HID controller/keyboard/mouse.
+Manual gadget setup: `sudo ~/steamdeck-bt-controller-emulator/scripts/setup-usb-gadget.sh`  
+Teardown: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh`
 
-CLI mode available for testing without `--gui` flag. Use `--forward /dev/input/eventX` to map physical controller.
+---
+
+## Diagnostics
+
+If anything fails, run this and share the output when asking for help:
+
+```bash
+~/steamdeck-bt-controller-emulator/scripts/diagnose.sh
+```
+
+Other helpers:
+
+| Script | Purpose |
+|--------|---------|
+| [`scripts/diagnose.sh`](scripts/diagnose.sh) | Groups, BlueZ, evdev gamepads, USB gadget |
+| [`scripts/check-usb-gadget.sh`](scripts/check-usb-gadget.sh) | USB gadget / `hidg` only |
+| [`scripts/view-logs.sh`](scripts/view-logs.sh) | Tail journal while reproducing |
+
+**Quick evdev check:** `evtest` — you should see something like **Valve Software Steam Deck Controller** or **Microsoft X-Box 360 pad** (Steam virtual pad). If the list has no gamepad, the app cannot forward sticks/buttons until SteamOS exposes input (try quitting Steam, Desktop Mode, or a stable OS channel).
+
+---
 
 ## Troubleshooting
 
-### SteamOS 3.7+ (Preview / Main / Beta)
+### Status stuck on “Starting...” (Bluetooth)
 
-BlueZ **5.76+** on recent SteamOS builds enforces the full GATT D-Bus tree during `RegisterApplication`. Older builds of this app could hang on **Starting...** or pair without passing input. **Re-run the install script** to pick up fixes, then **log out and back in** (group + D-Bus policy). If Bluetooth mode still fails on a bleeding-edge image, use **Wired USB** mode as a fallback.
+- Re-run the [install command](#installation), then **log out / in**
+- Run from **Desktop Mode**
+- Run `diagnose.sh`; check BlueZ / D-Bus errors in Konsole when starting the service
 
-- if you make the connection to the computer but steam does not recognize any controller, first try a reboot (especially if you have not logged out/rebooted since first install). If you still have issues, try forgetting both the deck from the PC and the pc from the deck in their respective bluetooth settings.
+### Pairs but no input (Bluetooth)
 
-- When pairing, be sure on both devices to affirm the pin matches when asked, generally I find acknowledging on the PC first, then steam deck second is the best way to go, but it shouldn't matter much
+- Forget device on both sides and pair again
+- Reboot the Deck after first install
+- Confirm `evtest` shows a gamepad node (see [Diagnostics](#diagnostics))
+- On the host (e.g. Steam), map the new controller once
 
-- on first pair, you will probably have to jump into controller config settings in steam and do the mapping routine, things like triggers and bumpers may not map exactly right by default but all inputs are exposed so Steam can assign to the right places. skip guide and qam buttons, those are mapped inside the GUI rather than the physical controllers pass through (since the actual decks guide and qam are reserved for its nav needs).
+### Wired USB fails immediately
+
+- BIOS **DRD** enabled, **cold boot**
+- `passwd` set for user `deck`
+- Re-run installer (passwordless `sudo` for setup scripts)
+- `check-usb-gadget.sh` — need UDC, gadget bound, `/dev/hidg0`–`hidg2` writable
+
+### Both modes fail on Preview / Main
+
+Some prerelease builds do not expose built-in controls to evdev while Steam or the kernel holds them. Use `diagnose.sh` and `evtest`. Mitigations: Desktop Mode, exit Steam before starting the service, **Stable** channel, or USB mode with DRD. Kernel customization on stock SteamOS is not a practical fix for most users.
+
+### General pairing / mapping tips
+
+- Confirm matching PIN when prompted (often acknowledge on PC first, then Deck)
+- Triggers/bumpers may need one-time mapping in the host’s controller settings
+- **Guide / QAM** on the physical Deck are not forwarded; use the in-app **Home** / **QAM** buttons (keyboard shortcuts)
+
+---
 
 ## Development
 
-`just deploy` syncs to Steam Deck over SSH (be sure to change the ip). `just run` executes remotely. `just logs` tails system logs. Source in src/hogp includes bluez.py (D-Bus interface), gatt_app.py (HID service), input_handler.py (evdev forwarding), and gui.py (GTK4 interface).
+From repo root on a dev machine:
+
+- `just deploy` — sync to Deck over SSH (edit IP in justfile)
+- `just run` — run remotely
+- `just logs` — tail logs
+
+Key modules: `src/hogp/bluez.py`, `gatt_app.py`, `input_handler.py`, `usb_gadget.py`, `gui.py`
+
+---
 
 ## References
 
-[EmuBTHID](https://github.com/Alkaid-Benetnash/EmuBTHID), [BTGamepad](https://github.com/007durgesh219/BTGamepad), [diyps3controller](https://github.com/rafikel/diyps3controller), [GIMX](https://github.com/matlo/GIMX) 
+[EmuBTHID](https://github.com/Alkaid-Benetnash/EmuBTHID), [BTGamepad](https://github.com/007durgesh219/BTGamepad), [diyps3controller](https://github.com/rafikel/diyps3controller), [GIMX](https://github.com/matlo/GIMX), [DeckJoy](https://github.com/Lucaber/deckjoy) (USB gadget reference)

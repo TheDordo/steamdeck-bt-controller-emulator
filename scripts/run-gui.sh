@@ -1,6 +1,6 @@
 #!/bin/bash
-# Quick launcher for BT Controller Emulator GUI
-# Run this on the Steam Deck to launch the GUI
+# Launch BT Controller Emulator GUI (Desktop Mode recommended).
+# Install/update: curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash
 
 # Go to project root (parent of scripts directory)
 cd "$(dirname "$0")/.."

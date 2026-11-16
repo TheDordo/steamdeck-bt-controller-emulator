@@ -1,6 +1,6 @@
 #!/bin/bash
 # Uninstaller for BT Controller Emulator
-# Usage: curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/uninstall.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/uninstall.sh | bash
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ DESKTOP_SHORTCUT="$HOME/Desktop/bt-controller-emulator.desktop"
 echo "Uninstalling BT Controller Emulator..."
 echo "  - Application files from: $INSTALL_DIR"
 echo "  - Desktop shortcuts"
-echo "  - System permissions (D-Bus policies, sudoers rules)"
+echo "  - System permissions (D-Bus, sudoers, udev)"
 echo "  - User from 'bluetooth' group"
 echo "  - Bluetooth adapter reset"
 echo
@@ -55,13 +55,26 @@ if [ -f "$DBUS_POLICY" ]; then
     echo "✓ Removed D-Bus policy"
 fi
 
-# Remove sudoers rule
+# Remove sudoers rules
 SUDOERS_FILE="/etc/sudoers.d/bt-controller-emulator"
 if [ -f "$SUDOERS_FILE" ]; then
     sudo rm "$SUDOERS_FILE" || {
         echo "⚠ Warning: Could not remove sudoers rule: $SUDOERS_FILE"
     }
     echo "✓ Removed sudoers rule"
+fi
+
+USB_SUDOERS="/etc/sudoers.d/bt-controller-emulator-usb-${CURRENT_USER}"
+if [ -f "$USB_SUDOERS" ]; then
+    sudo rm "$USB_SUDOERS" || echo "⚠ Warning: Could not remove $USB_SUDOERS"
+    echo "✓ Removed per-user USB sudoers"
+fi
+
+UDEV_RULE="/etc/udev/rules.d/99-steamdeck-hidg.rules"
+if [ -f "$UDEV_RULE" ]; then
+    sudo rm "$UDEV_RULE" || echo "⚠ Warning: Could not remove udev rule"
+    sudo udevadm control --reload-rules 2>/dev/null || true
+    echo "✓ Removed udev rule for hidg"
 fi
 
 # Reload D-Bus

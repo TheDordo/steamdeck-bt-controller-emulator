@@ -1,11 +1,13 @@
 #!/bin/bash
 # One-line installer for BT Controller Emulator
-# Usage: curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash
 
 set -euo pipefail
 
-REPO_URL="https://github.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator.git"
+REPO_URL="https://github.com/TheDordo/steamdeck-bt-controller-emulator.git"
 INSTALL_DIR="$HOME/steamdeck-bt-controller-emulator"
+INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh"
+UNINSTALL_SCRIPT_URL="https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/uninstall.sh"
 
 echo "=== BT Controller Emulator - Installer ==="
 echo
@@ -22,8 +24,9 @@ CURRENT_USER="$USER"
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo "Updating existing installation..."
     cd "$INSTALL_DIR"
-    git stash -u
-    git pull
+    git remote set-url origin "$REPO_URL"
+    git stash push -u -m "install.sh stash $(date -Iseconds)" 2>/dev/null || git stash -u
+    git pull --rebase origin main
 else
     echo "Installing to $INSTALL_DIR..."
     git clone "$REPO_URL" "$INSTALL_DIR"
@@ -166,31 +169,33 @@ cp "$DESKTOP_FILE" "$DESKTOP_SHORTCUT"
 chmod +x "$DESKTOP_SHORTCUT"
 echo "✓ Desktop launcher created"
 
-chmod +x "$INSTALL_DIR/scripts/run-gui.sh" 2>/dev/null || true
-chmod +x "$INSTALL_DIR/scripts/launcher-wrapper.sh" 2>/dev/null || true
+chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 echo
 echo "=== Installation Complete ==="
 echo
+echo "IMPORTANT: Log out and back in (or reboot) so 'input'/'bluetooth' groups and D-Bus policy apply."
+echo
 if [ "$GROUPS_CHANGED" = true ]; then
-    echo "⚠ Activating new group memberships..."
-    exec sg input -c "exec sg bluetooth -c 'echo; echo ✓ Groups activated; echo; echo The BT Controller Emulator runs as a normal user (no root needed).; exec $SHELL'"
+    echo "⚠ New group memberships — logging out is required before Bluetooth/USB will work."
 fi
-echo "The BT Controller Emulator runs as a normal user (no root needed)."
 echo
-echo "You can now launch 'BT Controller Emulator' from:"
-echo "  - Desktop mode: Application menu"
-echo "  - Game mode: Add as non-Steam game"
+echo "Prerequisites:"
+echo "  Bluetooth — use Desktop Mode; wait for 'Active - Discoverable'"
+echo "  Wired USB — BIOS: USB Dual Role = DRD; set password with: passwd"
 echo
-echo "Usage:"
-echo "  1. Launch the application"
-echo "  2. Select Bluetooth or Wired USB mode"
-echo "  3. Click 'Start Service'"
-echo "  4. Connect from another device"
+echo "Launch: Application menu → BT Controller Emulator   (or: $INSTALL_DIR/scripts/run-gui.sh)"
 echo
-echo "Diagnostics: $INSTALL_DIR/scripts/diagnose.sh"
-echo "To update:  curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash"
-echo "To uninstall: curl -fsSL https://raw.githubusercontent.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator/main/uninstall.sh | bash"
+echo "Quick start:"
+echo "  1. Open the app in Desktop Mode"
+echo "  2. Pick Bluetooth or Wired USB"
+echo "  3. Start Service → connect from the other device"
+echo
+echo "Diagnostics:  $INSTALL_DIR/scripts/diagnose.sh"
+echo "USB check:    $INSTALL_DIR/scripts/check-usb-gadget.sh"
+echo
+echo "Update:       curl -fsSL $INSTALL_SCRIPT_URL | bash"
+echo "Uninstall:    curl -fsSL $UNINSTALL_SCRIPT_URL | bash"
 echo
