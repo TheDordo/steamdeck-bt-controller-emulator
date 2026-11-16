@@ -13,6 +13,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Match BLE throttle — axis/button floods can fill the USB HID queue.
+USB_GAMEPAD_MIN_INTERVAL_MS = 30
+
 
 class USBGadgetHID:
     """
@@ -67,6 +70,8 @@ class USBGadgetHID:
         self._mouse_y = 0  # Y movement (signed 16-bit)
         self._mouse_wheel = 0  # Wheel movement (signed 8-bit)
         self._mouse_h_wheel = 0  # Horizontal wheel (signed 8-bit)
+        self._last_gamepad_send_ms = 0
+        self._gamepad_write_pending = False
 
     def open(self) -> bool:
         """
@@ -80,9 +85,9 @@ class USBGadgetHID:
             return True
         
         try:
-            # Open gamepad device
+            # Open gamepad device (blocking — nonblocking writes often fail with EAGAIN)
             if os.path.exists(self.gamepad_device):
-                self._gamepad_fd = os.open(self.gamepad_device, os.O_RDWR | os.O_NONBLOCK)
+                self._gamepad_fd = os.open(self.gamepad_device, os.O_RDWR)
                 logger.info(f"Opened gamepad device: {self.gamepad_device} (fd={self._gamepad_fd})")
             else:
                 logger.warning(f"Gamepad device not found: {self.gamepad_device}")
@@ -107,6 +112,7 @@ class USBGadgetHID:
             
             self._active = True
             logger.info("USB gadget HID opened successfully")
+            self._send_gamepad_report()
             return True
             
         except Exception as e:
@@ -249,10 +255,23 @@ class USBGadgetHID:
             # HAT switch
             report[12] = self._hat
             
-            written = os.write(self._gamepad_fd, bytes(report))
-            if written != len(report):
+            payload = bytes(report)
+            offset = 0
+            while offset < len(payload):
+                try:
+                    written = os.write(self._gamepad_fd, payload[offset:])
+                except OSError as e:
+                    if e.errno in (11, 35):  # EAGAIN / EWOULDBLOCK
+                        time.sleep(0.002)
+                        continue
+                    raise
+                if written <= 0:
+                    logger.error("Gamepad write returned 0 bytes")
+                    break
+                offset += written
+            if offset != len(payload):
                 logger.error(
-                    f"Gamepad write short: {written}/{len(report)} bytes — re-run setup-usb-gadget.sh"
+                    f"Gamepad write short: {offset}/{len(payload)} bytes — re-run setup-usb-gadget.sh"
                 )
             
             if self.verbose:

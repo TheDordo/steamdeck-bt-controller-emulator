@@ -298,9 +298,24 @@ class GattApplication:
 
     def _flush_gamepad_notify(self) -> bool:
         self._gamepad_notify_pending = False
-        if self._gamepad_notifying:
+        if self._can_send_gamepad():
             self._send_gamepad_notification()
         return False
+
+    def _can_send_gamepad(self) -> bool:
+        return self._gamepad_notifying or self._keyboard_notifying
+
+    def _gamepad_notify_path(self) -> Optional[str]:
+        """
+        macOS often enables notifications only on the keyboard Report char (char4).
+        Fall back to char4 when char3 was never subscribed so gamepad reports still deliver.
+        """
+        base = f"{self.APP_PATH}/service0"
+        if self._gamepad_notifying:
+            return f"{base}/char3"
+        if self._keyboard_notifying:
+            return f"{base}/char4"
+        return None
 
     def set_button(self, button_index: int, pressed: bool) -> None:
         """Set a button state (0-10)."""
@@ -1401,12 +1416,12 @@ class GattApplication:
         )
 
     def _ensure_notify_timer(self) -> None:
-        if self._notify_timeout_id is None and self._gamepad_notifying:
+        if self._notify_timeout_id is None and self._can_send_gamepad():
             interval_ms = max(1, 1000 // self._report_rate_hz)
             self._notify_timeout_id = GLib.timeout_add(interval_ms, self._send_gamepad_notification)
 
     def _clear_notify_timer_if_idle(self) -> None:
-        if not self._gamepad_notifying and self._notify_timeout_id is not None:
+        if not self._can_send_gamepad() and self._notify_timeout_id is not None:
             GLib.source_remove(self._notify_timeout_id)
             self._notify_timeout_id = None
 
@@ -1414,29 +1429,35 @@ class GattApplication:
         if self._gamepad_notifying:
             return
         self._gamepad_notifying = True
-        logger.info("Gamepad notifications enabled")
+        logger.info("Gamepad notifications enabled (char3)")
         if self._on_notify_start:
             self._on_notify_start()
+        self._last_gamepad_report = None
         self._ensure_notify_timer()
-        self._keyboard_notifying = True
+        self._send_gamepad_notification()
 
     def stop_gamepad_notify(self) -> None:
         if not self._gamepad_notifying:
             return
         self._gamepad_notifying = False
-        self._keyboard_notifying = False
-        logger.info("Gamepad notifications disabled")
+        logger.info("Gamepad notifications disabled (char3)")
         self._clear_notify_timer_if_idle()
-        if self._on_notify_stop:
+        if self._on_notify_stop and not self._keyboard_notifying:
             self._on_notify_stop()
 
     def start_keyboard_notify(self) -> None:
         self._keyboard_notifying = True
-        logger.info("Keyboard notifications enabled")
+        logger.info(
+            "Keyboard notifications enabled (char4); gamepad will use char4 if char3 is not subscribed"
+        )
+        self._last_gamepad_report = None
+        self._ensure_notify_timer()
+        self._send_gamepad_notification()
 
     def stop_keyboard_notify(self) -> None:
         self._keyboard_notifying = False
-        logger.info("Keyboard notifications disabled")
+        logger.info("Keyboard notifications disabled (char4)")
+        self._clear_notify_timer_if_idle()
 
     def start_notify(self) -> None:
         self.start_gamepad_notify()
@@ -1448,14 +1469,15 @@ class GattApplication:
             self._kbd_release_timeout_id = None
 
     def _send_gamepad_notification(self) -> bool:
-        if not self._gamepad_notifying:
+        char_path = self._gamepad_notify_path()
+        if not char_path:
             return False
         report = self.get_current_report()
         if report == self._last_gamepad_report:
             return True
         self._last_gamepad_report = report
         self._queue_hid_notification(
-            f"{self.APP_PATH}/service0/char3",
+            char_path,
             report,
             priority=0,
         )
