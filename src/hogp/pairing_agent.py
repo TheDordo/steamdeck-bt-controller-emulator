@@ -22,8 +22,8 @@ class PairingAgent:
     """Auto-accept inbound BLE pairing (default agent for peripheral mode)."""
 
     AGENT_PATH = "/com/steamdeck/hogp/agent"
-    # KeyboardDisplay works better with macOS/iOS (passkey / confirm pairing).
-    CAPABILITY = "KeyboardDisplay"
+    # Just Works LE pairing — KeyboardDisplay can stall macOS when we auto-accept.
+    CAPABILITY = "NoInputNoOutput"
 
     def __init__(self, bus: Gio.DBusConnection, verbose: bool = False):
         self.bus = bus
@@ -135,13 +135,14 @@ class PairingAgent:
             device = params.unpack()[0] if params.n_children() else ""
             if method == "Release":
                 invoc.return_value(None)
-            elif method == "RequestConfirmation":
-                passkey = params.unpack()[1] if params.n_children() > 1 else 0
-                logger.info(f"Agent pairing confirmation for {device} (passkey {passkey:06d}) — accepting")
-                invoc.return_value(None)
-            elif method in ("RequestAuthorization", "AuthorizeService"):
-                if self.verbose:
-                    logger.info(f"Agent {method} for {device} — accepting")
+            elif method in (
+                "RequestConfirmation",
+                "RequestAuthorization",
+                "AuthorizeService",
+                "DisplayPasskey",
+                "DisplayPinCode",
+            ):
+                logger.info(f"Pairing agent {method} for {device} — accepting")
                 invoc.return_value(None)
             elif method == "Cancel":
                 logger.debug("Agent Cancel")
@@ -150,8 +151,6 @@ class PairingAgent:
                 invoc.return_value(GLib.Variant("(s)", ("0000",)))
             elif method == "RequestPasskey":
                 invoc.return_value(GLib.Variant("(u)", (0,)))
-            elif method in ("DisplayPinCode", "DisplayPasskey"):
-                invoc.return_value(None)
             else:
                 invoc.return_dbus_error(
                     "org.freedesktop.DBus.Error.UnknownMethod",

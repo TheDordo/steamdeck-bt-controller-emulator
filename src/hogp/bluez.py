@@ -548,26 +548,29 @@ def pair_device_sync(
 def complete_bond_with_central(
     bus: Gio.DBusConnection,
     adapter_path: str,
-) -> Optional[Dict]:
+) -> tuple[Optional[Dict], Optional[str]]:
     """
     If a central is connected but not bonded, run Pair and Trust.
-    Returns updated device info dict or None.
+    Returns (updated device info dict or None, error message or None).
     """
     device = get_primary_connected_device(bus, adapter_path)
     if not device:
-        return None
+        return None, "No connected device"
     path = device["path"]
     paired = device.get("paired", False)
     bonded = device.get("bonded", False)
+    err: Optional[str] = None
+    set_device_trusted(bus, path, True)
     if not paired and not bonded:
-        ok, err = pair_device_sync(bus, path)
+        ok, pair_err = pair_device_sync(bus, path)
         if not ok:
-            logger.warning(f"Bond incomplete: {err}")
-        else:
-            paired = True
-    if paired or bonded:
+            err = pair_err
+            logger.warning(f"Bond incomplete: {pair_err}")
+    updated = get_primary_connected_device(bus, adapter_path)
+    if updated and (updated.get("paired") or updated.get("bonded")):
         set_device_trusted(bus, path, True)
-    return get_primary_connected_device(bus, adapter_path)
+        err = None
+    return updated, err
 
 
 def get_primary_connected_device(bus: Gio.DBusConnection, adapter_path: str) -> Optional[Dict]:

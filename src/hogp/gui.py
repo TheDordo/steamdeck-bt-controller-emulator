@@ -9,6 +9,7 @@ import logging
 import sys
 import os
 import threading
+import time
 from typing import Optional
 
 import gi
@@ -676,6 +677,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._mode = "bluetooth"
         self._bond_in_progress = False
         self._bond_attempted_for: Optional[str] = None
+        self._last_bond_attempt_at = 0.0
+        self._last_bond_error: Optional[str] = None
         
         # Build UI
         self._build_ui()
@@ -839,7 +842,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 self._show_error("Failed to power on Bluetooth")
                 return False
 
-            self._pairing_agent = PairingAgent(self._bus, verbose=False)
+            self._pairing_agent = PairingAgent(self._bus, verbose=True)
             if not self._pairing_agent.register():
                 self._show_error(
                     "Could not register Bluetooth pairing agent. Re-run install.sh and log out/in."
@@ -1076,22 +1079,24 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         )
         
         # Update connection status (Bluetooth mode only)
-        if self._gatt_app:
+        if self._gatt_app and self._bus and self._adapter_path:
+            device_info = get_primary_connected_device(self._bus, self._adapter_path)
+            if device_info:
+                self._maybe_complete_bond(device_info)
             if self._gatt_app.notifying:
-                if self._bus and self._adapter_path:
-                    device_info = get_primary_connected_device(self._bus, self._adapter_path)
-                    if device_info:
-                        self._maybe_complete_bond(device_info)
-                        self._refresh_bt_connection_labels(device_info)
-                    else:
-                        self.connection_label.set_label("✓ Sending data")
-                        self.device_info_label.set_label("")
+                if device_info:
+                    self._refresh_bt_connection_labels(device_info)
                 else:
                     self.connection_label.set_label("✓ Sending data")
+                    self.device_info_label.set_label("")
             elif self._registered:
-                self.connection_label.set_label("Waiting for connection...")
-                self.device_info_label.set_label("")
-                self._bond_attempted_for = None
+                if device_info:
+                    self._refresh_bt_connection_labels(device_info)
+                    self.connection_label.set_label("✓ Connected — accept pairing on Mac…")
+                else:
+                    self.connection_label.set_label("Waiting for connection...")
+                    self.device_info_label.set_label("")
+                    self._bond_attempted_for = None
         
         return True
     
@@ -1110,22 +1115,30 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.connection_label.set_label(conn)
         bond_line = "yes" if paired else "no (in progress)"
         trust_line = "yes" if trusted else "no"
+        err_line = ""
+        if self._last_bond_error and not paired:
+            err_line = f"\n<b>Bond:</b> {GLib.markup_escape_text(self._last_bond_error)}"
         self.device_info_label.set_markup(
             f"<b>Device:</b> {device_info['name']}\n"
             f"<b>Address:</b> {device_info['address']}\n"
             f"<b>Paired:</b> {bond_line}  <b>Trusted:</b> {trust_line}"
+            f"{err_line}"
         )
     
     def _maybe_complete_bond(self, device_info: dict) -> None:
-        """Trigger BlueZ Pair + Trusted once per central after HID notify starts."""
+        """Trigger BlueZ Pair + Trusted when a central connects."""
         path = device_info.get("path")
         if not path:
             return
         paired = device_info.get("paired") or device_info.get("bonded")
         if paired and device_info.get("trusted"):
             self._bond_attempted_for = path
+            self._last_bond_error = None
             return
-        if self._bond_in_progress or self._bond_attempted_for == path:
+        if self._bond_in_progress:
+            return
+        now = time.monotonic()
+        if path == self._bond_attempted_for and (now - self._last_bond_attempt_at) < 20.0:
             return
         
         bus = self._bus
@@ -1134,18 +1147,23 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         
         def work():
             try:
-                updated = complete_bond_with_central(bus, adapter_path)
+                updated, err = complete_bond_with_central(bus, adapter_path)
             except Exception as e:
                 logger.warning(f"Bond completion failed: {e}")
-                updated = None
-            GLib.idle_add(self._on_bond_complete, device_path, updated)
+                updated, err = None, str(e)
+            GLib.idle_add(self._on_bond_complete, device_path, updated, err)
         
         self._bond_in_progress = True
+        self._last_bond_attempt_at = now
         threading.Thread(target=work, daemon=True, name="hogp-bond").start()
     
-    def _on_bond_complete(self, device_path, device_info):
+    def _on_bond_complete(self, device_path, device_info, error_msg):
         self._bond_in_progress = False
-        self._bond_attempted_for = device_path
+        self._last_bond_error = error_msg
+        paired = device_info and (device_info.get("paired") or device_info.get("bonded"))
+        if paired:
+            self._bond_attempted_for = device_path
+            self._last_bond_error = None
         if device_info:
             self._refresh_bt_connection_labels(device_info)
         return False
@@ -1202,6 +1220,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.device_info_label.set_label("")
         self._bond_in_progress = False
         self._bond_attempted_for = None
+        self._last_bond_attempt_at = 0.0
+        self._last_bond_error = None
         self.start_button.set_sensitive(True)
         self.stop_button.set_sensitive(False)
         self.bluetooth_radio.set_sensitive(True)

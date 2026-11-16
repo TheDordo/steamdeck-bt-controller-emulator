@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 # Default configuration
 DEFAULT_REPORT_RATE_HZ = 10
 
+# macOS bonds when the central reads/notifies encrypted GATT attributes.
+HID_INFO_FLAGS = ["read", "encrypt-read"]
+REPORT_MAP_FLAGS = ["read", "encrypt-read"]
+HID_CONTROL_POINT_FLAGS = ["write-without-response", "encrypt-write"]
+REPORT_CHAR_FLAGS = ["read", "notify", "encrypt-read", "encrypt-notify"]
+REPORT_REFERENCE_FLAGS = ["read", "encrypt-read"]
+
 # Standard UUIDs
 HID_SERVICE_UUID = "00001812-0000-1000-8000-00805f9b34fb"
 HID_INFO_UUID = "00002a4a-0000-1000-8000-00805f9b34fb"
@@ -428,7 +435,7 @@ class GattApplication:
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", HID_INFO_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
+                    "Flags": GLib.Variant("as", HID_INFO_FLAGS),
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
@@ -436,7 +443,7 @@ class GattApplication:
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_MAP_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
+                    "Flags": GLib.Variant("as", REPORT_MAP_FLAGS),
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
@@ -444,7 +451,7 @@ class GattApplication:
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", HID_CONTROL_POINT_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["write-without-response"]),
+                    "Flags": GLib.Variant("as", HID_CONTROL_POINT_FLAGS),
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
@@ -452,7 +459,7 @@ class GattApplication:
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["read", "notify"]),
+                    "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
                     "Descriptors": GLib.Variant("ao", [desc0_path]),
                 },
             },
@@ -460,7 +467,7 @@ class GattApplication:
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
                     "Characteristic": GLib.Variant("o", char3_path),
-                    "Flags": GLib.Variant("as", ["read"]),
+                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
                 },
             },
         }
@@ -568,6 +575,7 @@ class GattApplication:
             HID_INFO_UUID,
             HID_INFO,
             "HID Information",
+            flags=HID_INFO_FLAGS,
         )
 
     def _register_report_map_char(self) -> None:
@@ -577,6 +585,7 @@ class GattApplication:
             REPORT_MAP_UUID,
             REPORT_MAP,
             "Report Map",
+            flags=REPORT_MAP_FLAGS,
         )
 
     def _register_hid_control_point_char(self) -> None:
@@ -626,7 +635,7 @@ class GattApplication:
                 props = {
                     "UUID": GLib.Variant("s", HID_CONTROL_POINT_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["write-without-response"]),
+                    "Flags": GLib.Variant("as", HID_CONTROL_POINT_FLAGS),
                     "Descriptors": GLib.Variant("ao", []),
                 }
                 if method == "Get":
@@ -663,6 +672,7 @@ class GattApplication:
         value: bytes,
         name: str,
         service_path: Optional[str] = None,
+        flags: Optional[List[str]] = None,
     ) -> None:
         """Register a read-only characteristic."""
         xml = f"""
@@ -692,6 +702,8 @@ class GattApplication:
         """
         if service_path is None:
             service_path = f"{self.APP_PATH}/service0"
+        if flags is None:
+            flags = ["read"]
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
         def handler(conn, sender, obj_path, iface, method, params, invoc):
@@ -709,7 +721,7 @@ class GattApplication:
                 props = {
                     "UUID": GLib.Variant("s", uuid),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["read"]),
+                    "Flags": GLib.Variant("as", flags),
                     "Descriptors": GLib.Variant("ao", []),
                 }
                 if method == "Get":
@@ -800,7 +812,7 @@ class GattApplication:
                 props = {
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", ["read", "notify"]),
+                    "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
                     "Descriptors": GLib.Variant("ao", [desc0_path]),
                     "Notifying": GLib.Variant("b", self._notifying),
                 }
@@ -879,7 +891,7 @@ class GattApplication:
                 props = {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
                     "Characteristic": GLib.Variant("o", char_path),
-                    "Flags": GLib.Variant("as", ["read"]),
+                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
                 }
                 if method == "Get":
                     _, prop = params.unpack()

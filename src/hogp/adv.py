@@ -51,6 +51,7 @@ class Advertisement:
         self._discoverable = True
         # Do not list "appearance" here when Appearance property is set — BlueZ errors.
         self._includes = ["tx-power"]
+        self._connectable = True
 
     def register(self) -> bool:
         """Register advertisement object on D-Bus."""
@@ -83,6 +84,7 @@ class Advertisement:
             "Appearance": GLib.Variant("q", self._appearance),
             "Discoverable": GLib.Variant("b", self._discoverable),
             "Includes": GLib.Variant("as", self._includes),
+            "Connectable": GLib.Variant("b", self._connectable),
         }
 
     def _register_advertisement(self) -> None:
@@ -97,6 +99,7 @@ class Advertisement:
                 <property name="Appearance" type="q" access="read"/>
                 <property name="Discoverable" type="b" access="read"/>
                 <property name="Includes" type="as" access="read"/>
+                <property name="Connectable" type="b" access="read"/>
             </interface>
         </node>
         """
