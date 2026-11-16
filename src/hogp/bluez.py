@@ -796,8 +796,155 @@ def clear_static_ble_address(adapter_index: int = 0) -> bool:
             return False
             
     except subprocess.CalledProcessError as e:
-        logger.warning(f"Failed to clear static BLE address: {e}")
+        logger.warning(f"Failed to clear static BLE address (requires sudo): {e}")
         return False
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
         logger.warning(f"Could not clear static BLE address: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Pro Controller (BR/EDR HID) gamepad mode helpers
+# ---------------------------------------------------------------------------
+
+PRO_CONTROLLER_NAME = "Pro Controller"
+PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
+HID_SERVICE_UUID_FULL = "00001124-0000-1000-8000-00805f9b34fb"
+HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
+
+
+def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
+    """Read the adapter's BR/EDR public address (used in device-info replies)."""
+    try:
+        result = bus.call_sync(
+            BLUEZ_SERVICE,
+            adapter_path,
+            DBUS_PROPS_IFACE,
+            "Get",
+            GLib.Variant("(ss)", (ADAPTER_IFACE, "Address")),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return result.get_child_value(0).get_variant().get_string()
+    except GLib.Error as e:
+        logger.warning(f"Could not read adapter address: {e}")
+        return None
+
+
+def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
+    """
+    Classic BR/EDR posture for the Pro Controller gamepad mode.
+
+    macOS pairs real Pro Controllers as BR/EDR HID peripherals, so unlike the
+    LE HoG mode we keep BR/EDR enabled and advertise a gamepad Class of
+    Device under the name "Pro Controller".
+    """
+    logger.info("Configuring adapter for Pro Controller (BR/EDR HID) mode...")
+    ok = True
+    _run_btmgmt(adapter_index, "power", "off")
+    _run_btmgmt(adapter_index, "bredr", "on")
+    _run_btmgmt(adapter_index, "le", "on")
+    _run_btmgmt(adapter_index, "name", PRO_CONTROLLER_NAME)
+    if not _run_btmgmt(adapter_index, "class", hex(PRO_CONTROLLER_CLASS)):
+        ok = False
+    _run_btmgmt(adapter_index, "ssp", "on")
+    _run_btmgmt(adapter_index, "sc", "on")
+    _run_btmgmt(adapter_index, "connectable", "on")
+    _run_btmgmt(adapter_index, "pairable", "on")
+    _run_btmgmt(adapter_index, "power", "on")
+    return ok
+
+
+def register_hid_sdp_profile(
+    bus: Gio.DBusConnection,
+    sdp_xml: str,
+    profile_path: str = HID_SDP_PROFILE_PATH,
+) -> bool:
+    """
+    Register the HID SDP record (L2CAP PSM 0x11/0x13 + Pro Controller report
+    map) with BlueZ so the Mac can discover and pair the gamepad.
+
+    Modern BlueZ (>=5.10) accepts a raw ServiceRecord XML via
+    ProfileManager1.RegisterProfile; no sdptool needed. We implement a
+    minimal org.bluez.Profile1 object because BlueZ requires the profile
+    object to exist, but our own L2CAP sockets handle the connections
+    (same design as joycontrol).
+    """
+    profile_xml = """
+    <node>
+        <interface name="org.bluez.Profile1">
+            <method name="Release"/>
+            <method name="NewConnection">
+                <arg type="o" direction="in"/>
+                <arg type="h" direction="in"/>
+                <arg type="a{sv}" direction="in"/>
+            </method>
+            <method name="RequestDisconnection">
+                <arg type="o" direction="in"/>
+            </method>
+        </interface>
+    </node>
+    """
+    try:
+        node_info = Gio.DBusNodeInfo.new_for_xml(profile_xml)
+        bus.register_object(
+            profile_path,
+            node_info.interfaces[0],
+            lambda *args, **kwargs: None,  # method calls are no-ops
+            None,
+            None,
+        )
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            "/org/bluez",
+            "org.bluez.ProfileManager1",
+            "RegisterProfile",
+            GLib.Variant(
+                "(osa{sv})",
+                (
+                    profile_path,
+                    HID_SERVICE_UUID_FULL,
+                    {
+                        "ServiceRecord": GLib.Variant("s", sdp_xml),
+                        "Role": GLib.Variant("s", "server"),
+                        "RequireAuthentication": GLib.Variant("b", False),
+                        "RequireAuthorization": GLib.Variant("b", False),
+                    },
+                ),
+            ),
+            None,
+            Gio.DBusCallFlags.NONE,
+            10000,
+            None,
+        )
+        logger.info("HID SDP record registered with BlueZ")
+        return True
+    except GLib.Error as e:
+        logger.error(f"Could not register HID SDP record: {e}")
+        return False
+
+
+def unregister_hid_sdp_profile(
+    bus: Gio.DBusConnection,
+    profile_path: str = HID_SDP_PROFILE_PATH,
+) -> bool:
+    """Remove the HID SDP record registered by register_hid_sdp_profile()."""
+    try:
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            "/org/bluez",
+            "org.bluez.ProfileManager1",
+            "UnregisterProfile",
+            GLib.Variant("(o)", (profile_path,)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        logger.info("HID SDP record unregistered")
+        return True
+    except GLib.Error as e:
+        logger.warning(f"UnregisterProfile: {e}")
         return False

@@ -3,12 +3,27 @@
 # Setup USB gadget HID for Steam Deck wired controller mode
 #
 # This script configures the Linux USB gadget framework (configfs) to create
-# a virtual USB HID device that matches our Bluetooth HID profile.
+# virtual USB HID devices. Two gamepad identities are supported:
+#
+#   --profile ds4      (default) DualShock 4 identity (VID 0x054C/PID 0x05C4,
+#                      64-byte reports). macOS 27's GameController framework
+#                      recognises this as a natively supported controller.
+#   --profile generic  Plain HID gamepad (VID 0x1209, 13-byte reports).
+#                      Works with Steam/games that accept generic HID pads.
 #
 # Requires: configfs mounted, USB gadget drivers loaded, root/sudo access
 #
 
 set -euo pipefail
+
+PROFILE="ds4"
+if [ "${1:-}" = "--profile" ]; then
+    PROFILE="${2:-ds4}"
+    if [ "$PROFILE" != "ds4" ] && [ "$PROFILE" != "generic" ]; then
+        echo "Error: profile must be 'ds4' or 'generic'"
+        exit 1
+    fi
+fi
 
 GADGET_NAME="steamdeck_hid"
 GADGET_DIR="/sys/kernel/config/usb_gadget/${GADGET_NAME}"
@@ -17,24 +32,32 @@ UDC_DEVICE=""  # Will be auto-detected
 # Get script directory before we cd elsewhere
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# USB IDs (using generic HID for Windows/Linux compatibility)
-# Using a common vendor ID that won't trigger proprietary drivers
-VENDOR_ID="0x1209"   # pid.codes (Open Source)
-PRODUCT_ID="0x0001"  # Generic HID Device
-DEVICE_BCD="0x0100"  # Device version 1.0
-USB_BCD="0x0200"     # USB 2.0
-
-# Strings
-SERIAL="steamdeck001"
-MANUFACTURER="SteamDeckPad"
-PRODUCT="USB HID Gamepad"
+# USB IDs
+if [ "$PROFILE" = "ds4" ]; then
+    VENDOR_ID="0x054C"      # Sony Interactive Entertainment
+    PRODUCT_ID="0x05C4"     # DualShock 4 (v1)
+    DEVICE_BCD="0x0100"     # Device version 1.0
+    MANUFACTURER="Sony Interactive Entertainment"
+    PRODUCT="Wireless Controller"
+    SERIAL="a01e0d000000"
+    GAMEPAD_REPORT_LENGTH=64
+else
+    VENDOR_ID="0x1209"      # pid.codes (Open Source)
+    PRODUCT_ID="0x0001"     # Generic HID Device
+    DEVICE_BCD="0x0100"     # Device version 1.0
+    MANUFACTURER="SteamDeckPad"
+    PRODUCT="USB HID Gamepad"
+    SERIAL="steamdeck001"
+    GAMEPAD_REPORT_LENGTH=13
+fi
+USB_BCD="0x0200"            # USB 2.0
 
 # Configuration
 CONFIG_NAME="c.1"
 MAX_POWER="250"  # 250mA
 CONFIG_STRING="HID Gadget Configuration"
 
-echo "=== Setting up USB Gadget HID for Steam Deck ==="
+echo "=== Setting up USB Gadget HID for Steam Deck (profile: ${PROFILE}) ==="
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
@@ -101,7 +124,7 @@ echo "Creating HID functions..."
 mkdir -p functions/hid.usb0
 echo 0 > functions/hid.usb0/protocol   # 0 = none (gamepad is not boot keyboard/mouse)
 echo 0 > functions/hid.usb0/subclass  # 0 = no subclass
-echo 13 > functions/hid.usb0/report_length  # Must match exact write() size to /dev/hidg0
+echo "${GAMEPAD_REPORT_LENGTH}" > functions/hid.usb0/report_length  # Must match exact write() size to /dev/hidg0
 
 # Function 2: Keyboard
 mkdir -p functions/hid.usb1
@@ -117,7 +140,7 @@ echo 6 > functions/hid.usb2/report_length  # Mouse report size (6 bytes without 
 
 # Write HID report descriptors using Python script
 echo "Writing HID report descriptors..."
-python3 "${SCRIPT_DIR}/write-hid-descriptors.py" \
+python3 "${SCRIPT_DIR}/write-hid-descriptors.py" --profile "${PROFILE}" \
     "${GADGET_DIR}/functions/hid.usb0/report_desc" \
     "${GADGET_DIR}/functions/hid.usb1/report_desc" \
     "${GADGET_DIR}/functions/hid.usb2/report_desc"
@@ -149,7 +172,7 @@ sleep 1
 # Check if HID devices were created
 if [ -c /dev/hidg0 ] && [ -c /dev/hidg1 ] && [ -c /dev/hidg2 ]; then
     echo "✓ USB HID gadget devices created successfully!"
-    echo "  - /dev/hidg0 (Gamepad)"
+    echo "  - /dev/hidg0 (Gamepad, ${PROFILE})"
     echo "  - /dev/hidg1 (Keyboard)"
     echo "  - /dev/hidg2 (Mouse)"
     ls -l /dev/hidg*
@@ -170,6 +193,11 @@ echo "Write HID reports to:"
 echo "  - /dev/hidg0 for gamepad input"
 echo "  - /dev/hidg1 for keyboard input"
 echo "  - /dev/hidg2 for mouse input"
+if [ "$PROFILE" = "ds4" ]; then
+    echo
+    echo "Gamepad presents as a DUALSHOCK 4 (054C:05C4) — macOS Game Controllers"
+    echo "should list it as a Wireless Controller / DUALSHOCK 4."
+fi
 echo
 echo "To disable: Run cleanup-usb-gadget.sh or:"
 echo "  sudo echo \"\" > ${GADGET_DIR}/UDC"

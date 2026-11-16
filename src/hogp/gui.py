@@ -37,6 +37,10 @@ from hogp.bluez import (
     complete_bond_with_central,
     set_adapter_alias,
     reset_adapter_to_default_state,
+    configure_adapter_for_pro_controller,
+    get_adapter_address,
+    register_hid_sdp_profile,
+    unregister_hid_sdp_profile,
     acquire_app_bus_name,
 )
 from hogp.gatt_app import GattApplication
@@ -44,6 +48,7 @@ from hogp.adv import Advertisement
 from hogp.input_handler import InputHandler
 from hogp.usb_gadget import USBGadgetHID
 from hogp.pairing_agent import PairingAgent
+from hogp.pro_controller import ProControllerEmulator, SDP_RECORD_XML, PRO_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +727,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._running = False
         self._update_timeout_id = None
         self._mode = "bluetooth"
+        self._profile = "gamepad"  # "gamepad" | "keyboard"
+        self._pro_controller = None
+        self._pro_sdp_registered = False
         self._bond_in_progress = False
         self._bond_attempted_for: Optional[str] = None
         self._last_bond_attempt_at = 0.0
@@ -771,6 +779,20 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         
         main_box.append(mode_box)
         
+        # Device profile (gamepad identity vs keyboard-only)
+        profile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        profile_box.set_halign(Gtk.Align.CENTER)
+        profile_box.append(Gtk.Label(label="Profile:"))
+        self.gamepad_radio = Gtk.CheckButton(label="Gamepad (macOS)")
+        self.gamepad_radio.set_active(True)
+        self.gamepad_radio.connect("toggled", self._on_gamepad_toggled)
+        profile_box.append(self.gamepad_radio)
+        self.keyboard_radio = Gtk.CheckButton(label="Keyboard")
+        self.keyboard_radio.set_group(self.gamepad_radio)
+        self.keyboard_radio.connect("toggled", self._on_keyboard_toggled)
+        profile_box.append(self.keyboard_radio)
+        main_box.append(profile_box)
+        
         # Status box
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         
@@ -793,7 +815,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         
         # Helper to get active HID output (either Bluetooth GATT or USB Gadget)
         def get_hid_output():
-            return self._gatt_app or self._usb_gadget
+            return self._gatt_app or self._usb_gadget or self._pro_controller
         
         # Controller tab
         self.visualizer = ControllerVisualizer(get_hid_output)
@@ -841,15 +863,35 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         if button.get_active() and not self._running:
             self._mode = "wired"
             logger.info("Mode: Wired USB")
+
+    def _on_gamepad_toggled(self, button):
+        """Handle Gamepad profile selection."""
+        if button.get_active() and not self._running:
+            self._profile = "gamepad"
+            logger.info("Profile: Gamepad")
+
+    def _on_keyboard_toggled(self, button):
+        """Handle Keyboard profile selection."""
+        if button.get_active() and not self._running:
+            self._profile = "keyboard"
+            logger.info("Profile: Keyboard")
     
     def _on_start_clicked(self, button):
         """Start the controller service."""
         self.start_button.set_sensitive(False)
         self.bluetooth_radio.set_sensitive(False)
         self.wired_radio.set_sensitive(False)
+        self.gamepad_radio.set_sensitive(False)
+        self.keyboard_radio.set_sensitive(False)
         self.status_label.set_markup("<big><b>Status: Starting...</b></big>")
         
-        if self._mode == "bluetooth":
+        if self._mode == "bluetooth" and self._profile == "gamepad":
+            # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
+            threading.Thread(
+                target=self._prepare_pro_controller_adapter,
+                daemon=True,
+            ).start()
+        elif self._mode == "bluetooth":
             # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
             threading.Thread(
                 target=self._prepare_bluetooth_adapter,
@@ -867,6 +909,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.status_label.set_markup("<big><b>Status: Stopping...</b></big>")
         GLib.idle_add(self._stop_service_begin)
     
+    def _prepare_pro_controller_adapter(self):
+        """Configure BR/EDR adapter for Pro Controller mode (blocking)."""
+        try:
+            adapter_idx = get_adapter_index("hci0")
+            configure_adapter_for_pro_controller(adapter_idx)
+        except Exception as e:
+            logger.warning(f"Pro Controller adapter prep skipped: {e}")
+        GLib.idle_add(self._start_pro_controller_service)
+
     def _prepare_bluetooth_adapter(self):
         """Configure adapter (blocking); D-Bus work continues on main thread."""
         try:
@@ -933,6 +984,81 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             self._show_error(f"Error: {e}")
             return False
     
+    def _start_pro_controller_service(self):
+        """Start the Pro Controller (BR/EDR HID) gamepad service on the main thread."""
+        self._shutting_down = False
+        self._stop_in_progress = False
+        try:
+            self._bus = get_system_bus()
+            if not acquire_app_bus_name(self._bus):
+                logger.warning("D-Bus name com.steamdeck.hogp not acquired; re-run installer if BT fails")
+
+            self._adapter_path = find_adapter_path(self._bus, "hci0")
+            if not self._adapter_path:
+                self._show_error("Bluetooth adapter not found")
+                return False
+
+            set_adapter_alias(self._bus, self._adapter_path, PRO_NAME)
+
+            if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
+                self._show_error("Failed to power on Bluetooth")
+                return False
+
+            adapter_address = get_adapter_address(self._bus, self._adapter_path) or "00:00:00:00:00:00"
+
+            self._pairing_agent = PairingAgent(self._bus, verbose=True)
+            if not self._pairing_agent.register():
+                self._show_error(
+                    "Could not register Bluetooth pairing agent. Re-run install.sh and log out/in."
+                )
+                return False
+
+            if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
+                self._show_error("Could not register HID SDP record (ProfileManager1)")
+                return False
+            self._pro_sdp_registered = True
+
+            self._pro_controller = ProControllerEmulator(adapter_address=adapter_address)
+            self._pro_controller.on_state_change = self._on_pro_controller_state
+            if not self._pro_controller.start():
+                self._show_error("Could not bind HID L2CAP sockets (PSM 0x11/0x13)")
+                return False
+
+            self._registered = True
+            self._running = True
+            self._start_input_handler()
+            self.status_label.set_markup("<big><b>Status: Active - Pro Controller</b></big>")
+            self.connection_label.set_label("Waiting for Mac to connect…")
+            self.device_info_label.set_label(
+                "macOS: System Settings → Bluetooth → Pro Controller → Connect, accept the "
+                "pairing request. Game Controllers will then list a Pro Controller."
+            )
+            self.stop_button.set_sensitive(True)
+            self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
+            return False
+        except Exception as e:
+            logger.error(f"Failed to start Pro Controller service: {e}")
+            self._show_error(f"Error: {e}")
+            return False
+
+    def _on_pro_controller_state(self, connected):
+        """UI update when the Mac connects/disconnects the L2CAP HID channels."""
+
+        def update():
+            if not self._pro_controller:
+                return False
+            if connected:
+                self.connection_label.set_label("✓ Paired — streaming as Pro Controller")
+            else:
+                self.connection_label.set_label("Waiting for Mac to connect…")
+            return False
+
+        GLib.idle_add(update)
+
+    def _usb_setup_args(self):
+        """CLI args for setup-usb-gadget.sh matching the selected profile."""
+        return ["--profile", "ds4" if self._profile == "gamepad" else "generic"]
+
     def _start_wired_service(self):
         """Start the USB Gadget wired mode service (runs in thread)."""
         try:
@@ -952,8 +1078,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 try:
                     result = None
                     for cmd in (
-                        ['sudo', '-n', 'bash', script_path],
-                        ['pkexec', 'bash', script_path],
+                        ['sudo', '-n', 'bash', script_path] + self._usb_setup_args(),
+                        ['pkexec', 'bash', script_path] + self._usb_setup_args(),
                     ):
                         result = subprocess.run(
                             cmd,
@@ -980,7 +1106,10 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                     return
             
             # Create USB gadget HID instance
-            self._usb_gadget = USBGadgetHID(verbose=False)
+            self._usb_gadget = USBGadgetHID(
+                verbose=False,
+                gamepad_profile="ds4" if self._profile == "gamepad" else "generic",
+            )
             
             if not self._usb_gadget.open():
                 GLib.idle_add(
@@ -1008,11 +1137,18 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         """Update UI for wired mode active state."""
         self.status_label.set_markup("<big><b>Status: Active - Wired USB</b></big>")
         self.connection_label.set_label("Connected via USB (cable)")
-        self.device_info_label.set_label(
-            "Mac: Game Controllers tracks Bluetooth only — SteamDeckPad may show Disconnected "
-            "here. USB gamepad is separate: System Settings → General → About → System Report → USB. "
-            "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
-        )
+        if self._profile == "gamepad":
+            self.device_info_label.set_label(
+                "USB gamepad presents as a DUALSHOCK 4 (054C:05C4). On the Mac check "
+                "System Settings → Game Controllers — a Wireless Controller should be listed. "
+                "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
+            )
+        else:
+            self.device_info_label.set_label(
+                "Mac: Game Controllers tracks Bluetooth only — SteamDeckPad may show Disconnected "
+                "here. USB gamepad is separate: System Settings → General → About → System Report → USB. "
+                "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
+            )
         self.stop_button.set_sensitive(True)
         # Start update loop
         self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
@@ -1119,7 +1255,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._schedule_input_coalesce()
 
     def _apply_button(self, index, pressed):
-        if self._gatt_app:
+        if self._pro_controller:
+            self._pro_controller.set_button(index, pressed)
+        elif self._gatt_app:
             self._gatt_app.set_button(index, pressed)
         elif self._usb_gadget:
             self._usb_gadget.set_button(index, pressed)
@@ -1130,7 +1268,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._schedule_input_coalesce()
 
     def _apply_axis(self, index, value):
-        if self._gatt_app:
+        if self._pro_controller:
+            self._pro_controller.set_axis(index, value)
+        elif self._gatt_app:
             self._gatt_app.set_axis(index, value)
         elif self._usb_gadget:
             self._usb_gadget.set_axis(index, value)
@@ -1141,7 +1281,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._schedule_input_coalesce()
 
     def _apply_trigger(self, index, value):
-        if self._gatt_app:
+        if self._pro_controller:
+            self._pro_controller.set_trigger(index, value)
+        elif self._gatt_app:
             self._gatt_app.set_trigger(index, value)
         elif self._usb_gadget:
             self._usb_gadget.set_trigger(index, value)
@@ -1152,7 +1294,9 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._schedule_input_coalesce()
 
     def _apply_hat(self, direction):
-        if self._gatt_app:
+        if self._pro_controller:
+            self._pro_controller.set_hat(direction)
+        elif self._gatt_app:
             self._gatt_app.set_hat(direction)
         elif self._usb_gadget:
             self._usb_gadget.set_hat(direction)
@@ -1180,7 +1324,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             return False
         
         # Get active HID output
-        hid_output = self._gatt_app or self._usb_gadget
+        hid_output = self._gatt_app or self._usb_gadget or self._pro_controller
         if not hid_output:
             return False
         
@@ -1320,7 +1464,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 self._input_handler.stop()
                 self._input_handler = None
 
-            if registered and adapter_path:
+            if registered and adapter_path and self._gatt_app is not None:
                 bus = get_system_bus()
                 unregister_advertisement_sync(
                     bus, adapter_path, Advertisement.ADV_PATH, timeout_ms=4000
@@ -1333,6 +1477,17 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             if self._usb_gadget:
                 self._usb_gadget.close()
                 self._usb_gadget = None
+
+            if self._pro_controller:
+                self._pro_controller.stop()
+                self._pro_controller = None
+
+            if self._pro_sdp_registered:
+                try:
+                    unregister_hid_sdp_profile(get_system_bus())
+                except Exception as e:
+                    logger.warning(f"Could not unregister HID SDP profile: {e}")
+                self._pro_sdp_registered = False
 
             if adapter_path:
                 try:
@@ -1367,6 +1522,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.stop_button.set_sensitive(False)
         self.bluetooth_radio.set_sensitive(True)
         self.wired_radio.set_sensitive(True)
+        self.gamepad_radio.set_sensitive(True)
+        self.keyboard_radio.set_sensitive(True)
         return False
     
     def _show_error(self, message):
@@ -1376,6 +1533,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.start_button.set_sensitive(True)
         self.bluetooth_radio.set_sensitive(True)
         self.wired_radio.set_sensitive(True)
+        self.gamepad_radio.set_sensitive(True)
+        self.keyboard_radio.set_sensitive(True)
         self._running = False
     
     def _show_info(self, message):

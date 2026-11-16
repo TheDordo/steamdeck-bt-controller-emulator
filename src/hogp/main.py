@@ -25,6 +25,10 @@ from .bluez import (
     get_le_advertising_active_instances,
     set_static_ble_address,
     configure_adapter_for_hog_peripheral,
+    configure_adapter_for_pro_controller,
+    get_adapter_address,
+    register_hid_sdp_profile,
+    unregister_hid_sdp_profile,
     get_adapter_index,
     set_adapter_alias,
     reset_adapter_to_default_state,
@@ -33,6 +37,7 @@ from .bluez import (
 from .gatt_app import GattApplication
 from .adv import Advertisement
 from .input_handler import InputHandler
+from .pro_controller import ProControllerEmulator, SDP_RECORD_XML, PRO_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,7 @@ class HoGPeripheral:
         adapter: str = DEFAULT_ADAPTER,
         static_addr: Optional[str] = DEFAULT_STATIC_BLE_ADDRESS,
         input_device: Optional[str] = None,
+        mode: str = "hogp",
         verbose: bool = False,
     ):
         self.name = name
@@ -66,12 +72,14 @@ class HoGPeripheral:
         self.static_addr = static_addr
         self.input_device = input_device
         self.verbose = verbose
+        self.mode = mode
         
         self._bus: Optional[GLib.DBusConnection] = None
         self._adapter_path: Optional[str] = None
         self._gatt_app: Optional[GattApplication] = None
         self._advertisement: Optional[Advertisement] = None
         self._input_handler: Optional[InputHandler] = None
+        self._pro_controller = None
         self._main_loop: Optional[GLib.MainLoop] = None
         self._registered = False
         self._shutting_down = False
@@ -92,6 +100,9 @@ class HoGPeripheral:
         )
         
         logger.info(f"Starting HoG Peripheral: name={self.name}, rate={self.rate}Hz")
+
+        if self.mode == "pro":
+            return self._run_pro_controller_mode()
         
         # Get D-Bus connection
         try:
@@ -189,6 +200,76 @@ class HoGPeripheral:
         
         return 0
 
+    def _run_pro_controller_mode(self) -> int:
+        """Run as a Pro Controller (BR/EDR HID) gamepad peripheral."""
+        log_level = logging.DEBUG if self.verbose else logging.INFO
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+
+        logger.info(f"Starting Pro Controller peripheral: name={PRO_NAME}")
+
+        try:
+            self._bus = get_system_bus()
+        except Exception as e:
+            logger.error(f"Failed to connect to system bus: {e}")
+            return 1
+
+        self._adapter_path = find_adapter_path(self._bus, self.adapter)
+        if not self._adapter_path:
+            logger.error(f"Adapter {self.adapter} not found")
+            return 1
+
+        set_adapter_alias(self._bus, self._adapter_path, PRO_NAME)
+        configure_adapter_for_pro_controller(get_adapter_index(self.adapter))
+
+        if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
+            logger.error("Failed to power on adapter")
+            return 1
+
+        adapter_address = get_adapter_address(self._bus, self._adapter_path) or "00:00:00:00:00:00"
+
+        if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
+            logger.error("Failed to register HID SDP record")
+            return 1
+
+        self._pro_controller = ProControllerEmulator(
+            adapter_address=adapter_address, verbose=self.verbose
+        )
+        self._pro_controller.on_state_change = lambda connected: logger.info(
+            "Mac %s" % ("connected — streaming" if connected else "disconnected")
+        )
+        if not self._pro_controller.start():
+            logger.error("Failed to bind HID L2CAP sockets")
+            unregister_hid_sdp_profile(self._bus)
+            return 1
+
+        if self.input_device or self.input_device != "none":
+            self._input_handler = InputHandler(
+                device_path=self.input_device if self.input_device != "auto" else None,
+                on_button_change=self._on_physical_button,
+                on_axis_change=self._on_physical_axis,
+                on_trigger_change=self._on_physical_trigger,
+                on_hat_change=self._on_physical_hat,
+                verbose=self.verbose,
+            )
+            if not self._input_handler.start():
+                logger.warning("Could not start input handler (forwarding disabled)")
+
+        self._main_loop = GLib.MainLoop()
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+        logger.info("Pro Controller ready — pair on the Mac: Bluetooth → Pro Controller")
+        try:
+            self._main_loop.run()
+        except KeyboardInterrupt:
+            pass
+
+        self._shutdown()
+        return 0
+
     def _register_with_bluez(self) -> None:
         """Register GATT application and advertisement with BlueZ."""
         def on_app_registered(success, error):
@@ -242,6 +323,13 @@ class HoGPeripheral:
             GLib.source_remove(self._test_pattern_id)
             self._test_pattern_id = None
         
+        # Stop Pro Controller emulator
+        if self._pro_controller:
+            self._pro_controller.stop()
+            self._pro_controller = None
+            if self._bus:
+                unregister_hid_sdp_profile(self._bus)
+
         # Stop input handler
         if self._input_handler:
             self._input_handler.stop()
@@ -376,28 +464,36 @@ class HoGPeripheral:
 
     def _on_physical_button(self, button_index: int, pressed: bool) -> None:
         """Callback for physical button events."""
-        if self._gatt_app and not self._shutting_down:
+        if self._pro_controller and not self._shutting_down:
+            self._pro_controller.set_button(button_index, pressed)
+        elif self._gatt_app and not self._shutting_down:
             self._gatt_app.set_button(button_index, pressed)
             if self.verbose:
                 logger.debug(f"Physical button {button_index} {'pressed' if pressed else 'released'}")
 
     def _on_physical_axis(self, axis_index: int, value: int) -> None:
         """Callback for physical axis events."""
-        if self._gatt_app and not self._shutting_down:
+        if self._pro_controller and not self._shutting_down:
+            self._pro_controller.set_axis(axis_index, value)
+        elif self._gatt_app and not self._shutting_down:
             self._gatt_app.set_axis(axis_index, value)
             if self.verbose:
                 logger.debug(f"Physical axis {axis_index} = {value}")
 
     def _on_physical_trigger(self, trigger_index: int, value: int) -> None:
         """Callback for physical trigger events."""
-        if self._gatt_app and not self._shutting_down:
+        if self._pro_controller and not self._shutting_down:
+            self._pro_controller.set_trigger(trigger_index, value)
+        elif self._gatt_app and not self._shutting_down:
             self._gatt_app.set_trigger(trigger_index, value)
             if self.verbose:
                 logger.debug(f"Physical trigger {trigger_index} = {value}")
 
     def _on_physical_hat(self, direction: int) -> None:
         """Callback for physical HAT/D-pad events."""
-        if self._gatt_app and not self._shutting_down:
+        if self._pro_controller and not self._shutting_down:
+            self._pro_controller.set_hat(direction)
+        elif self._gatt_app and not self._shutting_down:
             self._gatt_app.set_hat(direction)
             if self.verbose:
                 logger.debug(f"Physical HAT = {direction:02X}")
@@ -491,6 +587,13 @@ Verification commands (run in another terminal):
         help="Skip setting static BLE address",
     )
     parser.add_argument(
+        "--mode",
+        choices=("hogp", "pro"),
+        default="hogp",
+        help="hogp = BLE HID-over-GATT keyboard/gamepad; "
+             "pro = Pro Controller gamepad (BR/EDR HID, macOS-native)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging",
@@ -505,6 +608,7 @@ Verification commands (run in another terminal):
         static_addr=None if args.no_static_addr else args.static_addr,
         input_device=args.input_device,
         verbose=args.verbose,
+        mode=args.mode,
     )
     
     sys.exit(peripheral.run())

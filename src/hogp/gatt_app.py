@@ -17,6 +17,8 @@ from gi.repository import Gio, GLib
 
 logger = logging.getLogger(__name__)
 
+from .battery import read_battery_percent
+
 # Default configuration
 DEFAULT_REPORT_RATE_HZ = 10
 # BlueZ ATT drops notifications if flooded; gwyntel/bt-keyboard-adapter uses 30ms.
@@ -970,7 +972,8 @@ class GattApplication:
                 if method == "ReadValue":
                     if self.verbose:
                         logger.info(f"{name} ReadValue called by {sender}")
-                    invoc.return_value(GLib.Variant("(ay)", (value,)))
+                    val = value() if callable(value) else value
+                    invoc.return_value(GLib.Variant("(ay)", (val,)))
                 else:
                     invoc.return_dbus_error(
                         "org.freedesktop.DBus.Error.UnknownMethod",
@@ -1355,7 +1358,7 @@ class GattApplication:
         self._register_read_char(
             f"{dis_service_path}/char0",
             BATTERY_LEVEL_UUID,
-            bytes([self._battery_level]),
+            lambda: bytes([read_battery_percent()]),
             "Battery Level",
             flags=BATTERY_LEVEL_FLAGS,
             service_path=dis_service_path,
