@@ -10,7 +10,7 @@ import sys
 import os
 import threading
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import gi
 
@@ -727,6 +727,12 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._last_bond_error: Optional[str] = None
         self._shutting_down = False
         self._stop_in_progress = False
+        self._input_coalesce_id: Optional[int] = None
+        self._input_coalesce_ms = 20
+        self._pending_buttons: Dict[int, bool] = {}
+        self._pending_axes: Dict[int, int] = {}
+        self._pending_triggers: Dict[int, int] = {}
+        self._pending_hat: Optional[int] = None
         
         # Build UI
         self._build_ui()
@@ -904,7 +910,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             
             # Create GATT application
             self._gatt_app = GattApplication(self._bus, device_name="SteamDeckPad", verbose=False)
-            self._gatt_app.set_report_rate(60)
+            self._gatt_app.set_report_rate(25)
             
             if not self._gatt_app.register():
                 self._show_error("Failed to register GATT service")
@@ -1096,8 +1102,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
         return False
     
+    def _schedule_input_coalesce(self) -> None:
+        if self._input_coalesce_id is None:
+            self._input_coalesce_id = GLib.timeout_add(
+                self._input_coalesce_ms, self._flush_coalesced_input
+            )
+
     def _on_button(self, index, pressed):
-        GLib.idle_add(self._apply_button, index, pressed)
+        self._pending_buttons[index] = pressed
+        self._schedule_input_coalesce()
 
     def _apply_button(self, index, pressed):
         if self._gatt_app:
@@ -1107,7 +1120,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return False
 
     def _on_axis(self, index, value):
-        GLib.idle_add(self._apply_axis, index, value)
+        self._pending_axes[index] = value
+        self._schedule_input_coalesce()
 
     def _apply_axis(self, index, value):
         if self._gatt_app:
@@ -1117,7 +1131,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return False
 
     def _on_trigger(self, index, value):
-        GLib.idle_add(self._apply_trigger, index, value)
+        self._pending_triggers[index] = value
+        self._schedule_input_coalesce()
 
     def _apply_trigger(self, index, value):
         if self._gatt_app:
@@ -1127,13 +1142,30 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return False
 
     def _on_hat(self, direction):
-        GLib.idle_add(self._apply_hat, direction)
+        self._pending_hat = direction
+        self._schedule_input_coalesce()
 
     def _apply_hat(self, direction):
         if self._gatt_app:
             self._gatt_app.set_hat(direction)
         elif self._usb_gadget:
             self._usb_gadget.set_hat(direction)
+        return False
+
+    def _flush_coalesced_input(self):
+        self._input_coalesce_id = None
+        for index, pressed in self._pending_buttons.items():
+            self._apply_button(index, pressed)
+        self._pending_buttons.clear()
+        for index, value in self._pending_axes.items():
+            self._apply_axis(index, value)
+        self._pending_axes.clear()
+        for index, value in self._pending_triggers.items():
+            self._apply_trigger(index, value)
+        self._pending_triggers.clear()
+        if self._pending_hat is not None:
+            self._apply_hat(self._pending_hat)
+            self._pending_hat = None
         return False
     
     def _update_visualizer(self):

@@ -218,8 +218,8 @@ class GattApplication:
     - APP_PATH (ObjectManager root)
     - APP_PATH/service0 (HID Service)
     - APP_PATH/service0/char0..char2 (HID Information, Report Map, Control Point)
-    - APP_PATH/service0/char3 (Report + Report Reference)
-    - APP_PATH/service0/char4 (Protocol Mode — appended; stable for BlueZ/macOS)
+    - APP_PATH/service0/char3 (single HoG Report + gamepad/keyboard refs)
+    - APP_PATH/service0/char4 (Protocol Mode), char5 (PnP ID)
     HID (service0), Device Information (service1), and Battery (service2).
     Do not register GAP (0x1800) — BlueZ already owns adapter GAP.
     """
@@ -231,9 +231,9 @@ class GattApplication:
         self.device_name = device_name
         self.verbose = verbose
         self._registrations: List[int] = []
+        self._report_notifying = False
         self._gamepad_notifying = False
         self._keyboard_notifying = False
-        self._notify_timeout_id: Optional[int] = None
         self._kbd_release_timeout_id: Optional[int] = None
         self._report_rate_hz = DEFAULT_REPORT_RATE_HZ
         
@@ -303,19 +303,10 @@ class GattApplication:
         return False
 
     def _can_send_gamepad(self) -> bool:
-        return self._gamepad_notifying or self._keyboard_notifying
+        return self._report_notifying
 
-    def _gamepad_notify_path(self) -> Optional[str]:
-        """
-        macOS often enables notifications only on the keyboard Report char (char4).
-        Fall back to char4 when char3 was never subscribed so gamepad reports still deliver.
-        """
-        base = f"{self.APP_PATH}/service0"
-        if self._gamepad_notifying:
-            return f"{base}/char3"
-        if self._keyboard_notifying:
-            return f"{base}/char4"
-        return None
+    def _report_notify_path(self) -> str:
+        return f"{self.APP_PATH}/service0/char3"
 
     def set_button(self, button_index: int, pressed: bool) -> None:
         """Set a button state (0-10)."""
@@ -425,10 +416,8 @@ class GattApplication:
             self._register_hid_info_char()
             self._register_report_map_char()
             self._register_hid_control_point_char()
-            self._register_gamepad_report_char()
-            self._register_gamepad_descriptors()
-            self._register_keyboard_report_char()
-            self._register_keyboard_descriptors()
+            self._register_input_report_char()
+            self._register_input_report_descriptors()
             self._register_protocol_mode_char()
             self._register_hid_pnp_char()
             # Custom DIS/Battery (not adapter GAP); required by macOS/iOS HoG peers.
@@ -511,11 +500,10 @@ class GattApplication:
         char3_path = f"{service_path}/char3"
         char4_path = f"{service_path}/char4"
         char5_path = f"{service_path}/char5"
-        char6_path = f"{service_path}/char6"
         gp_desc_ref = f"{char3_path}/desc0"
         gp_desc_cud = f"{char3_path}/desc1"
-        kb_desc_ref = f"{char4_path}/desc0"
-        kb_desc_cud = f"{char4_path}/desc1"
+        kb_desc_ref = f"{char3_path}/desc2"
+        kb_desc_cud = f"{char3_path}/desc3"
         dis_service_path = f"{self.APP_PATH}/service1"
         dis_char0 = f"{dis_service_path}/char0"
         dis_char1 = f"{dis_service_path}/char1"
@@ -536,7 +524,6 @@ class GattApplication:
                             char3_path,
                             char4_path,
                             char5_path,
-                            char6_path,
                         ],
                     ),
                 },
@@ -570,18 +557,13 @@ class GattApplication:
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [gp_desc_ref, gp_desc_cud]),
+                    "Descriptors": GLib.Variant(
+                        "ao",
+                        [gp_desc_ref, gp_desc_cud, kb_desc_ref, kb_desc_cud],
+                    ),
                 },
             },
             char4_path: {
-                GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", REPORT_UUID),
-                    "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [kb_desc_ref, kb_desc_cud]),
-                },
-            },
-            char5_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", PROTOCOL_MODE_UUID),
                     "Service": GLib.Variant("o", service_path),
@@ -589,7 +571,7 @@ class GattApplication:
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
-            char6_path: {
+            char5_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", PNP_ID_UUID),
                     "Service": GLib.Variant("o", service_path),
@@ -614,14 +596,14 @@ class GattApplication:
             kb_desc_ref: {
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                    "Characteristic": GLib.Variant("o", char4_path),
+                    "Characteristic": GLib.Variant("o", char3_path),
                     "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
                 },
             },
             kb_desc_cud: {
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", CHAR_USER_DESC_UUID),
-                    "Characteristic": GLib.Variant("o", char4_path),
+                    "Characteristic": GLib.Variant("o", char3_path),
                     "Flags": GLib.Variant("as", CHAR_USER_DESC_FLAGS),
                 },
             },
@@ -752,7 +734,7 @@ class GattApplication:
     def _register_service(self) -> None:
         """Register HID Service object."""
         service_path = f"{self.APP_PATH}/service0"
-        char_paths = [f"{service_path}/char{i}" for i in range(7)]
+        char_paths = [f"{service_path}/char{i}" for i in range(6)]
         self._register_gatt_service(
             service_path,
             HID_SERVICE_UUID,
@@ -790,7 +772,7 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char5"
+        path = f"{self.APP_PATH}/service0/char4"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
@@ -1271,33 +1253,21 @@ class GattApplication:
         reg_id = self.bus.register_object(char_path, node_info.interfaces[1], handler, None, None)
         self._registrations.append(reg_id)
 
-    def _register_gamepad_report_char(self) -> None:
+    def _register_input_report_char(self) -> None:
+        """Single HoG Report char — macOS needs one CCC for all report IDs."""
         char_path = f"{self.APP_PATH}/service0/char3"
-        desc_paths = [f"{char_path}/desc0", f"{char_path}/desc1"]
+        desc_paths = [f"{char_path}/desc{i}" for i in range(4)]
         self._register_hid_report_channel(
             char_path,
             desc_paths,
             self.get_current_report,
-            self.start_gamepad_notify,
-            self.stop_gamepad_notify,
-            lambda: self._gamepad_notifying,
-            "Gamepad report",
+            self.start_report_notify,
+            self.stop_report_notify,
+            lambda: self._report_notifying,
+            "HID input report",
         )
 
-    def _register_keyboard_report_char(self) -> None:
-        char_path = f"{self.APP_PATH}/service0/char4"
-        desc_paths = [f"{char_path}/desc0", f"{char_path}/desc1"]
-        self._register_hid_report_channel(
-            char_path,
-            desc_paths,
-            self.get_keyboard_report,
-            self.start_keyboard_notify,
-            self.stop_keyboard_notify,
-            lambda: self._keyboard_notifying,
-            "Keyboard report",
-        )
-
-    def _register_gamepad_descriptors(self) -> None:
+    def _register_input_report_descriptors(self) -> None:
         char_path = f"{self.APP_PATH}/service0/char3"
         self._register_readonly_descriptor(
             f"{char_path}/desc0",
@@ -1313,18 +1283,15 @@ class GattApplication:
             CHAR_USER_DESC_FLAGS,
             char_path,
         )
-
-    def _register_keyboard_descriptors(self) -> None:
-        char_path = f"{self.APP_PATH}/service0/char4"
         self._register_readonly_descriptor(
-            f"{char_path}/desc0",
+            f"{char_path}/desc2",
             REPORT_REFERENCE_UUID,
             bytes([0x02, 0x01]),
             REPORT_REFERENCE_FLAGS,
             char_path,
         )
         self._register_readonly_descriptor(
-            f"{char_path}/desc1",
+            f"{char_path}/desc3",
             CHAR_USER_DESC_UUID,
             b"Keyboard",
             CHAR_USER_DESC_FLAGS,
@@ -1334,7 +1301,7 @@ class GattApplication:
     def _register_hid_pnp_char(self) -> None:
         """PnP ID inside HID service (bt-keyboard-adapter / Apple HoG expectation)."""
         self._register_read_char(
-            f"{self.APP_PATH}/service0/char6",
+            f"{self.APP_PATH}/service0/char5",
             PNP_ID_UUID,
             PNP_ID,
             "HID PnP ID",
@@ -1415,69 +1382,46 @@ class GattApplication:
             service_path=gap_service_path,
         )
 
-    def _ensure_notify_timer(self) -> None:
-        if self._notify_timeout_id is None and self._can_send_gamepad():
-            interval_ms = max(1, 1000 // self._report_rate_hz)
-            self._notify_timeout_id = GLib.timeout_add(interval_ms, self._send_gamepad_notification)
-
-    def _clear_notify_timer_if_idle(self) -> None:
-        if not self._can_send_gamepad() and self._notify_timeout_id is not None:
-            GLib.source_remove(self._notify_timeout_id)
-            self._notify_timeout_id = None
-
-    def start_gamepad_notify(self) -> None:
-        if self._gamepad_notifying:
+    def start_report_notify(self) -> None:
+        if self._report_notifying:
             return
+        self._report_notifying = True
         self._gamepad_notifying = True
-        logger.info("Gamepad notifications enabled (char3)")
+        self._keyboard_notifying = True
+        logger.info("HID input notifications enabled (char3, report IDs 1–3)")
         if self._on_notify_start:
             self._on_notify_start()
         self._last_gamepad_report = None
-        self._ensure_notify_timer()
         self._send_gamepad_notification()
 
-    def stop_gamepad_notify(self) -> None:
-        if not self._gamepad_notifying:
+    def stop_report_notify(self) -> None:
+        if not self._report_notifying:
             return
+        self._report_notifying = False
         self._gamepad_notifying = False
-        logger.info("Gamepad notifications disabled (char3)")
-        self._clear_notify_timer_if_idle()
-        if self._on_notify_stop and not self._keyboard_notifying:
+        self._keyboard_notifying = False
+        logger.info("HID input notifications disabled (char3)")
+        if self._on_notify_stop:
             self._on_notify_stop()
 
-    def start_keyboard_notify(self) -> None:
-        self._keyboard_notifying = True
-        logger.info(
-            "Keyboard notifications enabled (char4); gamepad will use char4 if char3 is not subscribed"
-        )
-        self._last_gamepad_report = None
-        self._ensure_notify_timer()
-        self._send_gamepad_notification()
-
-    def stop_keyboard_notify(self) -> None:
-        self._keyboard_notifying = False
-        logger.info("Keyboard notifications disabled (char4)")
-        self._clear_notify_timer_if_idle()
-
     def start_notify(self) -> None:
-        self.start_gamepad_notify()
+        self.start_report_notify()
 
     def stop_notify(self) -> None:
-        self.stop_gamepad_notify()
+        self.stop_report_notify()
         if self._kbd_release_timeout_id is not None:
             GLib.source_remove(self._kbd_release_timeout_id)
             self._kbd_release_timeout_id = None
 
     def _send_gamepad_notification(self) -> bool:
-        char_path = self._gamepad_notify_path()
-        if not char_path:
+        if not self._can_send_gamepad():
             return False
         report = self.get_current_report()
         if report == self._last_gamepad_report:
             return True
         self._last_gamepad_report = report
         self._queue_hid_notification(
-            char_path,
+            self._report_notify_path(),
             report,
             priority=0,
         )
@@ -1488,7 +1432,7 @@ class GattApplication:
             logger.debug("Keyboard notify skipped — host has not subscribed")
             return
         self._queue_hid_notification(
-            f"{self.APP_PATH}/service0/char4",
+            self._report_notify_path(),
             self.get_keyboard_report(),
             priority=10,
             force=force,
@@ -1498,7 +1442,7 @@ class GattApplication:
         if not self._keyboard_notifying:
             return
         self._queue_hid_notification(
-            f"{self.APP_PATH}/service0/char4",
+            self._report_notify_path(),
             self.get_mouse_report(),
             priority=5,
         )
@@ -1508,4 +1452,4 @@ class GattApplication:
 
     @property
     def notifying(self) -> bool:
-        return self._gamepad_notifying or self._keyboard_notifying
+        return self._report_notifying

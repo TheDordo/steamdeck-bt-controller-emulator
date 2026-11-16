@@ -142,7 +142,7 @@ GATT notify can start **before** macOS finishes SMP bonding. Latest builds **cal
 
 ### Paired on Mac but no gamepad / keyboard input
 
-Current builds use **separate Report characteristics** for gamepad (char3) and keyboard (char4), each with **Report Reference + User Description** (so macOS enables notify on the real CCC), plus **Protocol Mode on char5**. **Forget SteamDeckPad on both devices** after each GATT update, then pair again.
+Current builds use **one HoG Report characteristic (char3)** with **gamepad + keyboard Report Reference** descriptors (macOS needs a single notify subscription for all report IDs). Protocol Mode is **char4**. **Forget SteamDeckPad on both devices** after each GATT layout change, then pair again.
 
 **Quick Mac checks**
 
