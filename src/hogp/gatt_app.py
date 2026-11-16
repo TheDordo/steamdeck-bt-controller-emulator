@@ -270,7 +270,7 @@ class GattApplication:
         self._report_rate_hz = max(1, min(hz, 125))
         logger.info(f"Report rate set to {self._report_rate_hz} Hz")
 
-    REPORT_CHAR_PATH = "service0/char4"
+    REPORT_CHAR_PATH = "service0/char3"
 
     def _notify_gamepad_changed(self) -> None:
         if not self._gamepad_notify_pending:
