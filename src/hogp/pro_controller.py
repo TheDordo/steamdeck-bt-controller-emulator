@@ -350,6 +350,17 @@ class ProControllerEmulator:
             os.path.dirname(os.path.abspath(__file__)),
             "..", "..", "scripts", "hid-l2cap-bridge.py",
         )
+        # Kill orphaned bridges from previous crashed runs (they hold the
+        # well-known PSMs). The bracketed pattern avoids matching pkill's
+        # own command line.
+        try:
+            subprocess.run(
+                ["sudo", "-n", "pkill", "-f", "hid-l2cap-bridg[e]"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
         try:
             self._bridge_proc = subprocess.Popen(
                 [
@@ -359,7 +370,6 @@ class ProControllerEmulator:
                     "--bdaddr", self.adapter_address,
                 ],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
             )
         except (FileNotFoundError, ValueError, OSError) as e:
             logger.error("Could not launch the L2CAP bridge: %s", e)
@@ -367,14 +377,12 @@ class ProControllerEmulator:
             return False
 
         # Fail fast when passwordless sudo is missing (bridge exits at once).
-        try:
-            _out, err = self._bridge_proc.communicate(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            err = b""  # still running — good
-        if err:
+        # Bridge stderr is inherited, so its errors show in the console.
+        time.sleep(1.0)
+        if self._bridge_proc.poll() not in (None, 0):
             logger.error(
-                "HID L2CAP bridge failed to start: %s",
-                err.decode(errors="replace").strip(),
+                "HID L2CAP bridge exited immediately — passwordless sudo "
+                "missing or the bridge crashed (run from Konsole for details)"
             )
             self.stop()
             return False
@@ -382,6 +390,7 @@ class ProControllerEmulator:
         self._running = True
         self._spawn(self._accept_loop, (self._ctl_sock, "control"))
         self._spawn(self._accept_loop, (self._itr_sock, "interrupt"))
+        self._spawn(self._monitor_bridge)
         logger.info(
             "Pro Controller emulator listening (PSM 0x%x/0x%x via sudo bridge)",
             HID_CTRL_PSM, HID_INTR_PSM,
@@ -430,6 +439,22 @@ class ProControllerEmulator:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
         self._threads.append(t)
+
+    def _monitor_bridge(self) -> None:
+        """Warn when the privileged bridge dies unexpectedly."""
+        proc = self._bridge_proc
+        if proc is None:
+            return
+        proc.wait()
+        if self._running and self._bridge_proc is proc:
+            logger.error(
+                "HID L2CAP bridge exited unexpectedly — if the PSMs were "
+                "busy: pgrep -af hogp (kill stray app instances) or "
+                "'sudo modprobe -r hidp' (disconnect BT keyboards/mice first)"
+            )
+            self._connected = False
+            self._streaming = False
+            self._notify_state(False)
 
     def _accept_loop(self, sock: socket.socket, label: str) -> None:
         while self._running:

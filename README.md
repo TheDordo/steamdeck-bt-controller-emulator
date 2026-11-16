@@ -174,6 +174,7 @@ Failures are now shown with the exact D-Bus error (the watchdog no longer overwr
 1. **Pairing agent error containing `AlreadyExists`** — another process already holds BlueZ's default agent (usually an older instance of the app). Close extra instances (`pgrep -af hogp.gui`) or log out/in, then start again.
 2. **Pairing agent error containing `AccessDenied`/`NotPermitted`** — the `bluetooth` group is not active in this session. Run `groups` in Konsole: if `bluetooth` is missing, log out and back in (or reboot) after install.sh — reinstalling alone will not fix this.
 3. **SDP record error** — BlueZ rejected the profile registration. Run `journalctl -u bluetooth -n 50` and share the output.
+4. **`Address already in use` on PSM 0x11/0x13** — either an older app/bridge instance is still running (`pgrep -af hogp`, `sudo pkill -f hid-l2cap-bridge`) or the kernel's HID host module holds the ports while a Bluetooth keyboard/mouse is connected to the Deck (`sudo modprobe -r hidp`). The app kills orphaned bridges automatically, and the bridge retries and tries to unload hidp itself before giving up.
 
 To see the full start sequence in a terminal:
 

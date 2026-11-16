@@ -13,8 +13,12 @@ Usage (invoked by the app):
 """
 
 import argparse
+import errno
+import os
 import select
 import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -38,12 +42,50 @@ def pump(a, b):
                 return
 
 
+def bind_with_retries(listener, bdaddr, psm, attempts=30, delay=0.5):
+    """Bind one PSM, tolerating a briefly-busy port (a previous bridge
+    instance still dying) and freeing the kernel hidp module's well-known
+    PSMs once if it holds them."""
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            listener.bind((bdaddr, psm))
+            return True
+        except OSError as e:
+            last_err = e
+            if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+                raise
+            if attempt == 3:
+                # The kernel's hidp module (HID host role) holds 0x11/0x13
+                # while a Bluetooth keyboard/mouse is connected to this
+                # machine. Try unloading it once; it fails harmlessly when
+                # a session is active.
+                try:
+                    subprocess.run(
+                        ["modprobe", "-r", "hidp"],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
+            time.sleep(delay)
+    print(
+        "HID L2CAP bridge: PSM 0x%x is still busy (%s). "
+        "Kill stray app instances (pgrep -af hogp) or disconnect Bluetooth "
+        "keyboards/mice from this machine, then restart."
+        % (psm, last_err),
+        file=sys.stderr,
+    )
+    return False
+
+
 def serve_l2cap(psm, bdaddr, unix_name):
     """Bind one L2CAP PSM and relay accepted connections to the app."""
     listener = socket.socket(
         socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
     )
-    listener.bind((bdaddr, psm))
+    if not bind_with_retries(listener, bdaddr, psm):
+        os._exit(1)
     listener.listen(1)
     while True:
         conn, _addr = listener.accept()
