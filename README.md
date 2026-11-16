@@ -135,9 +135,10 @@ GATT notify can start **before** macOS finishes SMP bonding. Latest builds **cal
 2. On the Mac: **System Settings → Bluetooth** — remove old **SteamDeckPad** entries, then connect again from the list (don’t use only a quick-connect chip).
 3. If the Mac stalls on pairing: accept any **“Bluetooth Pairing Request”** dialog (Just Works / confirm).
 4. Deck UI should show **Paired — sending HID data** with **Paired: yes** and **Trusted: yes**. If **Paired** stays `no`, run `diagnose.sh` and check `journalctl -u bluetooth` while connecting.
-5. For controller input in games, open **System Settings → Game Controllers** (or Steam) and confirm **SteamDeckPad** appears; map buttons once if needed.
-6. HID characteristics require **encryption** on current builds — accept the macOS **Bluetooth Pairing Request** when it appears (pairing should finish before HID notify).
-7. If pairing still spins: on the Deck (Developer), add under `[General]` in `/etc/bluetooth/main.conf`:
+5. **Generic BLE HID gamepads often do not appear** in **System Settings → Game Controllers** on macOS (that list is for MFi / Xbox / PlayStation / Switch-style controllers). **Keyboard** over HoG still works in apps; for games on Mac, prefer **wired USB** or a native pad.
+6. If macOS shows the Deck as a **laptop** or adds a **Bluetooth audio output**: remove **every** “Steam Deck” / **SteamDeckPad** entry on the Mac, update the app, start the service (it switches the adapter to **LE-only** while running), then pair **only SteamDeckPad**. Stop the service before using Deck Bluetooth headphones again.
+7. HID characteristics require **encryption** on current builds — accept the macOS **Bluetooth Pairing Request** when it appears (pairing should finish before HID notify).
+8. If pairing still spins: on the Deck (Developer), add under `[General]` in `/etc/bluetooth/main.conf`:
    `ReverseServiceDiscovery=false` and `DisablePlugins=battery,deviceinfo`, then `sudo systemctl restart bluetooth`.
 
 ### Paired on Mac but no gamepad / keyboard input

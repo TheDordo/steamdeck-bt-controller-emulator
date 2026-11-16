@@ -204,10 +204,10 @@ REPORT_MAP = bytes([
 HID_INFO = bytes([0x11, 0x01, 0x00, 0x01])
 
 # Device Information values
-MANUFACTURER_NAME = b"SteamDeck"
-MODEL_NUMBER = b"HoG_Controller"
-# PnP ID: Vendor ID Source (Bluetooth SIG), Vendor ID (0x28DE = Valve), Product ID, Product Version
-PNP_ID = bytes([0x01, 0xDE, 0x28, 0x01, 0x00, 0x01, 0x00])  # Valve's VID
+MANUFACTURER_NAME = b"SteamDeckPad"
+MODEL_NUMBER = b"BLE HoG Gamepad"
+# PnP: Generic HID peripheral (not a Valve/Deck computer identity for macOS classification)
+PNP_ID = bytes([0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01])
 
 
 class GattApplication:

@@ -24,6 +24,7 @@ from hogp.bluez import (
     get_system_bus,
     find_adapter_path,
     ensure_adapter_powered_and_discoverable,
+    configure_adapter_for_hog_peripheral,
     register_application_async,
     unregister_application_async,
     unregister_application_sync,
@@ -868,13 +869,14 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     
     def _prepare_bluetooth_adapter(self):
         """Configure adapter (blocking); D-Bus work continues on main thread."""
-        if os.environ.get("HOGP_STATIC_ADDR", "").strip() not in ("", "0", "false"):
-            try:
-                adapter_idx = get_adapter_index("hci0")
+        try:
+            adapter_idx = get_adapter_index("hci0")
+            if os.environ.get("HOGP_STATIC_ADDR", "").strip() not in ("", "0", "false"):
                 addr = os.environ.get("HOGP_STATIC_ADDR", "C2:12:34:56:78:9A")
                 set_static_ble_address(adapter_idx, addr)
-            except Exception as e:
-                logger.warning(f"Static BLE address setup skipped: {e}")
+            configure_adapter_for_hog_peripheral(adapter_idx)
+        except Exception as e:
+            logger.warning(f"Adapter prep skipped: {e}")
         GLib.idle_add(self._start_bluetooth_service)
 
     def _start_bluetooth_service(self):

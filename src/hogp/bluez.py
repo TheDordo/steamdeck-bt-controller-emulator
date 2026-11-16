@@ -638,6 +638,63 @@ def get_primary_connected_device(bus: Gio.DBusConnection, adapter_path: str) -> 
     return devices[0] if devices else None
 
 
+def _run_btmgmt(adapter_index: int, *args: str, ignore_errors: bool = True) -> bool:
+    """Run btmgmt subcommand (passwordless sudo for bluetooth group)."""
+    try:
+        result = subprocess.run(
+            ["sudo", "btmgmt", "--index", str(adapter_index), *args],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if result.returncode != 0 and not ignore_errors:
+            logger.warning(
+                f"btmgmt {' '.join(args)} failed: {result.stderr or result.stdout}"
+            )
+            return False
+        if result.returncode == 0:
+            logger.info(f"btmgmt {' '.join(args)} ok")
+        else:
+            logger.debug(
+                f"btmgmt {' '.join(args)}: {result.stderr or result.stdout or result.returncode}"
+            )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+        logger.warning(f"btmgmt {' '.join(args)}: {e}")
+        return False
+
+
+def configure_adapter_for_hog_peripheral(adapter_index: int = 0) -> bool:
+    """
+    LE-only peripheral posture while HoG runs.
+
+    Stops macOS from treating the Deck as a BR/EDR laptop and opening the
+    Bluetooth audio sink (A2DP) on the same bond.
+    """
+    logger.info("Configuring adapter for LE HID peripheral mode...")
+    ok = True
+    # Some controllers require power off before bredr off.
+    _run_btmgmt(adapter_index, "power", "off")
+    if not _run_btmgmt(adapter_index, "bredr", "off"):
+        ok = False
+    _run_btmgmt(adapter_index, "le", "on")
+    # CoD: Peripheral / Gamepad (0x002508)
+    _run_btmgmt(adapter_index, "class", "0x002508")
+    _run_btmgmt(adapter_index, "connectable", "on")
+    _run_btmgmt(adapter_index, "pairable", "on")
+    _run_btmgmt(adapter_index, "power", "on")
+    return ok
+
+
+def restore_adapter_bluetooth_transport(adapter_index: int = 0) -> None:
+    """Re-enable BR/EDR when HoG stops so normal Deck Bluetooth works again."""
+    logger.info("Restoring dual BR/EDR + LE adapter mode...")
+    _run_btmgmt(adapter_index, "power", "off")
+    _run_btmgmt(adapter_index, "bredr", "on")
+    _run_btmgmt(adapter_index, "le", "on")
+    _run_btmgmt(adapter_index, "power", "on")
+
+
 def reset_adapter_to_default_state(bus: Gio.DBusConnection, adapter_path: str) -> bool:
     """
     Reset adapter properties to default state for normal Bluetooth operation.
@@ -676,9 +733,12 @@ def reset_adapter_to_default_state(bus: Gio.DBusConnection, adapter_path: str) -
         logger.warning("Could not ensure adapter powered")
         success = False
     
+    adapter_name = adapter_path.rsplit("/", 1)[-1] if adapter_path else "hci0"
+    restore_adapter_bluetooth_transport(get_adapter_index(adapter_name))
+
     if success:
         logger.info("Adapter reset to default state successfully")
-    
+
     return success
 
 

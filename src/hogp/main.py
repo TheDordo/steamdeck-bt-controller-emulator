@@ -24,6 +24,7 @@ from .bluez import (
     unregister_advertisement_async,
     get_le_advertising_active_instances,
     set_static_ble_address,
+    configure_adapter_for_hog_peripheral,
     get_adapter_index,
     set_adapter_alias,
     reset_adapter_to_default_state,
@@ -123,6 +124,8 @@ class HoGPeripheral:
                 logger.warning("Could not set static BLE address - device may appear as duplicate controller on reconnect")
         else:
             logger.info("Static BLE address not configured (--no-static-addr)")
+
+        configure_adapter_for_hog_peripheral(get_adapter_index(self.adapter))
         
         # Ensure adapter is powered
         if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):

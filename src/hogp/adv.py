@@ -46,15 +46,10 @@ class Advertisement:
         
         # Advertisement properties
         self._type = "peripheral"
-        # HID + DIS + Battery (macOS/iOS HoG expectations; not adapter-owned GAP).
-        self._service_uuids = [
-            HID_SERVICE_UUID_16,
-            DEVICE_INFO_SERVICE_UUID_16,
-            BATTERY_SERVICE_UUID_16,
-        ]
-        self._appearance = 0x03C4  # Gamepad appearance
+        # Advertise HoG only — DIS/Battery stay in GATT; extra UUIDs confuse macOS.
+        self._service_uuids = [HID_SERVICE_UUID_16]
+        self._appearance = 0x03C4  # BLE Appearance: Gamepad
         self._discoverable = True
-        # Do not list "appearance" here when Appearance property is set — BlueZ errors.
         self._includes = ["tx-power"]
         self._connectable = True
 
