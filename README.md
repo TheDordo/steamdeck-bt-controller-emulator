@@ -140,6 +140,16 @@ GATT notify can start **before** macOS finishes SMP bonding. Latest builds **cal
 7. If pairing still spins: on the Deck (Developer), add under `[General]` in `/etc/bluetooth/main.conf`:
    `ReverseServiceDiscovery=false` and `DisablePlugins=battery,deviceinfo`, then `sudo systemctl restart bluetooth`.
 
+### Paired on Mac but no gamepad / keyboard input
+
+Current builds expose **Protocol Mode (0x2A4E)**, **Report Reference** per report ID (gamepad / keyboard / mouse), and **event-driven HID notify**. **Forget SteamDeckPad on both devices** and pair again after updating (GATT layout changed).
+
+**Quick Mac checks**
+
+1. **Keyboard tab** — open TextEdit on the Mac, tap keys in the app; characters should appear.
+2. **Controller tab** — confirm sticks/buttons move in the **Deck UI visualizer** (proves evdev forwarding). On Mac, check **System Settings → Game Controllers** or test in a game/Steam that supports generic HID.
+3. If the visualizer does **not** move, use Desktop Mode / quit Steam so the Deck exposes controls to evdev (`evtest`).
+
 ### Pairs but no input (Bluetooth)
 
 - Forget device on both sides and pair again

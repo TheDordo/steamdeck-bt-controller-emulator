@@ -336,22 +336,20 @@ class InputHandler:
                 self._update_hat()
 
     def _update_hat(self) -> None:
-        """Convert D-pad X/Y state to HAT direction (0-7 or 0x0F for center)."""
-        # HAT switch encoding:
-        # 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW, 0x0F=center
+        """Convert D-pad X/Y state to HAT direction (0-7 or 8 for center)."""
         hat_map = {
-            ( 0, -1): 0,   # Up
-            ( 1, -1): 1,   # Up-Right
-            ( 1,  0): 2,   # Right
-            ( 1,  1): 3,   # Down-Right
-            ( 0,  1): 4,   # Down
-            (-1,  1): 5,   # Down-Left
-            (-1,  0): 6,   # Left
-            (-1, -1): 7,   # Up-Left
-            ( 0,  0): 0x0F # Center
+            ( 0, -1): 0,
+            ( 1, -1): 1,
+            ( 1,  0): 2,
+            ( 1,  1): 3,
+            ( 0,  1): 4,
+            (-1,  1): 5,
+            (-1,  0): 6,
+            (-1, -1): 7,
+            ( 0,  0): 8,
         }
         
-        direction = hat_map.get((self._dpad_x, self._dpad_y), 0x0F)
+        direction = hat_map.get((self._dpad_x, self._dpad_y), 8)
         
         if self.verbose:
             logger.debug(f"HAT = {direction:02X}")

@@ -1043,32 +1043,44 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
     
     def _on_button(self, index, pressed):
-        """Handle button event from physical controller."""
+        GLib.idle_add(self._apply_button, index, pressed)
+
+    def _apply_button(self, index, pressed):
         if self._gatt_app:
             self._gatt_app.set_button(index, pressed)
         elif self._usb_gadget:
             self._usb_gadget.set_button(index, pressed)
-    
+        return False
+
     def _on_axis(self, index, value):
-        """Handle axis event from physical controller."""
+        GLib.idle_add(self._apply_axis, index, value)
+
+    def _apply_axis(self, index, value):
         if self._gatt_app:
             self._gatt_app.set_axis(index, value)
         elif self._usb_gadget:
             self._usb_gadget.set_axis(index, value)
-    
+        return False
+
     def _on_trigger(self, index, value):
-        """Handle trigger event from physical controller."""
+        GLib.idle_add(self._apply_trigger, index, value)
+
+    def _apply_trigger(self, index, value):
         if self._gatt_app:
             self._gatt_app.set_trigger(index, value)
         elif self._usb_gadget:
             self._usb_gadget.set_trigger(index, value)
-    
+        return False
+
     def _on_hat(self, direction):
-        """Handle HAT/D-pad event from physical controller."""
+        GLib.idle_add(self._apply_hat, direction)
+
+    def _apply_hat(self, direction):
         if self._gatt_app:
             self._gatt_app.set_hat(direction)
         elif self._usb_gadget:
             self._usb_gadget.set_hat(direction)
+        return False
     
     def _update_visualizer(self):
         """Update the controller visualization."""
