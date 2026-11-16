@@ -74,46 +74,84 @@ MOD_LALT = 0x04
 MOD_LGUI = 0x08
 
 
+_BTN_NAMES = (
+    "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "Guide", "L3", "R3",
+)
+
+
 class ControllerVisualizer(Gtk.Box):
-    """Placeholder widget for controller tab."""
+    """Live view of forwarded gamepad state + Deck-only Home/QAM shortcuts."""
     
     def __init__(self, hid_output_getter):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.set_margin_top(50)
-        self.set_margin_bottom(50)
-        self.set_margin_start(50)
-        self.set_margin_end(50)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.set_margin_top(8)
+        self.set_margin_bottom(8)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
         
         self.hid_output_getter = hid_output_getter
-        
-        # Info text
-        info_label = Gtk.Label()
-        info_label.set_markup(
-            "<big>Controller Input Forwarding Active</big>\n\n"
-            "Physical controller inputs are being forwarded\n"
-            "when a device is connected via Bluetooth."
+        self._btn_labels: list[Gtk.Label] = []
+
+        title = Gtk.Label()
+        title.set_markup("<big><b>Physical input (evdev → HID)</b></big>")
+        self.append(title)
+
+        self._input_label = Gtk.Label(label="Input: waiting for service…")
+        self._input_label.set_wrap(True)
+        self._input_label.set_halign(Gtk.Align.START)
+        self.append(self._input_label)
+
+        btn_grid = Gtk.Grid(column_spacing=6, row_spacing=4)
+        btn_grid.set_halign(Gtk.Align.CENTER)
+        for i, name in enumerate(_BTN_NAMES):
+            lbl = Gtk.Label(label=f"{name}: —")
+            lbl.set_xalign(0)
+            col = i % 4
+            row = i // 4
+            btn_grid.attach(lbl, col, row, 1, 1)
+            self._btn_labels.append(lbl)
+        self.append(btn_grid)
+
+        self._axes_label = Gtk.Label(label="Sticks: —")
+        self._axes_label.set_halign(Gtk.Align.START)
+        self.append(self._axes_label)
+
+        self._trig_label = Gtk.Label(label="Triggers: —")
+        self._trig_label.set_halign(Gtk.Align.START)
+        self.append(self._trig_label)
+
+        self._hat_label = Gtk.Label(label="D-pad: —")
+        self._hat_label.set_halign(Gtk.Align.START)
+        self.append(self._hat_label)
+
+        hint = Gtk.Label()
+        hint.set_markup(
+            "<small>Press sticks/buttons on the Deck. Values should "
+            "change here before they reach the Mac. If nothing moves, "
+            "use Desktop Mode or quit Steam and run <tt>evtest</tt>.</small>"
         )
-        info_label.set_justify(Gtk.Justification.CENTER)
-        self.append(info_label)
+        hint.set_wrap(True)
+        hint.set_margin_top(8)
+        self.append(hint)
         
-        # On-screen buttons
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         button_box.set_halign(Gtk.Align.CENTER)
-        button_box.set_margin_top(30)
+        button_box.set_margin_top(12)
         
-        # Home/Nexus button (sends Ctrl+1)
         self.home_button = Gtk.Button(label="⌂ Home")
         self.home_button.set_size_request(150, 60)
         self.home_button.connect("clicked", self._send_home)
         button_box.append(self.home_button)
         
-        # QAM button (sends Ctrl+2)
         self.qam_button = Gtk.Button(label="⋯ QAM")
         self.qam_button.set_size_request(150, 60)
         self.qam_button.connect("clicked", self._send_qam)
         button_box.append(self.qam_button)
         
         self.append(button_box)
+
+    def set_input_source(self, text: str) -> None:
+        self._input_label.set_label(f"Input: {text}")
     
     def _send_home(self, button=None):
         """Send Ctrl+1 for Home button."""
@@ -162,8 +200,24 @@ class ControllerVisualizer(Gtk.Box):
         return False  # Don't repeat
         
     def update_state(self, buttons, axes, triggers, hat):
-        """Placeholder method for compatibility."""
-        pass
+        for i, lbl in enumerate(self._btn_labels):
+            pressed = bool(buttons & (1 << i))
+            mark = "●" if pressed else "○"
+            lbl.set_markup(
+                f"<b>{_BTN_NAMES[i]}</b>: <span "
+                f"foreground='{'#2ecc71' if pressed else '#888888'}'>{mark}</span>"
+            )
+        self._axes_label.set_label(
+            f"Sticks: LX={axes[0]:6d} LY={axes[1]:6d} "
+            f"RX={axes[2]:6d} RY={axes[3]:6d}"
+        )
+        self._trig_label.set_label(f"Triggers: LT={triggers[0]:3d} RT={triggers[1]:3d}")
+        hat_names = {
+            0: "Up", 1: "Up-Right", 2: "Right", 3: "Down-Right",
+            4: "Down", 5: "Down-Left", 6: "Left", 7: "Up-Left",
+            8: "Center",
+        }
+        self._hat_label.set_label(f"D-pad: {hat_names.get(hat, f'0x{hat:02x}')}")
 
 
 class VirtualKeyboard(Gtk.Box):
@@ -1035,12 +1089,22 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _start_input_handler(self):
         """Start forwarding physical controller input (Bluetooth path)."""
         if self._start_input_handler_sync():
-            GLib.idle_add(self._update_connection_label, "Input device connected")
+            GLib.idle_add(self._on_input_handler_ready, True)
         else:
-            GLib.idle_add(
-                self._update_connection_label,
-                "No gamepad evdev node — service up, input may be missing",
+            GLib.idle_add(self._on_input_handler_ready, False)
+
+    def _on_input_handler_ready(self, ok: bool):
+        if ok and self._input_handler:
+            self.visualizer.set_input_source(self._input_handler.active_device_label)
+            self._update_connection_label("Input device connected")
+        else:
+            self.visualizer.set_input_source(
+                "No gamepad found — Desktop Mode / quit Steam / evtest"
             )
+            self._update_connection_label(
+                "No gamepad evdev node — service up, input may be missing"
+            )
+        return False
     
     def _on_button(self, index, pressed):
         GLib.idle_add(self._apply_button, index, pressed)
@@ -1098,6 +1162,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             hid_output._triggers,
             hid_output._hat,
         )
+        if self._input_handler:
+            self.visualizer.set_input_source(self._input_handler.active_device_label)
         
         # Update connection status (Bluetooth mode only)
         if self._gatt_app and self._bus and self._adapter_path:

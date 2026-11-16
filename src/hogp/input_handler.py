@@ -361,3 +361,9 @@ class InputHandler:
     def is_running(self) -> bool:
         """Check if the input handler is running."""
         return self._running
+
+    @property
+    def active_device_label(self) -> str:
+        if self._device:
+            return f"{self._device.name} — {self.device_path}"
+        return "Not connected"
