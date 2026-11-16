@@ -66,6 +66,8 @@ HID_KEY_CODES = {
     'VolUp': 0x80, 'VolDown': 0x81, 'Mute': 0x7f,
     'PlayPause': 0xcd, 'Stop': 0xb7, 'NextTrack': 0xb5, 'PrevTrack': 0xb6,
 }
+for _fi in range(1, 13):
+    HID_KEY_CODES[f"f{_fi}"] = HID_KEY_CODES[f"F{_fi}"]
 
 # Modifier keys (bitmask)
 MOD_LCTRL = 0x01
@@ -158,17 +160,11 @@ class ControllerVisualizer(Gtk.Box):
         hid_output = self.hid_output_getter()
         logger.info(f"Home button clicked. hid_output={hid_output}")
         if hid_output:
-            if hasattr(hid_output, 'notifying') and hid_output.notifying:
-                # Bluetooth mode (GATT)
-                hid_output._kbd_modifiers = MOD_LCTRL
-                hid_output._kbd_keys = [0x1e, 0, 0, 0, 0, 0]  # '1' key
-                hid_output._send_keyboard_notification()
+            if hasattr(hid_output, 'send_key'):
+                hid_output.send_key(0x1e, MOD_LCTRL, hold_ms=200)
                 logger.info("Home: Sent Ctrl+1 press")
-                # Release after 50ms
-                GLib.timeout_add(50, self._release_keys)
-            elif hasattr(hid_output, 'send_key'):
-                # Wired mode (USB Gadget)
-                hid_output.send_key(0x1e, MOD_LCTRL)
+            elif hasattr(hid_output, 'notifying') and hid_output.notifying:
+                hid_output.send_key(0x1e, MOD_LCTRL, hold_ms=200)
                 logger.info("Home: Sent Ctrl+1 press (wired)")
     
     def _send_qam(self, button=None):
@@ -176,17 +172,11 @@ class ControllerVisualizer(Gtk.Box):
         hid_output = self.hid_output_getter()
         logger.info(f"QAM button clicked. hid_output={hid_output}")
         if hid_output:
-            if hasattr(hid_output, 'notifying') and hid_output.notifying:
-                # Bluetooth mode (GATT)
-                hid_output._kbd_modifiers = MOD_LCTRL
-                hid_output._kbd_keys = [0x1f, 0, 0, 0, 0, 0]  # '2' key
-                hid_output._send_keyboard_notification()
+            if hasattr(hid_output, 'send_key'):
+                hid_output.send_key(0x1f, MOD_LCTRL, hold_ms=200)
                 logger.info("QAM: Sent Ctrl+2 press")
-                # Release after 50ms
-                GLib.timeout_add(50, self._release_keys)
-            elif hasattr(hid_output, 'send_key'):
-                # Wired mode (USB Gadget)
-                hid_output.send_key(0x1f, MOD_LCTRL)
+            elif hasattr(hid_output, 'notifying') and hid_output.notifying:
+                hid_output.send_key(0x1f, MOD_LCTRL, hold_ms=200)
                 logger.info("QAM: Sent Ctrl+2 press (wired)")
     
     def _release_keys(self):
@@ -338,10 +328,11 @@ class VirtualKeyboard(Gtk.Box):
         if hasattr(hid_output, 'notifying') and not hid_output.notifying:
             return
         
-        key_lower = key.lower()
-        key_code = HID_KEY_CODES.get(key_lower) or HID_KEY_CODES.get(key)
+        key_code = HID_KEY_CODES.get(key) or HID_KEY_CODES.get(key.lower())
         if key_code:
-            hid_output.send_key(key_code, 0)
+            hid_output.send_key(key_code, 0, hold_ms=140)
+        else:
+            logger.warning(f"No HID code for key {key!r}")
     
     def _send_shortcut(self, key, modifier):
         """Send a keyboard shortcut (key + modifier)."""
@@ -351,10 +342,9 @@ class VirtualKeyboard(Gtk.Box):
         if hasattr(hid_output, 'notifying') and not hid_output.notifying:
             return
         
-        key_lower = key.lower()
-        key_code = HID_KEY_CODES.get(key_lower) or HID_KEY_CODES.get(key)
+        key_code = HID_KEY_CODES.get(key) or HID_KEY_CODES.get(key.lower())
         if key_code:
-            hid_output.send_key(key_code, modifier)
+            hid_output.send_key(key_code, modifier, hold_ms=200)
     
     def _send_modifier_only(self, modifier):
         """Send just a modifier key press (like Super key)."""
@@ -365,7 +355,7 @@ class VirtualKeyboard(Gtk.Box):
             return
         
         # Send modifier with no key
-        hid_output.send_key(0, modifier)
+        hid_output.send_key(0, modifier, hold_ms=120)
 
 
 class VirtualMediaControls(Gtk.Box):
@@ -444,7 +434,7 @@ class VirtualMediaControls(Gtk.Box):
         
         key_code = HID_KEY_CODES.get(key)
         if key_code:
-            hid_output.send_key(key_code, 0)
+            hid_output.send_key(key_code, 0, hold_ms=180)
 
 
 class VirtualTrackpad(Gtk.Box):

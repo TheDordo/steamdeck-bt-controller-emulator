@@ -227,6 +227,7 @@ class GattApplication:
         self._gamepad_notifying = False
         self._keyboard_notifying = False
         self._notify_timeout_id: Optional[int] = None
+        self._kbd_release_timeout_id: Optional[int] = None
         self._report_rate_hz = DEFAULT_REPORT_RATE_HZ
         
         # Current GAMEPAD report state (Report ID 1):
@@ -320,26 +321,46 @@ class GattApplication:
     
     # === KEYBOARD METHODS ===
     
-    def send_key(self, key_code: int, modifiers: int = 0) -> None:
+    def send_key(self, key_code: int, modifiers: int = 0, hold_ms: int = 140) -> None:
         """
         Send a single key press.
         
         Args:
             key_code: HID key code (e.g., 0x04 = 'a')
             modifiers: Modifier bitmask (0x01=LCtrl, 0x02=LShift, 0x04=LAlt, 0x08=LGUI)
+            hold_ms: How long to hold before release (macOS BLE needs >~50ms)
         """
+        if self._kbd_release_timeout_id is not None:
+            GLib.source_remove(self._kbd_release_timeout_id)
+            self._kbd_release_timeout_id = None
+
         self._kbd_modifiers = modifiers
-        self._kbd_keys = [key_code, 0, 0, 0, 0, 0]
+        slot = key_code if key_code else 0
+        self._kbd_keys = [slot, 0, 0, 0, 0, 0]
         self._send_keyboard_notification()
-        # Release key after a short delay
-        GLib.timeout_add(50, self._release_key)
-    
+        # Repeat once — some hosts sample notify irregularly over BLE.
+        GLib.timeout_add(12, self._resend_keyboard_press)
+
+        self._kbd_release_timeout_id = GLib.timeout_add(hold_ms, self._release_key)
+
+    def _resend_keyboard_press(self) -> bool:
+        if any(self._kbd_keys) or self._kbd_modifiers:
+            self._send_keyboard_notification()
+        return False
+
     def _release_key(self) -> bool:
         """Release all keys."""
+        self._kbd_release_timeout_id = None
         self._kbd_modifiers = 0
         self._kbd_keys = [0, 0, 0, 0, 0, 0]
         self._send_keyboard_notification()
-        return False  # Don't repeat
+        GLib.timeout_add(12, self._resend_keyboard_release)
+        return False
+
+    def _resend_keyboard_release(self) -> bool:
+        if not any(self._kbd_keys) and not self._kbd_modifiers:
+            self._send_keyboard_notification()
+        return False
     
     def get_keyboard_report(self) -> bytes:
         """Build the current 9-byte keyboard HID report (Report ID 2)."""
@@ -1271,6 +1292,9 @@ class GattApplication:
 
     def stop_notify(self) -> None:
         self.stop_gamepad_notify()
+        if self._kbd_release_timeout_id is not None:
+            GLib.source_remove(self._kbd_release_timeout_id)
+            self._kbd_release_timeout_id = None
 
     def _send_gamepad_notification(self) -> bool:
         if not self._gamepad_notifying:
