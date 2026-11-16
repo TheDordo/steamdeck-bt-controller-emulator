@@ -142,7 +142,7 @@ GATT notify can start **before** macOS finishes SMP bonding. Latest builds **cal
 
 ### Paired on Mac but no gamepad / keyboard input
 
-Current builds expose **Protocol Mode (0x2A4E)**, **Report Reference** per report ID (gamepad / keyboard / mouse), and **event-driven HID notify**. **Forget SteamDeckPad on both devices** and pair again after updating (GATT layout changed).
+Current builds keep the **stable char0–char3 HID layout** (what paired reliably), add **Protocol Mode on char4**, and use **event-driven HID notify**. **Forget SteamDeckPad on both devices** after each GATT update, then pair again.
 
 **Quick Mac checks**
 

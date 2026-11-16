@@ -25,7 +25,8 @@ REPORT_MAP_FLAGS = ["read", "encrypt-read"]
 HID_CONTROL_POINT_FLAGS = ["write-without-response", "encrypt-write"]
 REPORT_CHAR_FLAGS = ["read", "notify", "encrypt-read", "encrypt-notify"]
 REPORT_REFERENCE_FLAGS = ["read", "encrypt-read"]
-PROTOCOL_MODE_FLAGS = ["read", "write-without-response", "encrypt-read", "encrypt-write"]
+# Unencrypted so macOS can read before SMP finishes; report/map stay encrypted.
+PROTOCOL_MODE_FLAGS = ["read", "write-without-response"]
 
 # Standard UUIDs
 HID_SERVICE_UUID = "00001812-0000-1000-8000-00805f9b34fb"
@@ -207,12 +208,9 @@ class GattApplication:
     Registers D-Bus objects at:
     - APP_PATH (ObjectManager root)
     - APP_PATH/service0 (HID Service)
-    - APP_PATH/service0/char0 (Protocol Mode)
-    - APP_PATH/service0/char1 (HID Information)
-    - APP_PATH/service0/char2 (Report Map)
-    - APP_PATH/service0/char3 (HID Control Point)
-    - APP_PATH/service0/char4 (Report - with notifications)
-    - APP_PATH/service0/char4/desc0..2 (Report Reference per report ID)
+    - APP_PATH/service0/char0..char2 (HID Information, Report Map, Control Point)
+    - APP_PATH/service0/char3 (Report + Report Reference)
+    - APP_PATH/service0/char4 (Protocol Mode — appended; stable for BlueZ/macOS)
     HID service only in the exported GATT tree. GAP (0x1800) and DIS (0x180a)
     are owned by bluetoothd; registering them causes "Failed to create entry in database".
     """
@@ -371,12 +369,12 @@ class GattApplication:
         try:
             self._register_object_manager()
             self._register_service()
-            self._register_protocol_mode_char()
             self._register_hid_info_char()
             self._register_report_map_char()
             self._register_hid_control_point_char()
             self._register_report_char()
             self._register_report_reference_desc()
+            self._register_protocol_mode_char()
             # Do not register GAP (0x1800) or DIS (0x180a) — BlueZ already owns these.
             logger.info(f"GATT objects registered under {self.APP_PATH}")
             return True
@@ -447,9 +445,7 @@ class GattApplication:
         char2_path = f"{service_path}/char2"
         char3_path = f"{service_path}/char3"
         char4_path = f"{service_path}/char4"
-        desc0_path = f"{char4_path}/desc0"
-        desc1_path = f"{char4_path}/desc1"
-        desc2_path = f"{char4_path}/desc2"
+        desc0_path = f"{char3_path}/desc0"
 
         return {
             service_path: {
@@ -464,21 +460,13 @@ class GattApplication:
             },
             char0_path: {
                 GATT_CHAR_IFACE: {
-                    "UUID": GLib.Variant("s", PROTOCOL_MODE_UUID),
-                    "Service": GLib.Variant("o", service_path),
-                    "Flags": GLib.Variant("as", PROTOCOL_MODE_FLAGS),
-                    "Descriptors": GLib.Variant("ao", []),
-                },
-            },
-            char1_path: {
-                GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", HID_INFO_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", HID_INFO_FLAGS),
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
-            char2_path: {
+            char1_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_MAP_UUID),
                     "Service": GLib.Variant("o", service_path),
@@ -486,7 +474,7 @@ class GattApplication:
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
-            char3_path: {
+            char2_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", HID_CONTROL_POINT_UUID),
                     "Service": GLib.Variant("o", service_path),
@@ -494,32 +482,26 @@ class GattApplication:
                     "Descriptors": GLib.Variant("ao", []),
                 },
             },
-            char4_path: {
+            char3_path: {
                 GATT_CHAR_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [desc0_path, desc1_path, desc2_path]),
+                    "Descriptors": GLib.Variant("ao", [desc0_path]),
+                },
+            },
+            char4_path: {
+                GATT_CHAR_IFACE: {
+                    "UUID": GLib.Variant("s", PROTOCOL_MODE_UUID),
+                    "Service": GLib.Variant("o", service_path),
+                    "Flags": GLib.Variant("as", PROTOCOL_MODE_FLAGS),
+                    "Descriptors": GLib.Variant("ao", []),
                 },
             },
             desc0_path: {
                 GATT_DESC_IFACE: {
                     "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                    "Characteristic": GLib.Variant("o", char4_path),
-                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
-                },
-            },
-            desc1_path: {
-                GATT_DESC_IFACE: {
-                    "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                    "Characteristic": GLib.Variant("o", char4_path),
-                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
-                },
-            },
-            desc2_path: {
-                GATT_DESC_IFACE: {
-                    "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                    "Characteristic": GLib.Variant("o", char4_path),
+                    "Characteristic": GLib.Variant("o", char3_path),
                     "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
                 },
             },
@@ -649,7 +631,7 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char0"
+        path = f"{self.APP_PATH}/service0/char4"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
@@ -707,7 +689,7 @@ class GattApplication:
     def _register_hid_info_char(self) -> None:
         """Register HID Information characteristic."""
         self._register_read_char(
-            f"{self.APP_PATH}/service0/char1",
+            f"{self.APP_PATH}/service0/char0",
             HID_INFO_UUID,
             HID_INFO,
             "HID Information",
@@ -717,7 +699,7 @@ class GattApplication:
     def _register_report_map_char(self) -> None:
         """Register Report Map characteristic."""
         self._register_read_char(
-            f"{self.APP_PATH}/service0/char2",
+            f"{self.APP_PATH}/service0/char1",
             REPORT_MAP_UUID,
             REPORT_MAP,
             "Report Map",
@@ -751,7 +733,7 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char3"
+        path = f"{self.APP_PATH}/service0/char2"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
@@ -917,10 +899,8 @@ class GattApplication:
             </interface>
         </node>
         """
-        path = f"{self.APP_PATH}/service0/char4"
+        path = f"{self.APP_PATH}/service0/char3"
         desc0_path = f"{path}/desc0"
-        desc1_path = f"{path}/desc1"
-        desc2_path = f"{path}/desc2"
         service_path = f"{self.APP_PATH}/service0"
         node_info = Gio.DBusNodeInfo.new_for_xml(xml)
 
@@ -951,7 +931,7 @@ class GattApplication:
                     "UUID": GLib.Variant("s", REPORT_UUID),
                     "Service": GLib.Variant("o", service_path),
                     "Flags": GLib.Variant("as", REPORT_CHAR_FLAGS),
-                    "Descriptors": GLib.Variant("ao", [desc0_path, desc1_path, desc2_path]),
+                    "Descriptors": GLib.Variant("ao", [desc0_path]),
                     "Notifying": GLib.Variant("b", self._notifying),
                 }
                 if method == "Get":
@@ -1007,60 +987,52 @@ class GattApplication:
             </interface>
         </node>
         """
-        char_path = f"{self.APP_PATH}/service0/char4"
-        refs = [
-            (f"{char_path}/desc0", bytes([0x01, 0x01])),
-            (f"{char_path}/desc1", bytes([0x02, 0x01])),
-            (char_path + "/desc2", bytes([0x03, 0x01])),
-        ]
-        for path, report_ref_value in refs:
-            node_info = Gio.DBusNodeInfo.new_for_xml(xml)
+        char_path = f"{self.APP_PATH}/service0/char3"
+        path = f"{char_path}/desc0"
+        node_info = Gio.DBusNodeInfo.new_for_xml(xml)
+        report_ref_value = bytes([0x01, 0x01])
 
-            def make_handler(ref_bytes: bytes, desc_path: str, report_path: str):
-                def handler(conn, sender, obj_path, iface, method, params, invoc):
-                    if iface == GATT_DESC_IFACE:
-                        if method == "ReadValue":
-                            invoc.return_value(GLib.Variant("(ay)", (ref_bytes,)))
-                        else:
-                            invoc.return_dbus_error(
-                                "org.freedesktop.DBus.Error.UnknownMethod",
-                                f"Unknown method: {method}",
-                            )
-                    elif iface == DBUS_PROPS_IFACE:
-                        props = {
-                            "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
-                            "Characteristic": GLib.Variant("o", report_path),
-                            "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
-                        }
-                        if method == "Get":
-                            _, prop = params.unpack()
-                            if prop in props:
-                                invoc.return_value(GLib.Variant("(v)", (props[prop],)))
-                            else:
-                                invoc.return_dbus_error(
-                                    "org.freedesktop.DBus.Error.InvalidArgs",
-                                    f"Unknown property: {prop}",
-                                )
-                        elif method == "GetAll":
-                            invoc.return_value(GLib.Variant("(a{sv})", (props,)))
-                        else:
-                            invoc.return_dbus_error(
-                                "org.freedesktop.DBus.Error.UnknownMethod",
-                                f"Unknown method: {method}",
-                            )
+        def handler(conn, sender, obj_path, iface, method, params, invoc):
+            if iface == GATT_DESC_IFACE:
+                if method == "ReadValue":
+                    invoc.return_value(GLib.Variant("(ay)", (report_ref_value,)))
+                else:
+                    invoc.return_dbus_error(
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        f"Unknown method: {method}",
+                    )
+            elif iface == DBUS_PROPS_IFACE:
+                props = {
+                    "UUID": GLib.Variant("s", REPORT_REFERENCE_UUID),
+                    "Characteristic": GLib.Variant("o", char_path),
+                    "Flags": GLib.Variant("as", REPORT_REFERENCE_FLAGS),
+                }
+                if method == "Get":
+                    _, prop = params.unpack()
+                    if prop in props:
+                        invoc.return_value(GLib.Variant("(v)", (props[prop],)))
                     else:
                         invoc.return_dbus_error(
-                            "org.freedesktop.DBus.Error.UnknownInterface",
-                            f"Unknown interface: {iface}",
+                            "org.freedesktop.DBus.Error.InvalidArgs",
+                            f"Unknown property: {prop}",
                         )
+                elif method == "GetAll":
+                    invoc.return_value(GLib.Variant("(a{sv})", (props,)))
+                else:
+                    invoc.return_dbus_error(
+                        "org.freedesktop.DBus.Error.UnknownMethod",
+                        f"Unknown method: {method}",
+                    )
+            else:
+                invoc.return_dbus_error(
+                    "org.freedesktop.DBus.Error.UnknownInterface",
+                    f"Unknown interface: {iface}",
+                )
 
-                return handler
-
-            handler = make_handler(report_ref_value, path, char_path)
-            reg_id = self.bus.register_object(path, node_info.interfaces[0], handler, None, None)
-            self._registrations.append(reg_id)
-            reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
-            self._registrations.append(reg_id)
+        reg_id = self.bus.register_object(path, node_info.interfaces[0], handler, None, None)
+        self._registrations.append(reg_id)
+        reg_id = self.bus.register_object(path, node_info.interfaces[1], handler, None, None)
+        self._registrations.append(reg_id)
 
     def _register_device_info_service(self) -> None:
         """Register Device Information Service."""
@@ -1161,7 +1133,7 @@ class GattApplication:
             return False
         
         report = self.get_current_report()
-        char_path = f"{self.APP_PATH}/service0/char4"
+        char_path = f"{self.APP_PATH}/service0/char3"
         
         try:
             self.bus.emit_signal(
@@ -1190,7 +1162,7 @@ class GattApplication:
             return
         
         report = self.get_keyboard_report()
-        char_path = f"{self.APP_PATH}/service0/char4"
+        char_path = f"{self.APP_PATH}/service0/char3"
         
         logger.debug(f"Sending keyboard notification: modifiers={self._kbd_modifiers:#04x}, keys={[f'{k:#04x}' for k in self._kbd_keys]}")
         
@@ -1219,7 +1191,7 @@ class GattApplication:
             return
         
         report = self.get_mouse_report()
-        char_path = f"{self.APP_PATH}/service0/char4"
+        char_path = f"{self.APP_PATH}/service0/char3"
         
         try:
             self.bus.emit_signal(
