@@ -99,9 +99,9 @@ echo "Creating HID functions..."
 
 # Function 1: Gamepad
 mkdir -p functions/hid.usb0
-echo 1 > functions/hid.usb0/protocol  # 1 = keyboard/mouse boot protocol (use for gamepad)
+echo 0 > functions/hid.usb0/protocol   # 0 = none (gamepad is not boot keyboard/mouse)
 echo 0 > functions/hid.usb0/subclass  # 0 = no subclass
-echo 14 > functions/hid.usb0/report_length  # Gamepad report size (13 bytes + Report ID removed = 13 bytes)
+echo 13 > functions/hid.usb0/report_length  # Must match exact write() size to /dev/hidg0
 
 # Function 2: Keyboard
 mkdir -p functions/hid.usb1

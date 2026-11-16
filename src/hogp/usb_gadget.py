@@ -54,7 +54,7 @@ class USBGadgetHID:
         self._buttons = 0  # 11 buttons + 5 bits padding = 2 bytes
         self._axes = [0, 0, 0, 0]  # X, Y, RX, RY (signed 16-bit each = 8 bytes)
         self._triggers = [0, 0]  # LT, RT (unsigned 8-bit each = 2 bytes)
-        self._hat = 0x0F  # D-pad (8-bit, 0x0F = neutral)
+        self._hat = 0x08  # HAT neutral per descriptor (0–7 = dirs, 8 = center)
         
         # Keyboard report (9 bytes total)
         self._kbd_modifiers = 0  # Modifier keys bitfield (1 byte)
@@ -214,9 +214,11 @@ class USBGadgetHID:
         Set gamepad HAT/D-pad value.
         
         Args:
-            value: HAT value (0-7 for directions, 0x0F for neutral)
+            value: HAT value (0-7 for directions, 8 for neutral; 0x0F accepted as neutral)
         """
-        if value not in [0, 1, 2, 3, 4, 5, 6, 7, 0x0F]:
+        if value == 0x0F:
+            value = 8
+        if value < 0 or value > 8:
             logger.warning(f"Invalid HAT value: {value}")
             return
         
@@ -247,31 +249,38 @@ class USBGadgetHID:
             # HAT switch
             report[12] = self._hat
             
-            os.write(self._gamepad_fd, bytes(report))
+            written = os.write(self._gamepad_fd, bytes(report))
+            if written != len(report):
+                logger.error(
+                    f"Gamepad write short: {written}/{len(report)} bytes — re-run setup-usb-gadget.sh"
+                )
             
             if self.verbose:
                 logger.debug(f"Gamepad report: {report.hex()}")
                 
+        except OSError as e:
+            logger.error(f"Failed to send gamepad report ({len(report)} bytes): {e}")
         except Exception as e:
             logger.error(f"Failed to send gamepad report: {e}")
 
     # === Keyboard Methods ===
     
-    def send_key(self, key_code: int, modifiers: int = 0) -> None:
+    def send_key(self, key_code: int, modifiers: int = 0, hold_ms: int = 140) -> None:
         """
         Send keyboard key press and release.
         
         Args:
             key_code: HID key code
             modifiers: Modifier keys bitfield
+            hold_ms: How long to hold before release (ignored if 0)
         """
         # Press
         self._kbd_modifiers = modifiers
-        self._kbd_keys[0] = key_code
+        self._kbd_keys = [key_code if key_code else 0, 0, 0, 0, 0, 0]
         self._send_keyboard_report()
         
-        # Small delay
-        time.sleep(0.05)
+        if hold_ms > 0:
+            time.sleep(hold_ms / 1000.0)
         
         # Release
         self._kbd_modifiers = 0
@@ -303,11 +312,17 @@ class USBGadgetHID:
             report[1] = self._kbd_reserved
             report[2:8] = self._kbd_keys  # 6 keys
             
-            os.write(self._keyboard_fd, bytes(report))
+            written = os.write(self._keyboard_fd, bytes(report))
+            if written != len(report):
+                logger.error(
+                    f"Keyboard write short: {written}/{len(report)} bytes — re-run setup-usb-gadget.sh"
+                )
             
             if self.verbose:
                 logger.debug(f"Keyboard report: {report.hex()}")
                 
+        except OSError as e:
+            logger.error(f"Failed to send keyboard report ({len(report)} bytes): {e}")
         except Exception as e:
             logger.error(f"Failed to send keyboard report: {e}")
 
