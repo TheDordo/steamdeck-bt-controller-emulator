@@ -229,6 +229,58 @@ def register_advertisement_async(
     )
 
 
+def unregister_application_sync(
+    bus: Gio.DBusConnection,
+    adapter_path: str,
+    app_path: str,
+    timeout_ms: int = 5000,
+) -> bool:
+    """Unregister GATT application (blocking, for shutdown)."""
+    try:
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            adapter_path,
+            GATT_MANAGER_IFACE,
+            "UnregisterApplication",
+            GLib.Variant("(o)", (app_path,)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            timeout_ms,
+            None,
+        )
+        logger.info(f"GATT application unregistered from {app_path}")
+        return True
+    except GLib.Error as e:
+        logger.warning(f"UnregisterApplication: {e}")
+        return False
+
+
+def unregister_advertisement_sync(
+    bus: Gio.DBusConnection,
+    adapter_path: str,
+    adv_path: str,
+    timeout_ms: int = 5000,
+) -> bool:
+    """Unregister LE advertisement (blocking, for shutdown)."""
+    try:
+        bus.call_sync(
+            BLUEZ_SERVICE,
+            adapter_path,
+            LE_ADV_MANAGER_IFACE,
+            "UnregisterAdvertisement",
+            GLib.Variant("(o)", (adv_path,)),
+            None,
+            Gio.DBusCallFlags.NONE,
+            timeout_ms,
+            None,
+        )
+        logger.info(f"Advertisement unregistered from {adv_path}")
+        return True
+    except GLib.Error as e:
+        logger.warning(f"UnregisterAdvertisement: {e}")
+        return False
+
+
 def unregister_advertisement_async(
     bus: Gio.DBusConnection,
     adapter_path: str,
@@ -520,7 +572,7 @@ def set_device_trusted(bus: Gio.DBusConnection, device_path: str, trusted: bool 
 def pair_device_sync(
     bus: Gio.DBusConnection,
     device_path: str,
-    timeout_ms: int = 90000,
+    timeout_ms: int = 25000,
 ) -> tuple[bool, Optional[str]]:
     """Complete SMP pairing with connected central (e.g. Mac)."""
     try:
@@ -546,13 +598,15 @@ def pair_device_sync(
 
 
 def complete_bond_with_central(
-    bus: Gio.DBusConnection,
+    bus: Optional[Gio.DBusConnection],
     adapter_path: str,
 ) -> tuple[Optional[Dict], Optional[str]]:
     """
     If a central is connected but not bonded, run Pair and Trust.
     Returns (updated device info dict or None, error message or None).
     """
+    if bus is None:
+        bus = get_system_bus()
     device = get_primary_connected_device(bus, adapter_path)
     if not device:
         return None, "No connected device"

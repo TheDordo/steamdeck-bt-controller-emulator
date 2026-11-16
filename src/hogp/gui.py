@@ -26,8 +26,10 @@ from hogp.bluez import (
     ensure_adapter_powered_and_discoverable,
     register_application_async,
     unregister_application_async,
+    unregister_application_sync,
     register_advertisement_async,
     unregister_advertisement_async,
+    unregister_advertisement_sync,
     set_static_ble_address,
     get_adapter_index,
     get_primary_connected_device,
@@ -679,6 +681,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._bond_attempted_for: Optional[str] = None
         self._last_bond_attempt_at = 0.0
         self._last_bond_error: Optional[str] = None
+        self._shutting_down = False
+        self._stop_in_progress = False
         
         # Build UI
         self._build_ui()
@@ -805,9 +809,12 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     
     def _on_stop_clicked(self, button):
         """Stop the controller service."""
+        if self._stop_in_progress:
+            return
+        self._stop_in_progress = True
         self.stop_button.set_sensitive(False)
         self.status_label.set_markup("<big><b>Status: Stopping...</b></big>")
-        GLib.idle_add(self._stop_service)
+        GLib.idle_add(self._stop_service_begin)
     
     def _prepare_bluetooth_adapter(self):
         """Configure adapter (blocking); D-Bus work continues on main thread."""
@@ -822,6 +829,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
     def _start_bluetooth_service(self):
         """Start the BLE HoG service on the GTK/GLib main thread."""
+        self._shutting_down = False
+        self._stop_in_progress = False
         try:
             # Get D-Bus connection
             self._bus = get_system_bus()
@@ -1127,6 +1136,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     
     def _maybe_complete_bond(self, device_info: dict) -> None:
         """Trigger BlueZ Pair + Trusted when a central connects."""
+        if self._shutting_down or self._stop_in_progress:
+            return
         path = device_info.get("path")
         if not path:
             return
@@ -1141,13 +1152,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         if path == self._bond_attempted_for and (now - self._last_bond_attempt_at) < 20.0:
             return
         
-        bus = self._bus
         adapter_path = self._adapter_path
         device_path = path
         
         def work():
+            if self._shutting_down:
+                GLib.idle_add(self._on_bond_complete, device_path, None, None)
+                return
             try:
-                updated, err = complete_bond_with_central(bus, adapter_path)
+                updated, err = complete_bond_with_central(None, adapter_path)
             except Exception as e:
                 logger.warning(f"Bond completion failed: {e}")
                 updated, err = None, str(e)
@@ -1172,49 +1185,69 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         """Update connection label."""
         self.connection_label.set_label(text)
     
-    def _stop_service(self):
-        """Stop the HoG service (Bluetooth or Wired)."""
+    def _stop_service_begin(self) -> bool:
+        """First stop phase on the GTK main thread (non-blocking)."""
+        self._shutting_down = True
         self._running = False
-        
+
         if self._update_timeout_id:
             GLib.source_remove(self._update_timeout_id)
             self._update_timeout_id = None
-        
-        if self._input_handler:
-            self._input_handler.stop()
-            self._input_handler = None
-        
-        # Stop Bluetooth mode
-        if self._registered and self._bus and self._adapter_path:
-            unregister_advertisement_async(self._bus, self._adapter_path, Advertisement.ADV_PATH)
-            unregister_application_async(self._bus, self._adapter_path, GattApplication.APP_PATH)
-            self._registered = False
-        
-        if self._advertisement:
-            self._advertisement.unregister()
-            self._advertisement = None
-        
+
         if self._gatt_app:
-            self._gatt_app.unregister()
-            self._gatt_app = None
+            self._gatt_app.stop_notify()
 
         if self._pairing_agent:
             self._pairing_agent.unregister()
             self._pairing_agent = None
-        
-        # Reset adapter to default state (restore normal Bluetooth operation)
-        if self._bus and self._adapter_path:
-            try:
-                reset_adapter_to_default_state(self._bus, self._adapter_path)
-                logger.info("Adapter restored to default state")
-            except Exception as e:
-                logger.warning(f"Could not reset adapter state: {e}")
-        
-        # Stop Wired mode
-        if self._usb_gadget:
-            self._usb_gadget.close()
-            self._usb_gadget = None
-        
+
+        threading.Thread(target=self._stop_service_worker, daemon=True).start()
+        return False
+
+    def _stop_service_worker(self) -> None:
+        """Blocking teardown off the UI thread."""
+        adapter_path = self._adapter_path
+        registered = self._registered
+
+        try:
+            if self._input_handler:
+                self._input_handler.stop()
+                self._input_handler = None
+
+            if registered and adapter_path:
+                bus = get_system_bus()
+                unregister_advertisement_sync(
+                    bus, adapter_path, Advertisement.ADV_PATH, timeout_ms=4000
+                )
+                unregister_application_sync(
+                    bus, adapter_path, GattApplication.APP_PATH, timeout_ms=4000
+                )
+                self._registered = False
+
+            if self._usb_gadget:
+                self._usb_gadget.close()
+                self._usb_gadget = None
+
+            if adapter_path:
+                try:
+                    reset_adapter_to_default_state(get_system_bus(), adapter_path)
+                except Exception as e:
+                    logger.warning(f"Could not reset adapter state: {e}")
+        except Exception as e:
+            logger.warning(f"Error during service shutdown: {e}")
+        finally:
+            GLib.idle_add(self._stop_service_finalize)
+
+    def _stop_service_finalize(self) -> bool:
+        """Return UI and D-Bus objects to idle state (main thread)."""
+        if self._advertisement:
+            self._advertisement.unregister()
+            self._advertisement = None
+
+        if self._gatt_app:
+            self._gatt_app.unregister()
+            self._gatt_app = None
+
         self.status_label.set_markup("<big><b>Status: Stopped</b></big>")
         self.connection_label.set_label("Not connected")
         self.device_info_label.set_label("")
@@ -1222,10 +1255,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._bond_attempted_for = None
         self._last_bond_attempt_at = 0.0
         self._last_bond_error = None
+        self._shutting_down = False
+        self._stop_in_progress = False
         self.start_button.set_sensitive(True)
         self.stop_button.set_sensitive(False)
         self.bluetooth_radio.set_sensitive(True)
         self.wired_radio.set_sensitive(True)
+        return False
     
     def _show_error(self, message):
         """Show error message."""

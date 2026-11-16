@@ -42,6 +42,16 @@ class PairingAgent:
             return False
 
     def unregister(self) -> None:
+        # Drop the agent object before UnregisterAgent — otherwise call_sync can
+        # deadlock waiting for Release while the GLib main loop is blocked.
+        reg_ids = list(self._registrations)
+        self._registrations.clear()
+        for reg_id in reg_ids:
+            try:
+                self.bus.unregister_object(reg_id)
+            except Exception as e:
+                logger.debug(f"Agent unregister object: {e}")
+
         if self._registered_with_manager:
             try:
                 self.bus.call_sync(
@@ -52,19 +62,12 @@ class PairingAgent:
                     GLib.Variant("(o)", (self.AGENT_PATH,)),
                     None,
                     Gio.DBusCallFlags.NONE,
-                    5000,
+                    3000,
                     None,
                 )
             except GLib.Error as e:
                 logger.debug(f"UnregisterAgent: {e}")
             self._registered_with_manager = False
-
-        for reg_id in self._registrations:
-            try:
-                self.bus.unregister_object(reg_id)
-            except Exception as e:
-                logger.debug(f"Agent unregister object: {e}")
-        self._registrations.clear()
 
     def _register_with_agent_manager(self) -> None:
         self.bus.call_sync(

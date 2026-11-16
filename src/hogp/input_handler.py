@@ -216,7 +216,7 @@ class InputHandler:
         self._running = False
         
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=1.0)
         
         if self._device:
             try:
