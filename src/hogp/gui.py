@@ -41,6 +41,7 @@ from hogp.bluez import (
     get_adapter_address,
     register_hid_sdp_profile,
     unregister_hid_sdp_profile,
+    get_last_sdp_error,
     acquire_app_bus_name,
 )
 from hogp.gatt_app import GattApplication
@@ -731,6 +732,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._pro_controller = None
         self._pro_sdp_registered = False
         self._start_watchdog_id = None
+        self._start_error_shown = False
         self._bond_in_progress = False
         self._bond_attempted_for: Optional[str] = None
         self._last_bond_attempt_at = 0.0
@@ -884,6 +886,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.wired_radio.set_sensitive(False)
         self.gamepad_radio.set_sensitive(False)
         self.keyboard_radio.set_sensitive(False)
+        self._start_error_shown = False
         self.status_label.set_markup("<big><b>Status: Starting...</b></big>")
         # Watchdog: surface diagnostics instead of hanging on "Starting..."
         self._start_watchdog_id = GLib.timeout_add(35000, self._on_start_watchdog)
@@ -908,6 +911,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self._start_watchdog_id = None
         if self._running or self._shutting_down:
             return False
+        if self._start_error_shown:
+            return False  # the real error is already on screen
         self.status_label.set_markup(
             "<big><b>Status: Starting timed out — run scripts/view-logs.sh</b></big>"
         )
@@ -972,8 +977,12 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
             self._pairing_agent = PairingAgent(self._bus, verbose=True)
             if not self._pairing_agent.register():
+                detail = getattr(self._pairing_agent, "last_error", "unknown error")
                 self._show_error(
-                    "Could not register Bluetooth pairing agent. Re-run install.sh and log out/in."
+                    "Could not register Bluetooth pairing agent: "
+                    f"{detail} — check 'groups' includes bluetooth, log out/in "
+                    "after install, and make sure no older app instance is "
+                    "running (pgrep -af 'hogp.gui')"
                 )
                 return False
             
@@ -1025,14 +1034,21 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
             self._pairing_agent = PairingAgent(self._bus, verbose=True)
             if not self._pairing_agent.register():
+                detail = getattr(self._pairing_agent, "last_error", "unknown error")
                 self._show_error(
-                    "Could not register Bluetooth pairing agent. Re-run install.sh and log out/in."
+                    "Could not register Bluetooth pairing agent: "
+                    f"{detail} — check 'groups' includes bluetooth, log out/in "
+                    "after install, and make sure no older app instance is "
+                    "running (pgrep -af 'hogp.gui')"
                 )
                 return False
 
             logger.info("Pro Controller start: registering HID SDP record")
             if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
-                self._show_error("Could not register HID SDP record (ProfileManager1)")
+                self._show_error(
+                    "Could not register HID SDP record: "
+                    f"{get_last_sdp_error() or 'unknown BlueZ error'}"
+                )
                 return False
             self._pro_sdp_registered = True
 
@@ -1583,6 +1599,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _show_error(self, message):
         """Show error message."""
         logger.error(message)
+        self._start_error_shown = True
         self.status_label.set_markup(f"<big><b>Error: {message}</b></big>")
         self.start_button.set_sensitive(True)
         self.bluetooth_radio.set_sensitive(True)

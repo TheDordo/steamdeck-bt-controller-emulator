@@ -30,6 +30,7 @@ class PairingAgent:
         self.verbose = verbose
         self._registrations: List[int] = []
         self._registered_with_manager = False
+        self.last_error: Optional[str] = None
 
     def register(self) -> bool:
         try:
@@ -37,6 +38,7 @@ class PairingAgent:
             self._register_with_agent_manager()
             return True
         except Exception as e:
+            self.last_error = str(e)
             logger.error(f"Failed to register pairing agent: {e}")
             self.unregister()
             return False
@@ -81,17 +83,26 @@ class PairingAgent:
             5000,
             None,
         )
-        self.bus.call_sync(
-            BLUEZ_SERVICE,
-            "/org/bluez",
-            AGENT_MANAGER_IFACE,
-            "RequestDefaultAgent",
-            GLib.Variant("(o)", (self.AGENT_PATH,)),
-            None,
-            Gio.DBusCallFlags.NONE,
-            5000,
-            None,
-        )
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                "/org/bluez",
+                AGENT_MANAGER_IFACE,
+                "RequestDefaultAgent",
+                GLib.Variant("(o)", (self.AGENT_PATH,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+        except GLib.Error as e:
+            if "AlreadyExists" in str(e):
+                # Another agent (an older app instance, or the desktop's
+                # Bluetooth applet) is already the default. Our agent stays
+                # registered as a fallback, so pairing can still proceed.
+                logger.warning(f"Another agent is default ({e}); continuing")
+            else:
+                raise
         self._registered_with_manager = True
         logger.info("Pairing agent registered as default (auto-accept)")
 

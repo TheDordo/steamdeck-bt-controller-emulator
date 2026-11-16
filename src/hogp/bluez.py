@@ -811,7 +811,7 @@ PRO_CONTROLLER_NAME = "Pro Controller"
 PRO_CONTROLLER_CLASS = 0x002508  # Peripheral / Gamepad
 HID_SERVICE_UUID_FULL = "00001124-0000-1000-8000-00805f9b34fb"
 HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon-profile"
-_HID_SDP_STATE = {"object_reg": None}  # Gio registration id while the profile is exported
+_HID_SDP_STATE = {"object_reg": None, "last_error": None}  # Gio registration id while the profile is exported
 
 
 def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
@@ -924,9 +924,11 @@ def register_hid_sdp_profile(
             10000,
             None,
         )
+        _HID_SDP_STATE["last_error"] = None
         logger.info("HID SDP record registered with BlueZ")
         return True
     except Exception as e:
+        _HID_SDP_STATE["last_error"] = str(e)
         logger.error(f"Could not register HID SDP record: {e}")
         reg = _HID_SDP_STATE.get("object_reg")
         if reg is not None:
@@ -968,3 +970,8 @@ def unregister_hid_sdp_profile(
             except Exception:
                 pass
         _HID_SDP_STATE["object_reg"] = None
+
+
+def get_last_sdp_error() -> Optional[str]:
+    """Last RegisterProfile failure detail (for UI display)."""
+    return _HID_SDP_STATE.get("last_error")

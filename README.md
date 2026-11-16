@@ -167,13 +167,19 @@ BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x1
 
 ### Stuck on “Starting...” (Bluetooth gamepad)
 
-The GUI switches to **Active** before scanning input devices, and a 35 s watchdog shows a hint if a start step stalls. To find the stalled step, launch from Konsole:
+Failures are now shown with the exact D-Bus error (the watchdog no longer overwrites them). The most common causes, in order:
+
+1. **Pairing agent error containing `AlreadyExists`** — another process already holds BlueZ's default agent (usually an older instance of the app). Close extra instances (`pgrep -af hogp.gui`) or log out/in, then start again.
+2. **Pairing agent error containing `AccessDenied`/`NotPermitted`** — the `bluetooth` group is not active in this session. Run `groups` in Konsole: if `bluetooth` is missing, log out and back in (or reboot) after install.sh — reinstalling alone will not fix this.
+3. **SDP record error** — BlueZ rejected the profile registration. Run `journalctl -u bluetooth -n 50` and share the output.
+
+To see the full start sequence in a terminal:
 
 ```bash
-cd ~/steamdeck-bt-controller-emulator && ./scripts/run-gui.sh
+cd ~/steamdeck-bt-controller-emulator && python3 -m src.hogp --mode pro
 ```
 
-Watch for **Pro Controller start:** lines — they log each stage (bus/adapter, pairing agent, SDP record, L2CAP sockets). If it stops at the SDP step, BlueZ rejected the profile registration; run `journalctl -u bluetooth -n 50` and share the output.
+`Pro Controller start:` lines log each stage (bus/adapter, pairing agent, SDP record, L2CAP sockets).
 
 ### Status stuck on “Starting...” (Bluetooth)
 
