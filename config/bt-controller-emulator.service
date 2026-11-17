@@ -1,0 +1,26 @@
+# Steam Deck BT Controller Emulator daemon (systemd unit template).
+#
+# install.sh replaces {{INSTALL_DIR}} with the real repository path and
+# installs this file to /etc/systemd/system/bt-controller-emulator.service.
+#
+# The daemon runs as root so Bluetooth needs no runtime sudo: it drives
+# btmgmt, binds the HID L2CAP PSMs, reads evdev and writes /dev/hidg*
+# directly. The GUI and CLI are unprivileged D-Bus clients.
+
+[Unit]
+Description=Steam Deck BT Controller Emulator daemon
+Documentation=https://github.com/TheDordo/steamdeck-bt-controller-emulator
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+WorkingDirectory={{INSTALL_DIR}}/src
+ExecStart=/usr/bin/python3 -m hogp.service
+Restart=on-failure
+RestartSec=2
+# Stop tears the session down (adapter restore included); give it time.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

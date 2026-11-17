@@ -1,14 +1,24 @@
 """
-BlueZ D-Bus helpers for GATT and advertising operations.
+BlueZ D-Bus + btmgmt helpers for the privileged emulator daemon.
 
-Provides async-friendly wrappers around BlueZ's D-Bus APIs to avoid
-deadlocks with GDBus on older glib versions.
+The daemon runs as root (systemd service), so:
+
+    * btmgmt is invoked directly (no sudo, no sudoers rules),
+    * well-known L2CAP PSMs are bound in-process (see pro_controller.py),
+    * GATT/advertisement registration stays ASYNC: BlueZ calls back into
+      our exported ObjectManager/Properties objects while RegisterApplication
+      is in flight, so a blocking call_sync on the GLib main thread deadlocks.
+
+All GATT/advertisement registration helpers therefore take callbacks.
+Adapter property reads/writes and btmgmt are safe to call synchronously.
 """
 
 import logging
 import re
 import subprocess
+import time
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Any, List, Dict
 
 from gi.repository import Gio, GLib
@@ -22,6 +32,11 @@ GATT_MANAGER_IFACE = "org.bluez.GattManager1"
 LE_ADV_MANAGER_IFACE = "org.bluez.LEAdvertisingManager1"
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROPS_IFACE = "org.freedesktop.DBus.Properties"
+DEVICE_IFACE = "org.bluez.Device1"
+
+# Default BLE identity for the HoG mode (static random address keeps the
+# paired central from seeing a "new" device on every start).
+DEFAULT_STATIC_BLE_ADDRESS = "C2:12:34:56:78:9A"
 
 
 def get_system_bus() -> Gio.DBusConnection:
@@ -29,10 +44,34 @@ def get_system_bus() -> Gio.DBusConnection:
     return Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
 
 
+# ---------------------------------------------------------------------------
+# Bus / adapter discovery
+# ---------------------------------------------------------------------------
+
+def bluez_has_owner(bus: Gio.DBusConnection) -> bool:
+    """True while bluetoothd owns org.bluez on the system bus."""
+    try:
+        result = bus.call_sync(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            GLib.Variant("(s)", (BLUEZ_SERVICE,)),
+            GLib.VariantType("(b)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return result.get_child_value(0).get_boolean()
+    except GLib.Error as e:
+        logger.debug(f"NameHasOwner({BLUEZ_SERVICE}): {e}")
+        return False
+
+
 def find_adapter_path(bus: Gio.DBusConnection, adapter_name: str = "hci0") -> Optional[str]:
     """
     Find the BlueZ adapter object path for the given adapter name.
-    
+
     Returns the path like /org/bluez/hci0 or None if not found.
     """
     try:
@@ -108,6 +147,44 @@ def set_adapter_alias(bus: Gio.DBusConnection, adapter_path: str, alias: str) ->
     return set_adapter_property(bus, adapter_path, "Alias", GLib.Variant("s", alias))
 
 
+def ensure_adapter_powered(bus: Gio.DBusConnection, adapter_path: str) -> bool:
+    """Power the adapter on and allow pairing."""
+    if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
+        return False
+    set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True))
+    return True
+
+
+def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
+    """Read the adapter's BR/EDR public address (used in device-info replies)."""
+    try:
+        result = bus.call_sync(
+            BLUEZ_SERVICE,
+            adapter_path,
+            DBUS_PROPS_IFACE,
+            "Get",
+            GLib.Variant("(ss)", (ADAPTER_IFACE, "Address")),
+            GLib.VariantType("(v)"),
+            Gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+        return result.get_child_value(0).get_variant().get_string()
+    except GLib.Error as e:
+        logger.warning(f"Could not read adapter address: {e}")
+        return None
+
+
+def get_adapter_index(adapter_name: str = "hci0") -> int:
+    """Extract adapter index from adapter name (e.g., 'hci0' -> 0)."""
+    if adapter_name.startswith("hci"):
+        try:
+            return int(adapter_name[3:])
+        except ValueError:
+            pass
+    return 0
+
+
 def get_le_advertising_active_instances(bus: Gio.DBusConnection, adapter_path: str) -> int:
     """Get the number of active advertising instances."""
     try:
@@ -128,6 +205,11 @@ def get_le_advertising_active_instances(bus: Gio.DBusConnection, adapter_path: s
         return -1
 
 
+# ---------------------------------------------------------------------------
+# GATT application / advertisement registration (async — BlueZ calls back
+# into our exported objects during registration, so call_sync deadlocks)
+# ---------------------------------------------------------------------------
+
 def register_application_async(
     bus: Gio.DBusConnection,
     adapter_path: str,
@@ -136,7 +218,7 @@ def register_application_async(
 ) -> None:
     """
     Register a GATT application with BlueZ asynchronously.
-    
+
     The callback receives (success: bool, error_message: Optional[str]).
     """
     def on_done(connection, result, user_data):
@@ -237,7 +319,8 @@ def unregister_application_sync(
     app_path: str,
     timeout_ms: int = 5000,
 ) -> bool:
-    """Unregister GATT application (blocking, for shutdown)."""
+    """Unregister GATT application (blocking, for teardown). BlueZ does not
+    call back into our objects for unregister, so blocking is safe."""
     try:
         bus.call_sync(
             BLUEZ_SERVICE,
@@ -263,7 +346,7 @@ def unregister_advertisement_sync(
     adv_path: str,
     timeout_ms: int = 5000,
 ) -> bool:
-    """Unregister LE advertisement (blocking, for shutdown)."""
+    """Unregister LE advertisement (blocking, for teardown)."""
     try:
         bus.call_sync(
             BLUEZ_SERVICE,
@@ -318,155 +401,256 @@ def unregister_advertisement_async(
     )
 
 
-def ensure_adapter_powered_and_discoverable(bus: Gio.DBusConnection, adapter_path: str) -> bool:
-    """Power on adapter and allow pairing; LE discoverability comes from our advertisement."""
-    if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
-        return False
-    set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True))
-    # NOTE: BlueZ Adapter1 has no "Bondable" property (that is a btmgmt-only
-    # setting); setting it logs "No such property 'Bondable'" and must be
-    # avoided.
-    # BR/EDR discoverable off — LE advertisement sets Discoverable for centrals.
-    set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", False))
-    return True
+# ---------------------------------------------------------------------------
+# btmgmt (direct — the daemon is root; no sudo, no sudoers)
+# ---------------------------------------------------------------------------
+
+def _run_btmgmt(adapter_index: int, *args: str, timeout: float = 8.0) -> "subprocess.CompletedProcess":
+    """Run a btmgmt subcommand directly (root daemon)."""
+    cmd = ["btmgmt", "--index", str(adapter_index), *args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def acquire_app_bus_name(bus: Gio.DBusConnection, name: str = "com.steamdeck.hogp") -> bool:
-    """Request a well-known D-Bus name (required by some BlueZ versions)."""
+def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 8.0) -> bool:
+    """Run btmgmt, returning True on success (logs failures)."""
     try:
-        flags = 0x1 | 0x4  # ALLOW_REPLACEMENT | DO_NOT_QUEUE
-        result = bus.call_sync(
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "RequestName",
-            GLib.Variant("(su)", (name, flags)),
-            GLib.VariantType("(u)"),
-            Gio.DBusCallFlags.NONE,
-            5000,
-            None,
-        )
-        reply_code = result.get_child_value(0).get_uint32()
-        if reply_code in (1, 2):
-            logger.info(f"D-Bus name acquired: {name}")
-            return True
-        if reply_code == 3:
-            logger.warning(f"D-Bus name {name} queued (unexpected)")
-            return True
-        logger.warning(f"RequestName for {name} returned code {reply_code}")
+        result = _run_btmgmt(adapter_index, *args, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.warning(f"btmgmt {' '.join(args)}: {e}")
         return False
-    except GLib.Error as e:
-        logger.warning(f"Could not acquire D-Bus name {name}: {e}")
-        return False
+    if result.returncode == 0:
+        logger.info(f"btmgmt {' '.join(args)} ok")
+        return True
+    logger.warning(
+        f"btmgmt {' '.join(args)} failed: {result.stderr or result.stdout or result.returncode}"
+    )
+    return False
 
 
-def get_adapter_index(adapter_name: str = "hci0") -> int:
-    """Extract adapter index from adapter name (e.g., 'hci0' -> 0)."""
-    if adapter_name.startswith("hci"):
-        try:
-            return int(adapter_name[3:])
-        except ValueError:
-            pass
-    return 0
+@dataclass
+class AdapterSettings:
+    """Adapter settings we touch, snapshotted before a session and restored
+    when it stops so normal Deck Bluetooth (audio etc.) works again."""
+    name: Optional[str] = None
+    alias: Optional[str] = None
+    class_of_device: Optional[str] = None
+    powered: bool = True
+    connectable: bool = True
+    pairable: bool = True
+    discoverable: bool = False
+    ssp: bool = True
+    secure_conn: bool = True
+    bredr: bool = True
+    le: bool = True
+    # any settings tokens we did not recognise (kept to log on restore)
+    unknown: List[str] = field(default_factory=list)
 
+
+_SETTINGS_TOKEN_RE = re.compile(r"^\s*current settings:\s*(.*)$", re.IGNORECASE)
+_NAME_RE = re.compile(r"^\s*name\s*(.*)$")
+_CLASS_RE = re.compile(r"class\s+(0x[0-9a-fA-F]+)")
+_TOKEN_RE = re.compile(r"[^\s]+")
+
+
+def snapshot_adapter_settings(bus: Gio.DBusConnection, adapter_path: str, adapter_index: int) -> AdapterSettings:
+    """
+    Capture the current adapter posture (name/alias/class/settings) so it can
+    be restored when the emulator session stops. Never raises; falls back to
+    defaults so a session start cannot be blocked by a parse failure.
+    """
+    state = AdapterSettings()
+    try:
+        info = _run_btmgmt(adapter_index, "info", timeout=6.0).stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        info = ""
+
+    m = _NAME_RE.search(info)
+    if m:
+        name = m.group(1).strip()
+        state.name = name if name else None
+    m = _CLASS_RE.search(info)
+    if m:
+        state.class_of_device = m.group(1)
+    m = _SETTINGS_TOKEN_RE.search(info)
+    if m:
+        tokens = {t.lower() for t in _TOKEN_RE.findall(m.group(1))}
+        state.powered = "powered" in tokens
+        state.connectable = "connectable" in tokens
+        state.pairable = "pairable" in tokens
+        state.discoverable = "discoverable" in tokens
+        state.ssp = "ssp" in tokens
+        state.secure_conn = "secure-conn" in tokens
+        state.bredr = "br/edr" in tokens
+        state.le = "le" in tokens
+        known = {
+            "powered", "connectable", "pairable", "fast-connectable",
+            "discoverable", "bondable", "link-security", "ssp", "br/edr",
+            "le", "advertising", "secure-conn", "debug-keys", "privacy",
+            "configuration", "static-addr", "phy-configuration",
+            "wide-band-speech", "cis-central", "cis-peripheral",
+            "iso-broadcaster", "iso-sync-receiver",
+        }
+        state.unknown = sorted(tokens - known)
+
+    alias = get_adapter_property(bus, adapter_path, "Alias")
+    if alias is not None:
+        state.alias = alias.get_string()
+
+    logger.info(
+        "Adapter snapshot: name=%r class=%s bredr=%s le=%s ssp=%s sc=%s "
+        "connectable=%s pairable=%s discoverable=%s",
+        state.name, state.class_of_device, state.bredr, state.le, state.ssp,
+        state.secure_conn, state.connectable, state.pairable, state.discoverable,
+    )
+    return state
+
+
+def restore_adapter_settings(
+    bus: Gio.DBusConnection,
+    adapter_path: str,
+    adapter_index: int,
+    state: AdapterSettings,
+) -> None:
+    """
+    Restore the adapter to its pre-session posture. Best effort: every step is
+    independent so one failure cannot leave the adapter half-restored.
+    """
+    logger.info("Restoring adapter settings…")
+    btmgmt_ok(adapter_index, "power", "off")
+
+    if state.name is not None:
+        btmgmt_ok(adapter_index, "name", state.name)
+    if state.class_of_device is not None:
+        btmgmt_ok(adapter_index, "class", state.class_of_device)
+    btmgmt_ok(adapter_index, "bredr", "on" if state.bredr else "off")
+    btmgmt_ok(adapter_index, "le", "on" if state.le else "off")
+    btmgmt_ok(adapter_index, "ssp", "on" if state.ssp else "off")
+    btmgmt_ok(adapter_index, "sc", "on" if state.secure_conn else "off")
+    btmgmt_ok(adapter_index, "connectable", "on" if state.connectable else "off")
+    btmgmt_ok(adapter_index, "pairable", "on" if state.pairable else "off")
+
+    btmgmt_ok(adapter_index, "power", "on")
+
+    set_adapter_property(
+        bus, adapter_path, "Discoverable",
+        GLib.Variant("b", state.discoverable),
+    )
+    if state.alias is not None:
+        set_adapter_property(bus, adapter_path, "Alias", GLib.Variant("s", state.alias))
+    else:
+        set_adapter_property(bus, adapter_path, "Alias", GLib.Variant("s", "Steam Deck"))
+
+    if state.unknown:
+        logger.info("Not restoring unrecognised settings: %s", ", ".join(state.unknown))
+    logger.info("Adapter restored")
+
+
+# ---------------------------------------------------------------------------
+# Per-mode adapter posture
+# ---------------------------------------------------------------------------
+
+def configure_adapter_for_hog_peripheral(adapter_index: int = 0) -> bool:
+    """
+    LE-only peripheral posture while HoG runs.
+
+    Stops macOS from treating the Deck as a BR/EDR laptop and opening the
+    Bluetooth audio sink (A2DP) on the same bond.
+    """
+    logger.info("Configuring adapter for LE HID peripheral mode...")
+    ok = True
+    btmgmt_ok(adapter_index, "power", "off")
+    if not btmgmt_ok(adapter_index, "bredr", "off"):
+        ok = False
+    btmgmt_ok(adapter_index, "le", "on")
+    btmgmt_ok(adapter_index, "class", "0x002508")   # Peripheral / Gamepad
+    btmgmt_ok(adapter_index, "connectable", "on")
+    btmgmt_ok(adapter_index, "pairable", "on")
+    btmgmt_ok(adapter_index, "power", "on")
+    return ok
+
+
+def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
+    """
+    Classic BR/EDR posture for the Pro Controller gamepad mode.
+
+    macOS pairs real Pro Controllers as BR/EDR HID peripherals, so unlike the
+    LE HoG mode we keep BR/EDR enabled and advertise a gamepad Class of
+    Device under the name "Pro Controller".
+    """
+    logger.info("Configuring adapter for Pro Controller (BR/EDR HID) mode...")
+    ok = True
+    btmgmt_ok(adapter_index, "power", "off")
+    btmgmt_ok(adapter_index, "bredr", "on")
+    btmgmt_ok(adapter_index, "le", "on")
+    btmgmt_ok(adapter_index, "name", "Pro Controller")
+    if not btmgmt_ok(adapter_index, "class", "0x002508"):
+        ok = False
+    btmgmt_ok(adapter_index, "ssp", "on")
+    btmgmt_ok(adapter_index, "sc", "on")
+    btmgmt_ok(adapter_index, "connectable", "on")
+    btmgmt_ok(adapter_index, "pairable", "on")
+    btmgmt_ok(adapter_index, "power", "on")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Static BLE address (identity stability across starts)
+# ---------------------------------------------------------------------------
 
 def check_static_address_set(adapter_index: int = 0) -> bool:
-    """
-    Check if a static BLE address is already configured.
-    Returns True if a static address is set, False otherwise.
-    """
+    """True when the adapter currently has a static (random) address set."""
     try:
-        result = subprocess.run(
-            ["btmgmt", "--index", str(adapter_index), "info"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            # Look for "static-addr" in the output
-            return "static-addr" in result.stdout.lower()
+        info = _run_btmgmt(adapter_index, "info", timeout=6.0).stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        logger.debug(f"Could not check static address status: {e}")
-        return False
+    return "static-addr" in info.lower()
 
 
 def set_static_ble_address(
     adapter_index: int = 0,
-    address: str = "C2:12:34:56:78:9A",
+    address: str = DEFAULT_STATIC_BLE_ADDRESS,
 ) -> bool:
     """
     Set a static BLE address for the adapter to prevent identity rotation.
-    
-    This prevents the device from appearing as a new controller on each connection.
-    Uses sudo for btmgmt commands (passwordless via sudoers configuration).
-    
-    Args:
-        adapter_index: BlueZ adapter index (0 for hci0, 1 for hci1, etc.)
-        address: Static random address (must have bit 1 set in first octet for locally administered)
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        # Check if already set
-        if check_static_address_set(adapter_index):
-            logger.info(f"Static BLE address already configured for adapter {adapter_index}")
-            return True
-        
-        logger.info(f"Configuring static BLE address {address} for adapter {adapter_index}")
-        
-        # Power off adapter (use sudo)
-        subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "power", "off"],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
-        
-        # Wait for power off to complete
-        import time
-        time.sleep(1)
-        
-        # Set static address (use sudo)
-        result = subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "static-addr", address],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        )
-        
-        # Wait for address to be set
-        time.sleep(1)
-        
-        # Power back on (use sudo)
-        subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "power", "on"],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
-        
-        if "successfully set" in result.stdout.lower() or result.returncode == 0:
-            logger.info(f"Successfully set static BLE address: {address}")
-            return True
-        else:
-            logger.warning(f"Static address command completed but may not have succeeded: {result.stdout}")
-            return False
-            
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Failed to set static BLE address (requires sudo): {e}")
-        return False
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        logger.warning(f"Could not set static BLE address: {e}")
-        return False
 
+    This prevents the device from appearing as a new controller on each
+    connection. The daemon runs as root, so btmgmt works directly.
+    """
+    if check_static_address_set(adapter_index):
+        logger.info(f"Static BLE address already configured for adapter {adapter_index}")
+        return True
+
+    logger.info(f"Configuring static BLE address {address} for adapter {adapter_index}")
+    btmgmt_ok(adapter_index, "power", "off")
+    time.sleep(0.5)
+    ok = btmgmt_ok(adapter_index, "static-addr", address)
+    time.sleep(0.5)
+    btmgmt_ok(adapter_index, "power", "on")
+    if ok:
+        logger.info(f"Successfully set static BLE address: {address}")
+    return ok
+
+
+def clear_static_ble_address(adapter_index: int = 0) -> bool:
+    """Clear the static BLE address (restores normal address rotation)."""
+    if not check_static_address_set(adapter_index):
+        return True
+    btmgmt_ok(adapter_index, "power", "off")
+    time.sleep(0.5)
+    ok = btmgmt_ok(adapter_index, "static-addr", "00:00:00:00:00:00")
+    time.sleep(0.5)
+    btmgmt_ok(adapter_index, "power", "on")
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Connected device helpers (pairing/bonding status for the UI)
+# ---------------------------------------------------------------------------
 
 def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Dict]:
     """
     Get list of devices currently connected to the adapter.
-    
+
     Returns:
         List of dicts with 'path', 'name', 'address', 'connected' keys
     """
@@ -487,22 +671,22 @@ def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Di
         for i in range(objects.n_children()):
             entry = objects.get_child_value(i)
             path = entry.get_child_value(0).get_string()
-            
+
             # Only consider devices under our adapter
             if not path.startswith(adapter_path):
                 continue
-            
+
             ifaces = entry.get_child_value(1)
             device_props = None
-            
+
             for j in range(ifaces.n_children()):
                 iface_entry = ifaces.get_child_value(j)
                 iface_name = iface_entry.get_child_value(0).get_string()
-                
-                if iface_name == "org.bluez.Device1":
+
+                if iface_name == DEVICE_IFACE:
                     device_props = iface_entry.get_child_value(1)
                     break
-            
+
             if device_props:
                 props_dict = {}
                 for k in range(device_props.n_children()):
@@ -510,9 +694,9 @@ def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Di
                     prop_name = prop_entry.get_child_value(0).get_string()
                     prop_value = prop_entry.get_child_value(1).get_variant()
                     props_dict[prop_name] = prop_value
-                
+
                 connected = props_dict.get("Connected", GLib.Variant("b", False)).get_boolean()
-                
+
                 if connected:
                     devices.append({
                         "path": path,
@@ -525,11 +709,8 @@ def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Di
                     })
     except GLib.Error as e:
         logger.error(f"Error getting connected devices: {e}")
-    
+
     return devices
-
-
-DEVICE_IFACE = "org.bluez.Device1"
 
 
 def get_device_property(bus: Gio.DBusConnection, device_path: str, prop_name: str) -> Any:
@@ -577,7 +758,7 @@ def pair_device_sync(
     bus: Gio.DBusConnection,
     device_path: str,
     timeout_ms: int = 25000,
-) -> tuple[bool, Optional[str]]:
+) -> tuple:
     """Complete SMP pairing with connected central (e.g. Mac)."""
     try:
         bus.call_sync(
@@ -604,7 +785,7 @@ def pair_device_sync(
 def complete_bond_with_central(
     bus: Optional[Gio.DBusConnection],
     adapter_path: str,
-) -> tuple[Optional[Dict], Optional[str]]:
+) -> tuple:
     """
     If a central is connected but not bonded, run Pair and Trust.
     Returns (updated device info dict or None, error message or None).
@@ -634,7 +815,7 @@ def complete_bond_with_central(
 def get_primary_connected_device(bus: Gio.DBusConnection, adapter_path: str) -> Optional[Dict]:
     """
     Get the primary (first) connected device info.
-    
+
     Returns:
         Dict with 'name', 'address' keys or None if no device connected
     """
@@ -642,173 +823,8 @@ def get_primary_connected_device(bus: Gio.DBusConnection, adapter_path: str) -> 
     return devices[0] if devices else None
 
 
-def _run_btmgmt(adapter_index: int, *args: str, ignore_errors: bool = True) -> bool:
-    """Run btmgmt subcommand (passwordless sudo for bluetooth group)."""
-    try:
-        result = subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), *args],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-        if result.returncode != 0 and not ignore_errors:
-            logger.warning(
-                f"btmgmt {' '.join(args)} failed: {result.stderr or result.stdout}"
-            )
-            return False
-        if result.returncode == 0:
-            logger.info(f"btmgmt {' '.join(args)} ok")
-        else:
-            logger.debug(
-                f"btmgmt {' '.join(args)}: {result.stderr or result.stdout or result.returncode}"
-            )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        logger.warning(f"btmgmt {' '.join(args)}: {e}")
-        return False
-
-
-def configure_adapter_for_hog_peripheral(adapter_index: int = 0) -> bool:
-    """
-    LE-only peripheral posture while HoG runs.
-
-    Stops macOS from treating the Deck as a BR/EDR laptop and opening the
-    Bluetooth audio sink (A2DP) on the same bond.
-    """
-    logger.info("Configuring adapter for LE HID peripheral mode...")
-    ok = True
-    # Some controllers require power off before bredr off.
-    _run_btmgmt(adapter_index, "power", "off")
-    if not _run_btmgmt(adapter_index, "bredr", "off"):
-        ok = False
-    _run_btmgmt(adapter_index, "le", "on")
-    # CoD: Peripheral / Gamepad (0x002508)
-    _run_btmgmt(adapter_index, "class", "0x002508")
-    _run_btmgmt(adapter_index, "connectable", "on")
-    _run_btmgmt(adapter_index, "pairable", "on")
-    _run_btmgmt(adapter_index, "power", "on")
-    return ok
-
-
-def restore_adapter_bluetooth_transport(adapter_index: int = 0) -> None:
-    """Re-enable BR/EDR when HoG stops so normal Deck Bluetooth works again."""
-    logger.info("Restoring dual BR/EDR + LE adapter mode...")
-    _run_btmgmt(adapter_index, "power", "off")
-    _run_btmgmt(adapter_index, "bredr", "on")
-    _run_btmgmt(adapter_index, "le", "on")
-    _run_btmgmt(adapter_index, "power", "on")
-
-
-def reset_adapter_to_default_state(bus: Gio.DBusConnection, adapter_path: str) -> bool:
-    """
-    Reset adapter properties to default state for normal Bluetooth operation.
-    
-    This should be called when the HoG service stops to restore the adapter
-    to its normal state, preventing interference with other Bluetooth devices
-    (especially audio devices like AirPods that need specific profiles).
-    
-    Sets:
-    - Discoverable: False (normal default)
-    - Pairable: True (allow new pairings)
-    - Powered: True (keep powered on)
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    logger.info("Resetting adapter to default state...")
-    success = True
-    
-    # Set Discoverable to False (normal state)
-    if not set_adapter_property(bus, adapter_path, "Discoverable", GLib.Variant("b", False)):
-        logger.warning("Could not reset Discoverable property")
-        success = False
-    else:
-        logger.info("✓ Discoverable set to False")
-    
-    # Set Pairable to True (allow new pairings)
-    if not set_adapter_property(bus, adapter_path, "Pairable", GLib.Variant("b", True)):
-        logger.warning("Could not reset Pairable property")
-        success = False
-    else:
-        logger.info("✓ Pairable set to True")
-    
-    # Ensure adapter stays powered
-    if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
-        logger.warning("Could not ensure adapter powered")
-        success = False
-    
-    adapter_name = adapter_path.rsplit("/", 1)[-1] if adapter_path else "hci0"
-    restore_adapter_bluetooth_transport(get_adapter_index(adapter_name))
-
-    if success:
-        logger.info("Adapter reset to default state successfully")
-
-    return success
-
-
-def clear_static_ble_address(adapter_index: int = 0) -> bool:
-    """
-    Clear/reset the static BLE address to allow normal address rotation.
-    
-    This restores normal Bluetooth behavior and should be called during
-    uninstallation or when the service is no longer needed.
-    
-    Args:
-        adapter_index: BlueZ adapter index (0 for hci0, 1 for hci1, etc.)
-    
-    Returns:
-        True if successful or already cleared, False on error
-    """
-    try:
-        # Check if a static address is set
-        if not check_static_address_set(adapter_index):
-            logger.info(f"No static BLE address set for adapter {adapter_index}")
-            return True
-        
-        logger.info(f"Clearing static BLE address for adapter {adapter_index}...")
-        
-        # Power off adapter
-        subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "power", "off"],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
-        
-        # Clear static address by setting it to 00:00:00:00:00:00
-        result = subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "static-addr", "00:00:00:00:00:00"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        
-        # Power back on
-        subprocess.run(
-            ["sudo", "btmgmt", "--index", str(adapter_index), "power", "on"],
-            capture_output=True,
-            timeout=5,
-            check=True,
-        )
-        
-        # Verify it was cleared
-        if not check_static_address_set(adapter_index):
-            logger.info(f"✓ Static BLE address cleared successfully")
-            return True
-        else:
-            logger.warning("Static address may not have been fully cleared")
-            return False
-            
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Failed to clear static BLE address (requires sudo): {e}")
-        return False
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        logger.warning(f"Could not clear static BLE address: {e}")
-        return False
-
-
 # ---------------------------------------------------------------------------
-# Pro Controller (BR/EDR HID) gamepad mode helpers
+# Pro Controller (BR/EDR HID) SDP record helpers
 # ---------------------------------------------------------------------------
 
 PRO_CONTROLLER_NAME = "Pro Controller"
@@ -823,50 +839,6 @@ def _is_valid_object_path(path) -> bool:
     """D-Bus object path validation, used defensively before building
     GVariant('o') values (PyGObject aborts leaf constructors on bad paths)."""
     return isinstance(path, str) and bool(_OBJECT_PATH_RE.match(path))
-
-
-def get_adapter_address(bus: Gio.DBusConnection, adapter_path: str) -> Optional[str]:
-    """Read the adapter's BR/EDR public address (used in device-info replies)."""
-    try:
-        result = bus.call_sync(
-            BLUEZ_SERVICE,
-            adapter_path,
-            DBUS_PROPS_IFACE,
-            "Get",
-            GLib.Variant("(ss)", (ADAPTER_IFACE, "Address")),
-            GLib.VariantType("(v)"),
-            Gio.DBusCallFlags.NONE,
-            5000,
-            None,
-        )
-        return result.get_child_value(0).get_variant().get_string()
-    except GLib.Error as e:
-        logger.warning(f"Could not read adapter address: {e}")
-        return None
-
-
-def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
-    """
-    Classic BR/EDR posture for the Pro Controller gamepad mode.
-
-    macOS pairs real Pro Controllers as BR/EDR HID peripherals, so unlike the
-    LE HoG mode we keep BR/EDR enabled and advertise a gamepad Class of
-    Device under the name "Pro Controller".
-    """
-    logger.info("Configuring adapter for Pro Controller (BR/EDR HID) mode...")
-    ok = True
-    _run_btmgmt(adapter_index, "power", "off")
-    _run_btmgmt(adapter_index, "bredr", "on")
-    _run_btmgmt(adapter_index, "le", "on")
-    _run_btmgmt(adapter_index, "name", PRO_CONTROLLER_NAME)
-    if not _run_btmgmt(adapter_index, "class", hex(PRO_CONTROLLER_CLASS)):
-        ok = False
-    _run_btmgmt(adapter_index, "ssp", "on")
-    _run_btmgmt(adapter_index, "sc", "on")
-    _run_btmgmt(adapter_index, "connectable", "on")
-    _run_btmgmt(adapter_index, "pairable", "on")
-    _run_btmgmt(adapter_index, "power", "on")
-    return ok
 
 
 def register_hid_sdp_profile(
@@ -897,10 +869,6 @@ def register_hid_sdp_profile(
         # Build the (osa{sv}) parameters with explicit leaf constructors.
         # PyGObject's tuple-form GLib.Variant() marshalling can fail on 'o'
         # members with an opaque "constructor returned NULL", so avoid it.
-        # The UUID is random so it never collides with BlueZ's built-in HID
-        # host profile (0x1124), which would reject the registration with
-        # "UUID already registered"; the advertised service class comes from
-        # the ServiceRecord XML, exactly like joycontrol does.
         params = GLib.Variant.new_tuple(
             GLib.Variant.new_object_path(profile_path),
             GLib.Variant.new_string(str(uuid.uuid4())),

@@ -209,6 +209,22 @@ class USBGadgetHID:
         """Check if USB gadget is active (GATT-compatible property)."""
         return self._active
 
+    @property
+    def buttons(self) -> int:
+        return self._buttons
+
+    @property
+    def axes(self) -> list:
+        return list(self._axes)
+
+    @property
+    def triggers(self) -> list:
+        return list(self._triggers)
+
+    @property
+    def hat(self) -> int:
+        return self._hat
+
     # === Gamepad Methods ===
 
     def set_button(self, button_idx: int, pressed: bool) -> None:

@@ -1457,3 +1457,19 @@ class GattApplication:
     @property
     def notifying(self) -> bool:
         return self._report_notifying
+
+    @property
+    def buttons(self) -> int:
+        return self._buttons
+
+    @property
+    def axes(self) -> list:
+        return list(self._axes)
+
+    @property
+    def triggers(self) -> list:
+        return list(self._triggers)
+
+    @property
+    def hat(self) -> int:
+        return self._hat

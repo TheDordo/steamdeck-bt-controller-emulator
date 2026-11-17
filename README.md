@@ -1,20 +1,44 @@
-# Steamin Ma HoG
+# Steam Deck BT Controller Emulator
 
-Emulates a Bluetooth or **Wired USB** gamepad / keyboard / trackpad peripheral that forwards controller input from a Steam Deck to other devices.
+Emulates a Bluetooth or **wired USB** gamepad / keyboard / trackpad peripheral that forwards controller input from a Steam Deck to other devices — built for the official **SteamOS 3.x ("holo") image** on a real Steam Deck.
 
-**Gamepad mode is macOS-native:** the Deck can now present itself as two of the controllers Apple's GameController framework natively supports, so games on a Mac (macOS 13+ through macOS 27 Golden Gate) see a real game controller instead of ignoring a generic HID pad:
+**Gamepad mode is macOS-native:** the Deck presents itself as one of the controllers Apple's GameController framework natively supports, so games on a Mac (macOS 13+ through macOS 27 Golden Gate) see a real game controller instead of ignoring a generic HID pad:
 
 | Transport | Gamepad identity on the Mac | Keyboard/mouse |
 |-----------|-----------------------------|----------------|
 | Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") | not in this mode |
+| Bluetooth (LE) | — | HID-over-GATT gamepad/keyboard/mouse ("SteamDeckPad") |
 | Wired USB | **DUALSHOCK 4** (VID 0x054C / PID 0x05C4) | separate HID interfaces, always present |
 
 ![controller view](assets/controller-tab.png) ![keyboard view](assets/keyboard-tab.png) ![media view](assets/media-tab.png) ![trackpad view](assets/trackpad-tab.png)
 
-HID-over-GATT via BlueZ D-Bus, classic Bluetooth HID (HIDP/L2CAP) for the Pro Controller gamepad, plus USB gadget (configfs) for wired connections. Built for **SteamOS 3.x** on Steam Deck; other Linux distros may work if dependencies are installed.
+## How it works — Bluetooth just works
 
-> **Maintained fork (SteamOS 3.7+ fixes):** [TheDordo/steamdeck-bt-controller-emulator](https://github.com/TheDordo/steamdeck-bt-controller-emulator) — includes BlueZ 5.76+ registration fixes, Steam Deck evdev detection, USB setup improvements, macOS-native gamepad identities (Pro Controller over Bluetooth, DualShock 4 over USB), and [`scripts/diagnose.sh`](scripts/diagnose.sh).
-> Upstream: [xXJSONDeruloXx/steamdeck-bt-controller-emulator](https://github.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator).
+The old architecture ran everything from the GUI and needed runtime `sudo` (btmgmt), sudoers rules, group memberships, a setcap'd Python copy and a separate root bridge process for the HID L2CAP ports. Every one of those was a "Start Service failed" waiting to happen.
+
+This fork rewrites the repo around a **single root systemd daemon**:
+
+```
+┌───────────────────────────── Steam Deck (SteamOS holo) ─────────────────────────────┐
+│                                                                                     │
+│   bt-controller-emulator.service (root)                    GUI (GTK4, unprivileged) │
+│   ├─ BlueZ: GATT app + advertisement + agent + SDP        └─ talks D-Bus only ──┐   │
+│   ├─ btmgmt adapter config (no sudo)                                             │   │
+│   ├─ HID L2CAP PSMs 0x11/0x13 bound in-process (no bridge)                       │   │
+│   ├─ evdev input (no group memberships)                com.steamdeck.btemu ◄────┘   │
+│   └─ USB gadget setup + /dev/hidg* (no sudoers)           (D-Bus system bus)        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Zero runtime sudo.** Sudo is needed once during `install.sh` and never again — no passwordless rules, no `bluetooth`/`input` group juggling, no logout required.
+- **One instance by construction.** systemd owns the daemon; duplicate sessions and orphaned L2CAP bridges cannot exist.
+- **Self-healing.** The daemon watches `org.bluez`: if bluetoothd restarts (OS updates, crashes), it degrades gracefully and re-registers the GATT app, advertisement, agent and SDP record automatically. A 5 s health watchdog re-registers lost advertisements and re-binds the Pro Controller listeners.
+- **Clean start errors.** Every failure stage reports the exact D-Bus/BlueZ error through `GetStatus()` — the GUI shows it instead of a generic timeout.
+- **Adapter snapshot/restore.** The daemon saves the adapter's name/class/settings before a session and restores them on Stop (or daemon shutdown), so Deck Bluetooth audio etc. keeps working normally afterwards.
+
+The unprivileged GUI and CLI talk to the daemon over the system bus: `com.steamdeck.btemu` → `/com/steamdeck/btemu` (`com.steamdeck.btemu.Manager1`, see [`src/hogp/api.py`](src/hogp/api.py)).
+
+> **Upstream:** [xXJSONDeruloXx/steamdeck-bt-controller-emulator](https://github.com/xXJSONDeruloXx/steamdeck-bt-controller-emulator). This fork targets the official SteamOS 3.x holo image with the daemon/client rewrite described above.
 
 ---
 
@@ -22,13 +46,12 @@ HID-over-GATT via BlueZ D-Bus, classic Bluetooth HID (HIDP/L2CAP) for the Pro Co
 
 | Requirement | Bluetooth | Wired USB |
 |-------------|-----------|-----------|
-| **Mode** | Desktop Mode recommended (Konsole + app menu) | Desktop Mode |
-| **User password** | Optional (for `btmgmt`) | **Required** (`passwd`) for setup |
-| **BIOS** | — | **USB Dual Role Device → DRD** |
+| **Mode** | Desktop Mode (Konsole + app menu) | Desktop Mode |
+| **User password** | Required once (`passwd`) for install.sh sudo | Same + BIOS **USB Dual Role Device → DRD**, then cold boot |
 | **Cable** | — | USB-C **data** cable (not charge-only) |
-| **After install** | **Log out and back in** | Same + cold boot after BIOS change |
+| **After install** | Nothing — the daemon is already running | Re-plug the cable when starting |
 
-On **SteamOS Preview / Main / Beta** (BlueZ 5.76+), use this fork and re-run the installer after updates. Bleeding-edge OS builds can still break built-in controller evdev; run diagnostics if both modes fail.
+On **SteamOS Preview / Main / Beta**, re-run the installer after OS updates. Bleeding-edge builds can still break built-in controller evdev; run diagnostics if input doesn't move.
 
 ---
 
@@ -45,19 +68,19 @@ curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-em
 The installer will:
 
 - Clone or update `~/steamdeck-bt-controller-emulator`
-- Add you to `input` and `bluetooth` groups
-- Install D-Bus policy, sudoers (BlueZ + passwordless USB setup), and udev rules for `/dev/hidg*`
+- Install the D-Bus policy and the **systemd daemon** (`bt-controller-emulator.service`), then enable + start it
+- Install the udev rule for `/dev/hidg*`
 - Create Desktop and application menu shortcuts
 
-**You must log out and log back in** (or reboot) after the first install so groups and D-Bus policy apply.
-
-Add the desktop shortcut to Steam as a non-Steam game if you want it from Gaming Mode — still prefer **Desktop Mode** when starting Bluetooth/USB service.
+**No logout needed** — the daemon starts immediately.
 
 ### Uninstall
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/uninstall.sh | bash
 ```
+
+Stops the daemon (restoring the Bluetooth adapter), removes the unit, D-Bus policy, udev rule and shortcuts, and clears the static BLE address.
 
 ---
 
@@ -72,35 +95,46 @@ cd ~/steamdeck-bt-controller-emulator
 
 Pick **Bluetooth** or **Wired USB**, then pick a **Profile**:
 
-- **Gamepad (macOS)** — the Deck appears to the host as a natively supported game controller (Pro Controller over Bluetooth, DUALSHOCK 4 over USB). Games that use Apple's GameController framework, Steam, emulators, etc. see it as a real controller.
-- **Keyboard** — the classic behaviour: BLE HOGP keyboard/gamepad/mouse (Bluetooth) or generic HID gamepad + keyboard + mouse (USB).
+- **Gamepad (macOS)** — the Deck appears to the host as a natively supported game controller (Pro Controller over Bluetooth, DUALSHOCK 4 over USB).
+- **Keyboard** — BLE HOGP gamepad/keyboard/mouse (Bluetooth) or generic HID gamepad + keyboard + mouse (USB).
 
-Switching between Gamepad and Keyboard profile requires **Stop Service → switch → Start** (and re-pair/re-plug on the host) — the identity change happens at connect time. This matches "disconnect and reconnect to switch modes".
+Switching profiles requires **Stop Service → switch → Start** (and re-pair/re-plug on the host) — the identity changes at connect time.
+
+CLI (no GUI):
+
+```bash
+python3 -m src.hogp start --mode bluetooth --profile gamepad   # Pro Controller
+python3 -m src.hogp start --mode bluetooth --profile keyboard  # SteamDeckPad (HOGP)
+python3 -m src.hogp start --mode usb --profile gamepad         # DUALSHOCK 4
+python3 -m src.hogp status
+python3 -m src.hogp stop
+```
 
 ### Gamepad over Bluetooth (macOS / Android / Linux)
 
-1. Select **Bluetooth** + **Gamepad (macOS)** profile
-2. **Start Service** — wait for **Active - Pro Controller**
+1. Select **Bluetooth** + **Gamepad (macOS)** → **Start Service** — wait for **Active - Pro Controller**
+2. On the Mac: **System Settings → Bluetooth** → find **Pro Controller** → **Connect**
+3. Accept the **Bluetooth Pairing Request** (Just Works, no PIN)
+4. The Deck UI shows **✓ Paired — streaming as Pro Controller**
+5. Check **System Settings → Game Controllers** — a **Pro Controller** should be listed; test sticks/buttons in the Controller tab visualizer first (visualizer proves evdev forwarding before the Mac is involved)
+6. The Deck's real battery level is transmitted with the Pro Controller input reports (byte 2, refreshed every ~15 s) — macOS shows it next to the controller in System Settings
 
-> Gamepad mode launches a tiny bridge (`scripts/hid-l2cap-bridge.py`) that binds the HID L2CAP ports (the kernel only grants well-known PSMs to processes with CAP_NET_BIND_SERVICE). The installer creates a setcap'd Python copy (`.bridge-python`) for this, so **no sudo is needed at runtime**; if that helper is missing or cannot bind, the bridge falls back to the passwordless-sudo rule. Re-run install.sh after updating.
-3. On the Mac: **System Settings → Bluetooth** → find **Pro Controller** → **Connect**
-4. Accept the **Bluetooth Pairing Request** (Just Works, no PIN)
-5. The Deck UI shows **✓ Paired — streaming as Pro Controller**
-6. Check **System Settings → Game Controllers** — a **Pro Controller** should be listed; test sticks/buttons in any GameController-based game, Steam, or the Controller tab visualizer first (visualizer proves evdev forwarding before the Mac is involved)
-7. The Deck's real battery level is transmitted with the Pro Controller input reports (byte 2, refreshed every ~15 s) — macOS shows it next to the controller in System Settings
+### Keyboard over Bluetooth (SteamDeckPad, BLE HOGP)
 
-Keyboard over Bluetooth stays available via the **Keyboard** profile (pairs as **SteamDeckPad**, LE HOGP). You can keep both pairings on the Mac and switch by stopping/starting the service with the desired profile. In this mode the Deck battery is exposed on the standard HOGP Battery Service (0x180F), which macOS reads automatically.
+1. Select **Bluetooth** + **Keyboard** → **Start Service** — wait for **Active - Discoverable**
+2. On the host: pair **SteamDeckPad** (Just Works). The daemon completes bonding automatically (Pair + Trust) when the host subscribes to HID notifications — the UI shows **✓ Paired — sending HID data**
+3. The on-screen Keyboard / Media / Trackpad tabs and the Deck controls all stream to the host
 
-CLI (no GUI): `python3 -m src.hogp --mode pro` (Pro Controller) or the default HOGP mode (see `--help`).
+You can keep both pairings on the Mac and switch by stopping/starting the service with the desired profile. The Deck battery is exposed on the standard HOGP Battery Service (0x180F).
 
 ### Gamepad over Wired USB
 
 1. **BIOS:** Shut down → hold **Volume +** + **Power** → Setup Utility → **Advanced** → **USB Configuration** → **USB Dual Role Device** → **DRD** → save and exit. Cold boot.
-2. Connect Deck to host with a **data** USB-C cable (Deck port toward host).
-3. In the app: **Wired USB** + **Gamepad (macOS)** profile → **Start Service** (first run configures the gadget; no password prompt if install completed).
-4. On the Mac: **System Settings → Game Controllers** — a **Wireless Controller** (DUALSHOCK 4) should appear; games see it as a native PlayStation pad. **System Report → USB** shows the composite device (054C:05C4) with gamepad, keyboard and mouse interfaces.
+2. Connect Deck to host with a **data** USB-C cable.
+3. In the app: **Wired USB** + **Gamepad (macOS)** → **Start Service**. The daemon configures the gadget itself (no password prompt).
+4. On the Mac: **System Settings → Game Controllers** — a **Wireless Controller** (DUALSHOCK 4) should appear. **System Report → USB** shows the composite device (054C:05C4) with gamepad, keyboard and mouse interfaces.
 
-The **Keyboard** profile keeps the previous generic gamepad identity for hosts that don't support DS4 descriptors.
+The **Keyboard** profile keeps the generic gamepad identity for hosts that don't support DS4 descriptors.
 
 Manual gadget setup: `sudo ~/steamdeck-bt-controller-emulator/scripts/setup-usb-gadget.sh [--profile ds4|generic]`
 Teardown: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh`
@@ -113,7 +147,7 @@ Input is forwarded event-driven with a ~4 ms floor and no batching beyond a shor
 
 - **Wired (DS4):** every state change writes a report to `/dev/hidg0` immediately; the host polls the USB interrupt endpoint at its native interval (sub-millisecond on high-speed links)
 - **Bluetooth (Pro Controller):** buttons/sticks/hat changes trigger an immediate `0x30` report, with a 125 Hz baseline stream keeping the link alive between changes
-- The GUI batches only stick/trigger axes (~4 ms) — buttons and the D-pad apply on the next main-loop idle
+- The daemon coalesces only stick/trigger axes (~4 ms) — buttons and the D-pad apply immediately
 
 ---
 
@@ -125,26 +159,42 @@ If anything fails, run this and share the output when asking for help:
 ~/steamdeck-bt-controller-emulator/scripts/diagnose.sh
 ```
 
+Daemon log:
+
+```bash
+journalctl -u bt-controller-emulator -f        # live
+~/steamdeck-bt-controller-emulator/scripts/view-logs.sh   # last 100 lines
+```
+
 Other helpers:
 
 | Script | Purpose |
 |--------|---------|
-| [`scripts/diagnose.sh`](scripts/diagnose.sh) | Groups, BlueZ, evdev gamepads, USB gadget |
+| [`scripts/diagnose.sh`](scripts/diagnose.sh) | Daemon, D-Bus API, BlueZ, evdev gamepads, USB gadget |
 | [`scripts/check-usb-gadget.sh`](scripts/check-usb-gadget.sh) | USB gadget / `hidg` only |
-| [`scripts/view-logs.sh`](scripts/view-logs.sh) | Tail journal while reproducing |
+| [`scripts/view-logs.sh`](scripts/view-logs.sh) | Tail the daemon journal |
 
-**Quick evdev check:** `evtest` — you should see something like **Valve Software Steam Deck Controller** or **Microsoft X-Box 360 pad** (Steam virtual pad). If the list has no gamepad, the app cannot forward sticks/buttons until SteamOS exposes input (try quitting Steam, Desktop Mode, or a stable OS channel).
+**Quick evdev check:** `evtest` — you should see something like **Valve Software Steam Deck Controller** or **Microsoft X-Box 360 pad** (Steam virtual pad). If the list has no gamepad, the daemon cannot forward sticks/buttons until SteamOS exposes input (try quitting Steam, Desktop Mode, or a stable OS channel).
 
 ---
 
 ## Troubleshooting
 
+### Start Service fails with a D-Bus error
+
+The GUI shows the exact failure. The most common causes, in order:
+
+1. **Daemon not running** — `sudo systemctl start bt-controller-emulator`, or re-run [install.sh](#installation).
+2. **Pairing agent error (`AlreadyExists`)** — another process holds BlueZ's default agent. `sudo systemctl restart bluetooth` clears it; nothing else should register an agent now that the daemon owns it.
+3. **SDP record error** — BlueZ rejected the profile registration. `journalctl -u bluetooth -n 50` + `journalctl -u bt-controller-emulator -n 100`.
+4. **`Address already in use` on PSM 0x11/0x13** — a Bluetooth keyboard/mouse connected **to the Deck** holds the kernel HID ports (`hidp`). The daemon tries to unload `hidp` itself and retries; otherwise disconnect those devices (`bluetoothctl devices Connected` + `bluetoothctl disconnect <MAC>`) and start again.
+
 ### Gamepad pairs as "Pro Controller" but Mac shows nothing in Game Controllers
 
 1. Confirm the Deck UI shows **✓ Paired — streaming as Pro Controller** (both L2CAP channels connected).
-2. Check `journalctl -u bluetooth` + the app log: you should see subcommand traffic (`Pro Controller subcommand 0x02 …`) — that proves macOS is running the Pro init protocol.
+2. Check `journalctl -u bt-controller-emulator`: you should see subcommand traffic (`Pro Controller subcommand 0x02 …`) — that proves macOS is running the Pro init protocol.
 3. On the Mac, remove the **Pro Controller** entry, toggle Bluetooth off/on, and pair again.
-4. If pairing spins forever: the Deck must be **pairable + discoverable** with Class of Device `0x002508`; the app sets this at start. Re-run install.sh if D-Bus policy blocks it.
+4. If pairing spins forever: the Deck must be **pairable + connectable** with Class of Device `0x002508`; the daemon sets this at start. Re-run install.sh if the D-Bus policy blocks it.
 5. macOS 13+ is required for Pro Controller support (macOS 26 Tahoe / 27 Golden Gate both include it).
 
 ### Pairs but no input (Bluetooth gamepad)
@@ -153,80 +203,41 @@ Other helpers:
 - On the Deck, quit Steam (Desktop Mode) so the built-in controller is exposed to evdev (`evtest` must show a gamepad).
 - Watch the Controller tab visualizer while pressing sticks/buttons — if it doesn't move, the problem is evdev, not Bluetooth.
 
-### USB gamepad not recognised as a DUALSHOCK 4
+### macOS shows connected but not "Paired" (SteamDeckPad)
 
-- **System Report → USB** must show the device as `054C:05C4`. If it shows `1209:0001`, the gadget was configured with the generic profile — run `sudo scripts/setup-usb-gadget.sh --profile ds4` manually or switch the app to the Gamepad profile and Start again.
-- Some Mac games only refresh the controller list at launch — quit and reopen the game.
-- The keyboard/mouse interfaces on the same composite device are normal and expected.
+The daemon calls `Device1.Pair()` and sets `Trusted` when HID notifications start (and retries every 20 s per device).
 
-### `Advertisement failed` / `Failed to parse advertisement` (Keyboard profile)
-
-Usually a bad combination of `LEAdvertisement1` properties (e.g. `Appearance` set twice). Update to the latest fork build.
-
-### `GATT registration failed` / `Failed to create entry in database` (Keyboard profile)
-
-BlueZ **already owns** Generic Access (0x1800) and often Device Information (0x180a). This fork registers **only the HID service (0x1812)**. Update to the latest fork build if you still see this after an older install.
-
-### Stuck on “Starting...” (Bluetooth gamepad)
-
-Failures are now shown with the exact D-Bus error (the watchdog no longer overwrites them). The most common causes, in order:
-
-1. **Pairing agent error containing `AlreadyExists`** — another process already holds BlueZ's default agent (usually an older instance of the app). Close extra instances (`pgrep -af hogp.gui`) or log out/in, then start again.
-2. **Pairing agent error containing `AccessDenied`/`NotPermitted`** — the `bluetooth` group is not active in this session. Run `groups` in Konsole: if `bluetooth` is missing, log out and back in (or reboot) after install.sh — reinstalling alone will not fix this.
-3. **SDP record error** — BlueZ rejected the profile registration. Run `journalctl -u bluetooth -n 50` and share the output.
-4. **`Address already in use` on PSM 0x11/0x13** — either an older app/bridge instance is still running (`pgrep -af hogp`, `sudo pkill -f hid-l2cap-bridge`) or the kernel's HID host module holds the ports while a Bluetooth keyboard/mouse is connected to the Deck (`sudo modprobe -r hidp`). The app kills orphaned bridges automatically, and the bridge retries and tries to unload hidp itself before giving up.
-
-To see the full start sequence in a terminal:
-
-```bash
-cd ~/steamdeck-bt-controller-emulator && python3 -m src.hogp --mode pro
-```
-
-`Pro Controller start:` lines log each stage (bus/adapter, pairing agent, SDP record, L2CAP sockets).
-
-### Status stuck on “Starting...” (Bluetooth)
-
-- Re-run the [install command](#installation), then **log out / in**
-- Run from **Desktop Mode**
-- Run `diagnose.sh`; check BlueZ / D-Bus errors in Konsole when starting the service
+1. On the Mac: **System Settings → Bluetooth** — remove old **SteamDeckPad** entries, then connect again from the list.
+2. If the Mac stalls on pairing: accept any **"Bluetooth Pairing Request"** dialog (Just Works / confirm).
+3. Deck UI should show **Paired — sending HID data** with **Paired: yes** and **Trusted: yes**. If **Paired** stays `no`, run `diagnose.sh` and check both journals while connecting.
+4. If macOS shows the Deck as a **laptop** or adds a **Bluetooth audio output**: remove **every** "Steam Deck" / **SteamDeckPad** entry on the Mac, start the service (it switches the adapter to **LE-only** while running), then pair **only SteamDeckPad**. Stop the service before using Deck Bluetooth headphones again.
 
 ### Visible in discovery but never connects / pairs
 
-- Re-run **install.sh** and log out/in (registers an auto-accept **pairing agent**).
-- On the **host**, start the pairing flow from Bluetooth settings (don't rely only on “scan”).
-- If Android pairs then disconnects: on the Deck (Developer mode), try in `/etc/bluetooth/main.conf` under `[General]`: `ReverseServiceDiscovery = false`, then `sudo systemctl restart bluetooth`. This stops BlueZ from probing the phone as a GATT client during connect.
-
-### macOS shows connected but not “Paired” (Keyboard / SteamDeckPad)
-
-GATT notify can start **before** macOS finishes SMP bonding. Latest builds **call `Device1.Pair()` and set `Trusted`** when HID notify starts, and the UI shows **Paired / Trusted** (not only “sending data”).
-
-1. Re-run [install.sh](#installation) and **log out / in** (D-Bus policy + pairing agent).
-2. On the Mac: **System Settings → Bluetooth** — remove old **SteamDeckPad** entries, then connect again from the list (don't use only a quick-connect chip).
-3. If the Mac stalls on pairing: accept any **“Bluetooth Pairing Request”** dialog (Just Works / confirm).
-4. Deck UI should show **Paired — sending HID data** with **Paired: yes** and **Trusted: yes**. If **Paired** stays `no`, run `diagnose.sh` and check `journalctl -u bluetooth` while connecting.
-5. If macOS shows the Deck as a **laptop** or adds a **Bluetooth audio output**: remove **every** “Steam Deck” / **SteamDeckPad** entry on the Mac, update the app, start the service (it switches the adapter to **LE-only** while running), then pair **only SteamDeckPad**. Stop the service before using Deck Bluetooth headphones again.
+- The daemon registers an auto-accept **pairing agent** automatically; make sure the service is active (`btemu status`).
+- On the **host**, start the pairing flow from Bluetooth settings (don't rely only on "scan").
+- If Android pairs then disconnects: on the Deck (Developer mode), try in `/etc/bluetooth/main.conf` under `[General]`: `ReverseServiceDiscovery = false`, then `sudo systemctl restart bluetooth`.
 
 ### Wired shows Active but the Mac doesn't see the device
 
 - Re-plug the USB-C cable (the Mac re-enumerates on a fresh plug)
 - On the Mac: **System Report → USB** — the composite device should appear as **054C:05C4** (Gamepad profile) or **1209:0001** (Keyboard profile)
-- The app rebuilds the gadget whenever the configured profile doesn't match (tracked in `/tmp/steamdeck_hid.profile`); if it still says Active but the Mac sees nothing, run on the Deck: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh`, start again, then check `dmesg | tail -50` for `configfs-gadget` errors. A wedged dwc3 UDC only recovers on a Deck reboot
+- The daemon rebuilds the gadget whenever the configured profile doesn't match (tracked in `/tmp/steamdeck_hid.profile`); if it still says Active but the Mac sees nothing: `sudo ~/steamdeck-bt-controller-emulator/scripts/cleanup-usb-gadget.sh`, start again, then check `dmesg | tail -50` for `configfs-gadget` errors. A wedged dwc3 UDC only recovers on a Deck reboot
 
 ### Wired USB fails immediately
 
 - BIOS **DRD** enabled, **cold boot**
-- `passwd` set for user `deck`
-- Re-run installer (passwordless `sudo` for setup scripts)
-- `check-usb-gadget.sh` — need UDC, gadget bound, `/dev/hidg0`–`hidg2` writable
+- `passwd` set for user `deck` (needed for the installer's sudo)
+- `check-usb-gadget.sh` — need UDC, gadget bound, `/dev/hidg0`–`hidg2` present
 
 ### Both modes fail on Preview / Main
 
-Some prerelease builds do not expose built-in controls to evdev while Steam or the kernel holds them. Use `diagnose.sh` and `evtest`. Mitigations: Desktop Mode, exit Steam before starting the service, **Stable** channel, or USB mode with DRD. Kernel customization on stock SteamOS is not a practical fix for most users.
+Some prerelease builds do not expose built-in controls to evdev while Steam or the kernel holds them. Use `diagnose.sh` and `evtest`. Mitigations: Desktop Mode, exit Steam before starting the service, **Stable** channel, or USB mode with DRD.
 
 ### General pairing / mapping tips
 
 - Confirm matching PIN when prompted (often acknowledge on PC first, then Deck)
-- Triggers/bumpers may need one-time mapping in the host’s controller settings
+- Triggers/bumpers may need one-time mapping in the host's controller settings
 - **Guide / QAM** on the physical Deck are not forwarded; use the in-app **Home** / **QAM** buttons (keyboard shortcuts)
 
 ---
@@ -235,11 +246,24 @@ Some prerelease builds do not expose built-in controls to evdev while Steam or t
 
 From repo root on a dev machine:
 
-- `just deploy` — sync to Deck over SSH (edit IP in justfile)
-- `just run` — run remotely
-- `just logs` — tail logs
+- `just deploy` — sync source to the Deck over SSH (edit IP in justfile)
+- `just restart` — restart the daemon after a deploy
+- `just logs` — follow the daemon journal
+- `python3 -m src.hogp.service` — run the daemon in the foreground (as root) without systemd
 
-Key modules: `src/hogp/bluez.py`, `gatt_app.py`, `input_handler.py`, `usb_gadget.py`, `pro_controller.py` (BR/EDR Pro Controller emulator), `ds4.py` (DualShock 4 USB identity), `gui.py`
+Key modules:
+
+| Module | Role |
+|--------|------|
+| [`src/hogp/service.py`](src/hogp/service.py) | Root daemon: session state machine, BlueZ lifecycle, watchdog/self-heal, D-Bus API |
+| [`src/hogp/client.py`](src/hogp/client.py) | Unprivileged D-Bus client (GUI + CLI) |
+| [`src/hogp/api.py`](src/hogp/api.py) | D-Bus contract (name, path, interface, status keys) |
+| [`src/hogp/bluez.py`](src/hogp/bluez.py) | BlueZ helpers: async registration, adapter snapshot/restore, btmgmt (no sudo) |
+| [`src/hogp/gatt_app.py`](src/hogp/gatt_app.py) | HID-over-GATT service (report maps, ATT notify throttle) |
+| [`src/hogp/pro_controller.py`](src/hogp/pro_controller.py) | Pro Controller emulator (L2CAP HIDP + subcommand engine, direct PSM bind) |
+| [`src/hogp/input_handler.py`](src/hogp/input_handler.py) | evdev gamepad detection + forwarding |
+| [`src/hogp/usb_gadget.py`](src/hogp/usb_gadget.py) / [`ds4.py`](src/hogp/ds4.py) | USB gadget HID + DualShock 4 identity |
+| [`src/hogp/gui.py`](src/hogp/gui.py) | GTK4 client GUI |
 
 ---
 
@@ -247,4 +271,4 @@ Key modules: `src/hogp/bluez.py`, `gatt_app.py`, `input_handler.py`, `usb_gadget
 
 - Protocol research: [dekuNukem/Nintendo_Switch_Reverse_Engineering](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering) (BT HID reports + subcommands), [mart1nro/joycontrol](https://github.com/mart1nro/joycontrol) (Pro Controller L2CAP server + SDP record), Linux [hid-nintendo.c](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-nintendo.c) (report structs, calibration), [esp-cpp/espp](https://github.com/esp-cpp/espp) `switch_pro` (subcommand reply engine)
 - DualShock 4 USB: [chrippa/ds4drv](https://github.com/chrippa/ds4drv) (report layout), [orcadom/DS4](https://github.com/orcadom/DS4) (public-domain USB report descriptor)
-- HOGP: [EmuBTHID](https://github.com/Alkaid-Benetnash/EmuBTHID), [BTGamepad](https://github.com/007durgesh219/BTGamepad), [diyps3controller](https://github.com/rafikel/diyps3controller), [GIMX](https://github.com/matlo/GIMX), [DeckJoy](https://github.com/Lucaber/deckjoy) (USB gadget reference)
+- HOGP: [EmuBTHID](https://github.com/Alkaid-Benetnash/EmuBTHID), [BTGamepad](https://github.com/007durgesh219/BTGamepad), [diyps3controller](https://github.com/rafikel/diyps3controller), [GIMX](https://github.com/matlo/GIMX), [DeckJoy](https://github.com/Lucaber/deckjoy) (USB gadget reference), [bt-keyboard-adapter](https://github.com/gwyntel/bt-keyboard-adapter) (BlueZ HOGP reference)

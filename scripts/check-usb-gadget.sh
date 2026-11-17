@@ -47,7 +47,8 @@ if [ -d "$GADGET_DIR" ]; then
     fi
 else
     echo "   ✗ No gadget configuration found"
-    echo "   Run: sudo ~/steamdeck-bt-controller-emulator/scripts/setup-usb-gadget.sh"
+    echo "   The app rebuilds it automatically on Start (Wired USB) —"
+    echo "   or run: sudo ~/steamdeck-bt-controller-emulator/scripts/setup-usb-gadget.sh"
 fi
 
 echo
@@ -118,7 +119,8 @@ if ls /dev/hidg* > /dev/null 2>&1 && [ -f "$GADGET_DIR/UDC" ] && [ -s "$GADGET_D
 else
     echo "✗ USB gadget not fully configured"
     echo
-    echo "Run this to set up:"
+    echo "Start the app with Wired USB mode — the daemon sets this up automatically."
+    echo "Manual setup:"
     echo "  sudo ~/steamdeck-bt-controller-emulator/scripts/setup-usb-gadget.sh"
 fi
 echo

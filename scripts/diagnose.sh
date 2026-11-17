@@ -1,25 +1,36 @@
 #!/bin/bash
-# Full diagnostic for BT Controller Emulator on SteamOS
+# Full diagnostic for BT Controller Emulator on SteamOS (daemon architecture)
 set -u
-
-INSTALL_DIR="${INSTALL_DIR:-$HOME/steamdeck-bt-controller-emulator}"
 
 echo "=== BT Controller Emulator — diagnostics ==="
 echo "User: $(whoami)  Groups: $(groups)"
 echo
 
-echo "--- Permissions / install ---"
-for f in /etc/sudoers.d/bt-controller-emulator /etc/dbus-1/system.d/bt-controller-emulator.conf; do
-    if [ -f "$f" ]; then echo "  OK $f"; else echo "  MISSING $f (re-run install.sh)"; fi
-done
-if groups | grep -qw bluetooth; then echo "  OK bluetooth group"; else echo "  MISSING bluetooth group"; fi
-if groups | grep -qw input; then echo "  OK input group"; else echo "  MISSING input group"; fi
+echo "--- Daemon (systemd) ---"
+if systemctl is-active --quiet bt-controller-emulator; then
+    echo "  OK bt-controller-emulator.service is active"
+else
+    echo "  NOT RUNNING bt-controller-emulator.service"
+    echo "    Start it: sudo systemctl start bt-controller-emulator"
+fi
+systemctl is-enabled bt-controller-emulator 2>/dev/null | sed 's/^/  enabled: /'
+echo
+echo "  Recent daemon log:"
+journalctl -u bt-controller-emulator -n 15 --no-pager 2>/dev/null | sed 's/^/    /' || echo "    (no journal access)"
 echo
 
-echo "--- Pairing agent (optional) ---"
-if busctl --system status org.bluez 2>/dev/null | grep -q org.bluez; then
-    busctl --system tree org.bluez 2>/dev/null | grep -i steamdeck | sed 's/^/  /' || echo "  (no com.steamdeck paths visible — start the app first)"
+echo "--- Daemon D-Bus API ---"
+if busctl --system introspect com.steamdeck.btemu /com/steamdeck/btemu 2>/dev/null | head -5 | sed 's/^/  /'; then
+    true
+else
+    echo "  MISSING com.steamdeck.btemu (is the daemon running? re-run install.sh)"
 fi
+echo
+
+echo "--- Install files ---"
+for f in /etc/systemd/system/bt-controller-emulator.service /etc/dbus-1/system.d/bt-controller-emulator.conf /etc/udev/rules.d/99-steamdeck-hidg.rules; do
+    if [ -f "$f" ]; then echo "  OK $f"; else echo "  MISSING $f (re-run install.sh)"; fi
+done
 echo
 
 echo "--- Bluetooth (BlueZ) ---"
@@ -28,15 +39,8 @@ if command -v bluetoothctl >/dev/null; then
 else
     echo "  bluetoothctl not found"
 fi
-if busctl --system call org.bluez /org/bluez/hci0 org.bluez.GattManager1 GetManagedObjects 2>/dev/null | head -1; then
-    : # noop
-fi
 echo "  GattManager on hci0:"
-if busctl --system tree org.bluez 2>/dev/null | grep -i GattManager | head -3 | sed 's/^/    /'; then
-    true
-else
-    echo "    (check org.bluez)"
-fi
+busctl --system tree org.bluez 2>/dev/null | grep -i GattManager | head -3 | sed 's/^/    /' || echo "    (check org.bluez)"
 echo
 
 echo "--- Gamepad input (evdev) ---"
@@ -65,8 +69,9 @@ PY
 echo
 
 echo "--- USB gadget ---"
-bash "$INSTALL_DIR/scripts/check-usb-gadget.sh" 2>/dev/null || true
+bash "$(dirname "$0")/check-usb-gadget.sh" 2>/dev/null || true
 
 echo
-echo "If Bluetooth hangs: log out/in after install, Desktop Mode, re-run install from your fork."
-echo "If USB fails: BIOS DRD + data cable + passwd for sudo/pkexec."
+echo "If Bluetooth fails: check 'journalctl -u bt-controller-emulator -n 100',"
+echo "then 'sudo systemctl restart bluetooth' and start the service again."
+echo "If USB fails: BIOS DRD + data cable + 'sudo systemctl restart bt-controller-emulator'."

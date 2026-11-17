@@ -1,618 +1,137 @@
 """
-Main entrypoint for the HID-over-GATT peripheral emulator.
+Command-line client for the emulator daemon.
 
-Usage:
-    sudo python3 -m hogp --name SteamDeckHoG --rate 10
+    python3 -m src.hogp status
+    python3 -m src.hogp start --mode bluetooth --profile gamepad
+    python3 -m src.hogp start --mode usb --profile keyboard
+    python3 -m src.hogp stop
+    python3 -m src.hogp watch
+
+Legacy flags are accepted: --mode pro maps to bluetooth + gamepad and
+--mode hogp maps to bluetooth + keyboard.
+
+The daemon itself runs as `python3 -m src.hogp.service` (systemd unit
+bt-controller-emulator.service).
 """
 
 import argparse
-import logging
-import signal
 import sys
-import threading
-from typing import Optional
 
-from gi.repository import GLib
-
-from .bluez import (
-    get_system_bus,
-    find_adapter_path,
-    ensure_adapter_powered_and_discoverable,
-    register_application_async,
-    unregister_application_async,
-    register_advertisement_async,
-    unregister_advertisement_async,
-    get_le_advertising_active_instances,
-    set_static_ble_address,
-    configure_adapter_for_hog_peripheral,
-    configure_adapter_for_pro_controller,
-    get_adapter_address,
-    register_hid_sdp_profile,
-    unregister_hid_sdp_profile,
-    get_adapter_index,
-    set_adapter_alias,
-    reset_adapter_to_default_state,
-    acquire_app_bus_name,
+from .api import (
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD,
+    KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
+    KEY_CONNECTED, KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_BATTERY,
+    KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
+    KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
 )
-from .gatt_app import GattApplication
-from .adv import Advertisement
-from .input_handler import InputHandler
-from .pro_controller import ProControllerEmulator, SDP_RECORD_XML, PRO_NAME
-
-logger = logging.getLogger(__name__)
-
-# Default configuration constants
-DEFAULT_REPORT_RATE_HZ = 10
-DEFAULT_STATIC_BLE_ADDRESS = "C2:12:34:56:78:9A"
-DEFAULT_DEVICE_NAME = "SteamDeckHoG"
-DEFAULT_ADAPTER = "hci0"
+from .client import BtEmuClient, BtEmuError
 
 
-class HoGPeripheral:
-    """
-    HID-over-GATT peripheral controller.
-    
-    Manages the GATT application and advertisement lifecycle,
-    and provides a simple CLI for testing.
-    """
+def _print_status(client: BtEmuClient) -> int:
+    try:
+        status = client.get_status()
+    except BtEmuError as e:
+        print(f"Error: {e}")
+        return 1
 
-    def __init__(
-        self,
-        name: str = DEFAULT_DEVICE_NAME,
-        rate: int = DEFAULT_REPORT_RATE_HZ,
-        adapter: str = DEFAULT_ADAPTER,
-        static_addr: Optional[str] = DEFAULT_STATIC_BLE_ADDRESS,
-        input_device: Optional[str] = None,
-        mode: str = "hogp",
-        verbose: bool = False,
-    ):
-        self.name = name
-        self.rate = rate
-        self.adapter = adapter
-        self.static_addr = static_addr
-        self.input_device = input_device
-        self.verbose = verbose
-        self.mode = mode
-        
-        self._bus: Optional[GLib.DBusConnection] = None
-        self._adapter_path: Optional[str] = None
-        self._gatt_app: Optional[GattApplication] = None
-        self._advertisement: Optional[Advertisement] = None
-        self._input_handler: Optional[InputHandler] = None
-        self._pro_controller = None
-        self._main_loop: Optional[GLib.MainLoop] = None
-        self._registered = False
-        self._shutting_down = False
-        
-        # Test pattern state
-        self._test_pattern_id: Optional[int] = None
-        self._test_button_idx = 0
-        self._test_axis_value = 0
-        self._test_axis_direction = 1
-
-    def run(self) -> int:
-        """Run the peripheral. Returns exit code."""
-        # Setup logging
-        log_level = logging.DEBUG if self.verbose else logging.INFO
-        logging.basicConfig(
-            level=log_level,
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        )
-        
-        logger.info(f"Starting HoG Peripheral: name={self.name}, rate={self.rate}Hz")
-
-        if self.mode == "pro":
-            return self._run_pro_controller_mode()
-        
-        # Get D-Bus connection
-        try:
-            self._bus = get_system_bus()
-            logger.info(f"Connected to system bus: {self._bus.get_unique_name()}")
-            acquire_app_bus_name(self._bus)
-        except Exception as e:
-            logger.error(f"Failed to connect to system bus: {e}")
-            return 1
-        
-        # Find adapter
-        self._adapter_path = find_adapter_path(self._bus, self.adapter)
-        if not self._adapter_path:
-            logger.error(f"Adapter {self.adapter} not found")
-            return 1
-        logger.info(f"Using adapter: {self._adapter_path}")
-        
-        # Set adapter alias to match our device name
-        if set_adapter_alias(self._bus, self._adapter_path, self.name):
-            logger.info(f"Adapter alias set to: {self.name}")
-        else:
-            logger.warning("Could not set adapter alias - device name may not persist after pairing")
-        
-        # Set static BLE address to prevent duplicate controller entries
-        if self.static_addr:
-            adapter_idx = get_adapter_index(self.adapter)
-            if set_static_ble_address(adapter_idx, self.static_addr):
-                logger.info(f"Static BLE address configured: {self.static_addr}")
-            else:
-                logger.warning("Could not set static BLE address - device may appear as duplicate controller on reconnect")
-        else:
-            logger.info("Static BLE address not configured (--no-static-addr)")
-
-        configure_adapter_for_hog_peripheral(get_adapter_index(self.adapter))
-        
-        # Ensure adapter is powered
-        if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
-            logger.error("Failed to power on adapter")
-            return 1
-        
-        # Create GATT application
-        self._gatt_app = GattApplication(self._bus, device_name=self.name, verbose=self.verbose)
-        self._gatt_app.set_report_rate(self.rate)
-        
-        if not self._gatt_app.register():
-            logger.error("Failed to register GATT objects")
-            return 1
-        
-        # Create advertisement
-        self._advertisement = Advertisement(self._bus, self.name, verbose=self.verbose)
-        if not self._advertisement.register():
-            logger.error("Failed to register advertisement object")
-            self._gatt_app.unregister()
-            return 1
-        
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-        
-        # Setup input handler if input device specified or auto-detect enabled
-        if self.input_device or self.input_device != "none":
-            logger.info("Setting up physical input forwarding...")
-            self._input_handler = InputHandler(
-                device_path=self.input_device if self.input_device != "auto" else None,
-                on_button_change=self._on_physical_button,
-                on_axis_change=self._on_physical_axis,
-                on_trigger_change=self._on_physical_trigger,
-                on_hat_change=self._on_physical_hat,
-                verbose=self.verbose,
-            )
-            if self._input_handler.start():
-                logger.info("Physical input forwarding enabled")
-            else:
-                logger.warning("Could not start input handler, falling back to CLI-only mode")
-                self._input_handler = None
-        else:
-            logger.info("Physical input forwarding disabled (use --input-device to enable)")
-        
-        # Create main loop
-        self._main_loop = GLib.MainLoop()
-        
-        # Register with BlueZ asynchronously
-        self._register_with_bluez()
-        
-        # Start CLI input thread
-        cli_thread = threading.Thread(target=self._cli_loop, daemon=True)
-        cli_thread.start()
-        
-        # Run main loop
-        try:
-            logger.info("Running main loop (press Ctrl+C to stop)...")
-            self._main_loop.run()
-        except KeyboardInterrupt:
-            pass
-        
-        return 0
-
-    def _run_pro_controller_mode(self) -> int:
-        """Run as a Pro Controller (BR/EDR HID) gamepad peripheral."""
-        log_level = logging.DEBUG if self.verbose else logging.INFO
-        logging.basicConfig(
-            level=log_level,
-            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        )
-
-        logger.info(f"Starting Pro Controller peripheral: name={PRO_NAME}")
-
-        try:
-            self._bus = get_system_bus()
-        except Exception as e:
-            logger.error(f"Failed to connect to system bus: {e}")
-            return 1
-
-        self._adapter_path = find_adapter_path(self._bus, self.adapter)
-        if not self._adapter_path:
-            logger.error(f"Adapter {self.adapter} not found")
-            return 1
-
-        set_adapter_alias(self._bus, self._adapter_path, PRO_NAME)
-        configure_adapter_for_pro_controller(get_adapter_index(self.adapter))
-
-        if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
-            logger.error("Failed to power on adapter")
-            return 1
-
-        adapter_address = get_adapter_address(self._bus, self._adapter_path) or "00:00:00:00:00:00"
-
-        if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
-            logger.error("Failed to register HID SDP record")
-            return 1
-
-        self._pro_controller = ProControllerEmulator(
-            adapter_address=adapter_address, verbose=self.verbose
-        )
-        self._pro_controller.on_state_change = lambda connected: logger.info(
-            "Mac %s" % ("connected — streaming" if connected else "disconnected")
-        )
-        if not self._pro_controller.start():
-            logger.error("Failed to bind HID L2CAP sockets")
-            unregister_hid_sdp_profile(self._bus)
-            return 1
-
-        if self.input_device or self.input_device != "none":
-            self._input_handler = InputHandler(
-                device_path=self.input_device if self.input_device != "auto" else None,
-                on_button_change=self._on_physical_button,
-                on_axis_change=self._on_physical_axis,
-                on_trigger_change=self._on_physical_trigger,
-                on_hat_change=self._on_physical_hat,
-                verbose=self.verbose,
-            )
-            if not self._input_handler.start():
-                logger.warning("Could not start input handler (forwarding disabled)")
-
-        self._main_loop = GLib.MainLoop()
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-        logger.info("Pro Controller ready — pair on the Mac: Bluetooth → Pro Controller")
-        try:
-            self._main_loop.run()
-        except KeyboardInterrupt:
-            pass
-
-        self._shutdown()
-        return 0
-
-    def _register_with_bluez(self) -> None:
-        """Register GATT application and advertisement with BlueZ."""
-        def on_app_registered(success, error):
-            if not success:
-                logger.error(f"GATT registration failed: {error}")
-                self._shutdown()
-                return
-            
-            # Now register advertisement
-            register_advertisement_async(
-                self._bus,
-                self._adapter_path,
-                Advertisement.ADV_PATH,
-                on_adv_registered,
-            )
-        
-        def on_adv_registered(success, error):
-            if not success:
-                logger.error(f"Advertisement registration failed: {error}")
-                self._shutdown()
-                return
-            
-            self._registered = True
-            active = get_le_advertising_active_instances(self._bus, self._adapter_path)
-            logger.info(f"Registration complete! ActiveInstances: {active}")
-            logger.info(f"Device should be discoverable as '{self.name}'")
-            self._print_cli_help()
-        
-        register_application_async(
-            self._bus,
-            self._adapter_path,
-            GattApplication.APP_PATH,
-            on_app_registered,
-        )
-
-    def _signal_handler(self, sig, frame) -> None:
-        """Handle SIGINT/SIGTERM."""
-        logger.info("Received shutdown signal")
-        GLib.idle_add(self._shutdown)
-
-    def _shutdown(self) -> None:
-        """Clean shutdown procedure."""
-        if self._shutting_down:
-            return
-        self._shutting_down = True
-        
-        logger.info("Shutting down...")
-        
-        # Stop test pattern
-        if self._test_pattern_id:
-            GLib.source_remove(self._test_pattern_id)
-            self._test_pattern_id = None
-        
-        # Stop Pro Controller emulator
-        if self._pro_controller:
-            self._pro_controller.stop()
-            self._pro_controller = None
-            if self._bus:
-                unregister_hid_sdp_profile(self._bus)
-
-        # Stop input handler
-        if self._input_handler:
-            self._input_handler.stop()
-            self._input_handler = None
-        
-        # Unregister from BlueZ
-        if self._registered and self._bus and self._adapter_path:
-            unregister_advertisement_async(
-                self._bus,
-                self._adapter_path,
-                Advertisement.ADV_PATH,
-            )
-            unregister_application_async(
-                self._bus,
-                self._adapter_path,
-                GattApplication.APP_PATH,
-            )
-        
-        # Unregister D-Bus objects
-        if self._advertisement:
-            self._advertisement.unregister()
-        if self._gatt_app:
-            self._gatt_app.unregister()
-        
-        # Reset adapter to default state (restore normal Bluetooth operation)
-        if self._bus and self._adapter_path:
-            try:
-                reset_adapter_to_default_state(self._bus, self._adapter_path)
-                logger.info("Adapter restored to default state")
-            except Exception as e:
-                logger.warning(f"Could not reset adapter state: {e}")
-        
-        # Quit main loop
-        if self._main_loop and self._main_loop.is_running():
-            self._main_loop.quit()
-
-    def _print_cli_help(self) -> None:
-        """Print CLI help."""
-        print("\n--- CLI Commands ---")
-        print("  b <0-10>     : Toggle button (e.g., 'b 0')")
-        print("  a <0-3> <val>: Set axis value -32768 to 32767 (e.g., 'a 0 16000')")
-        print("  tr <0-1> <val>: Set trigger 0-255 (e.g., 'tr 0 255')")
-        print("  h <dir>      : Set HAT/D-pad direction 0-7 or F (e.g., 'h 0')")
-        print("  t            : Start/stop test pattern")
-        print("  s            : Show current state")
-        print("  q            : Quit")
-        print("--------------------\n")
-
-    def _cli_loop(self) -> None:
-        """Simple CLI for testing input."""
-        while not self._shutting_down:
-            try:
-                line = input().strip().lower()
-                if not line:
-                    continue
-                
-                parts = line.split()
-                cmd = parts[0]
-                
-                if cmd == "q":
-                    GLib.idle_add(self._shutdown)
-                    break
-                elif cmd == "b" and len(parts) >= 2:
-                    try:
-                        btn = int(parts[1])
-                        if 0 <= btn < 11:
-                            # Toggle button
-                            current = (self._gatt_app._buttons >> btn) & 1
-                            self._gatt_app.set_button(btn, not current)
-                            print(f"Button {btn} {'pressed' if not current else 'released'}")
-                        else:
-                            print("Button must be 0-10")
-                    except ValueError:
-                        print("Invalid button number")
-                elif cmd == "a" and len(parts) >= 3:
-                    try:
-                        axis = int(parts[1])
-                        value = int(parts[2])
-                        if 0 <= axis < 4:
-                            self._gatt_app.set_axis(axis, value)
-                            print(f"Axis {axis} = {value}")
-                        else:
-                            print("Axis must be 0-3")
-                    except ValueError:
-                        print("Invalid axis/value")
-                elif cmd == "tr" and len(parts) >= 3:
-                    try:
-                        trig = int(parts[1])
-                        value = int(parts[2])
-                        if 0 <= trig < 2:
-                            self._gatt_app.set_trigger(trig, value)
-                            print(f"Trigger {trig} = {value}")
-                        else:
-                            print("Trigger must be 0-1")
-                    except ValueError:
-                        print("Invalid trigger/value")
-                elif cmd == "h" and len(parts) >= 2:
-                    try:
-                        dirstr = parts[1].upper()
-                        if dirstr == 'F':
-                            direction = 0x0F
-                        else:
-                            direction = int(dirstr)
-                        if 0 <= direction <= 7 or direction == 0x0F:
-                            self._gatt_app.set_hat(direction)
-                            print(f"HAT = {direction:02X}")
-                        else:
-                            print("HAT must be 0-7 or F")
-                    except ValueError:
-                        print("Invalid HAT direction")
-                elif cmd == "t":
-                    GLib.idle_add(self._toggle_test_pattern)
-                elif cmd == "s":
-                    self._show_state()
-                else:
-                    self._print_cli_help()
-            except EOFError:
-                break
-            except Exception as e:
-                logger.debug(f"CLI error: {e}")
-
-    def _toggle_test_pattern(self) -> bool:
-        """Toggle the test pattern on/off."""
-        if self._test_pattern_id:
-            GLib.source_remove(self._test_pattern_id)
-            self._test_pattern_id = None
-            print("Test pattern stopped")
-        else:
-            self._test_pattern_id = GLib.timeout_add(500, self._test_pattern_tick)
-            print("Test pattern started (cycling buttons and sweeping axis)")
-        return False
-
-    def _on_physical_button(self, button_index: int, pressed: bool) -> None:
-        """Callback for physical button events."""
-        if self._pro_controller and not self._shutting_down:
-            self._pro_controller.set_button(button_index, pressed)
-        elif self._gatt_app and not self._shutting_down:
-            self._gatt_app.set_button(button_index, pressed)
-            if self.verbose:
-                logger.debug(f"Physical button {button_index} {'pressed' if pressed else 'released'}")
-
-    def _on_physical_axis(self, axis_index: int, value: int) -> None:
-        """Callback for physical axis events."""
-        if self._pro_controller and not self._shutting_down:
-            self._pro_controller.set_axis(axis_index, value)
-        elif self._gatt_app and not self._shutting_down:
-            self._gatt_app.set_axis(axis_index, value)
-            if self.verbose:
-                logger.debug(f"Physical axis {axis_index} = {value}")
-
-    def _on_physical_trigger(self, trigger_index: int, value: int) -> None:
-        """Callback for physical trigger events."""
-        if self._pro_controller and not self._shutting_down:
-            self._pro_controller.set_trigger(trigger_index, value)
-        elif self._gatt_app and not self._shutting_down:
-            self._gatt_app.set_trigger(trigger_index, value)
-            if self.verbose:
-                logger.debug(f"Physical trigger {trigger_index} = {value}")
-
-    def _on_physical_hat(self, direction: int) -> None:
-        """Callback for physical HAT/D-pad events."""
-        if self._pro_controller and not self._shutting_down:
-            self._pro_controller.set_hat(direction)
-        elif self._gatt_app and not self._shutting_down:
-            self._gatt_app.set_hat(direction)
-            if self.verbose:
-                logger.debug(f"Physical HAT = {direction:02X}")
-
-    def _test_pattern_tick(self) -> bool:
-        """Update test pattern state."""
-        if self._shutting_down:
-            return False
-        
-        # Cycle through buttons (0-10)
-        self._gatt_app.set_button(self._test_button_idx, False)
-        self._test_button_idx = (self._test_button_idx + 1) % 11
-        self._gatt_app.set_button(self._test_button_idx, True)
-        
-        # Sweep axis 0
-        self._test_axis_value += self._test_axis_direction * 4000
-        if self._test_axis_value >= 32000:
-            self._test_axis_direction = -1
-        elif self._test_axis_value <= -32000:
-            self._test_axis_direction = 1
-        self._gatt_app.set_axis(0, self._test_axis_value)
-        
-        return True
-
-    def _show_state(self) -> None:
-        """Print current controller state."""
-        buttons = self._gatt_app._buttons
-        axes = self._gatt_app._axes
-        triggers = self._gatt_app._triggers
-        hat = self._gatt_app._hat
-        notifying = self._gatt_app.notifying
-        
-        print(f"\nButtons: 0x{buttons:04X} (binary: {buttons:011b})")
-        print(f"Axes: X={axes[0]}, Y={axes[1]}, RX={axes[2]}, RY={axes[3]}")
-        print(f"Triggers: LT={triggers[0]}, RT={triggers[1]}")
-        print(f"HAT: {hat:02X}")
-        print(f"Notifying: {notifying}")
-        print(f"Report: {self._gatt_app.get_current_report().hex()}\n")
+    detail = status.get(KEY_DETAIL, "")
+    print(f"Status:   {detail}")
+    print(f"Mode:     {status.get(KEY_MODE, '')} ({status.get(KEY_PROFILE, '')})")
+    print(f"Conn:     {status.get(KEY_CONN, '')}")
+    device = status.get(KEY_DEVICE_NAME, "")
+    if device:
+        print(f"Device:   {device} ({status.get(KEY_DEVICE_ADDR, '')}) "
+              f"paired={status.get(KEY_PAIRED, False)} trusted={status.get(KEY_TRUSTED, False)}")
+    print(f"Input:    {status.get(KEY_INPUT, '') or 'none'}")
+    print(f"Battery:  {status.get(KEY_BATTERY, 0)}%")
+    if status.get(KEY_ERROR):
+        print(f"Error:    {status.get(KEY_ERROR)}")
+    if status.get(KEY_STATUS) in ("active", "degraded"):
+        axes = status.get(KEY_AXES, [0, 0, 0, 0])
+        triggers = status.get(KEY_TRIGGERS, [0, 0])
+        print(f"State:    buttons=0x{status.get(KEY_BUTTONS, 0):04X} "
+              f"axes={axes} triggers={triggers} hat={status.get(KEY_HAT, 8)}")
+    return 0
 
 
-def main():
-    """Main entrypoint."""
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Steam Deck BLE HID-over-GATT Peripheral",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    sudo python3 -m hogp --name SteamDeckHoG --rate 10
-    sudo python3 -m hogp --verbose
+        prog="btemu",
+        description="Control the Steam Deck BT Controller Emulator daemon.",
+    )
+    sub = parser.add_subparsers(dest="command")
 
-Verification commands (run in another terminal):
-    # Check advertisement is active:
-    busctl --system get-property org.bluez /org/bluez/hci0 \\
-        org.bluez.LEAdvertisingManager1 ActiveInstances
+    sub.add_parser("status", help="show daemon + session status")
+    sub.add_parser("stop", help="stop the active session")
 
-    # Check GATT objects (replace :1.xxx with actual bus name):
-    busctl --system list | grep python3
-    busctl --system call :1.xxx /com/steamdeck/hogp \\
-        org.freedesktop.DBus.ObjectManager GetManagedObjects
-""",
-    )
-    parser.add_argument(
-        "--name",
-        default=DEFAULT_DEVICE_NAME,
-        help=f"Local name for advertisement (default: {DEFAULT_DEVICE_NAME})",
-    )
-    parser.add_argument(
-        "--rate",
-        type=int,
-        default=DEFAULT_REPORT_RATE_HZ,
-        help=f"Notification rate in Hz (default: {DEFAULT_REPORT_RATE_HZ})",
-    )
-    parser.add_argument(
-        "--adapter",
-        default=DEFAULT_ADAPTER,
-        help=f"Bluetooth adapter name (default: {DEFAULT_ADAPTER})",
-    )
-    parser.add_argument(
-        "--input-device",
-        default="auto",
-        help="Input device path for physical controller forwarding (default: auto, use 'none' to disable)",
-    )
-    parser.add_argument(
-        "--static-addr",
-        default=DEFAULT_STATIC_BLE_ADDRESS,
-        help=f"Static BLE address to prevent duplicate controllers (default: {DEFAULT_STATIC_BLE_ADDRESS})",
-    )
-    parser.add_argument(
-        "--no-static-addr",
-        action="store_true",
-        help="Skip setting static BLE address",
-    )
-    parser.add_argument(
-        "--mode",
-        choices=("hogp", "pro"),
-        default="hogp",
-        help="hogp = BLE HID-over-GATT keyboard/gamepad; "
-             "pro = Pro Controller gamepad (BR/EDR HID, macOS-native)",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-    
-    args = parser.parse_args()
-    
-    peripheral = HoGPeripheral(
-        name=args.name,
-        rate=args.rate,
-        adapter=args.adapter,
-        static_addr=None if args.no_static_addr else args.static_addr,
-        input_device=args.input_device,
-        verbose=args.verbose,
-        mode=args.mode,
-    )
-    
-    sys.exit(peripheral.run())
+    start = sub.add_parser("start", help="start a session")
+    start.add_argument("--mode", choices=("bluetooth", "usb", "pro", "hogp"),
+                       default="bluetooth",
+                       help="transport (pro = bluetooth gamepad, hogp = bluetooth keyboard)")
+    start.add_argument("--profile", choices=("gamepad", "keyboard"),
+                       help="HID identity (default: gamepad for pro, keyboard otherwise)")
+
+    sub.add_parser("watch", help="follow status changes (Ctrl+C to exit)")
+    sub.add_parser("daemon", help="run the privileged daemon in the foreground (dev)")
+
+    args = parser.parse_args(argv)
+    command = args.command or "status"
+
+    if command == "daemon":
+        from .service import main as service_main
+        return service_main()
+
+    client = BtEmuClient()
+    if not client.daemon_running():
+        print("The emulator daemon is not running.")
+        print("Start it with:  sudo systemctl start bt-controller-emulator")
+        print("(or re-run the installer: curl -fsSL https://raw.githubusercontent.com/"
+              "TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash)")
+        return 1
+
+    try:
+        if command == "status":
+            return _print_status(client)
+
+        if command == "stop":
+            client.stop()
+            print("Stopped.")
+            return 0
+
+        if command == "start":
+            if args.mode in ("pro", "hogp"):
+                mode = MODE_BLUETOOTH
+                profile = PROFILE_GAMEPAD if args.mode == "pro" else PROFILE_KEYBOARD
+                if args.profile:
+                    profile = args.profile
+            else:
+                mode = args.mode
+                profile = args.profile or (
+                    PROFILE_GAMEPAD if args.mode == MODE_BLUETOOTH else PROFILE_KEYBOARD
+                )
+            client.start(mode, profile)
+            print("Started. Use 'btemu status' for details.")
+            return 0
+
+        if command == "watch":
+            print("Watching status (Ctrl+C to exit)…")
+            import signal
+            from gi.repository import GLib
+
+            loop = GLib.MainLoop()
+            sub_id = client.subscribe_status(
+                lambda s: print(f"[{s}] {client.get_status().get(KEY_DETAIL, '')}")
+            )
+            signal.signal(signal.SIGINT, lambda sig, frame: loop.quit())
+            loop.run()
+            client.unsubscribe_status(sub_id)
+            return 0
+    except BtEmuError as e:
+        print(f"Error: {e}")
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

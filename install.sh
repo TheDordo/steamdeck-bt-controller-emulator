@@ -1,6 +1,11 @@
 #!/bin/bash
 # One-line installer for BT Controller Emulator
 # Usage: curl -fsSL https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh | bash
+#
+# Architecture: one root systemd daemon does all privileged work (BlueZ
+# registration, btmgmt, L2CAP PSMs, evdev, USB gadget). The GUI/CLI are
+# unprivileged D-Bus clients. Sudo is needed ONCE here at install time —
+# never at runtime, no group memberships, no sudoers, no setcap helpers.
 
 set -euo pipefail
 
@@ -8,6 +13,8 @@ REPO_URL="https://github.com/TheDordo/steamdeck-bt-controller-emulator.git"
 INSTALL_DIR="$HOME/steamdeck-bt-controller-emulator"
 INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/install.sh"
 UNINSTALL_SCRIPT_URL="https://raw.githubusercontent.com/TheDordo/steamdeck-bt-controller-emulator/main/uninstall.sh"
+
+SERVICE_NAME="bt-controller-emulator"
 
 echo "=== BT Controller Emulator - Installer ==="
 echo
@@ -17,8 +24,6 @@ if [ "$EUID" -eq 0 ]; then
     echo "Error: Don't run as root. Run as your regular user."
     exit 1
 fi
-
-CURRENT_USER="$USER"
 
 # Clone or update repository
 if [ -d "$INSTALL_DIR/.git" ]; then
@@ -39,12 +44,12 @@ else
 fi
 
 # Verify source files
-if [ ! -f "$INSTALL_DIR/src/hogp/gui.py" ]; then
+if [ ! -f "$INSTALL_DIR/src/hogp/service.py" ] || [ ! -f "$INSTALL_DIR/src/hogp/gui.py" ]; then
     echo "Error: Installation failed - source files not found"
     exit 1
 fi
 
-# Check Python dependencies
+# Check Python dependencies (GUI + daemon)
 echo
 echo "Checking dependencies..."
 DEPS_OK=true
@@ -60,53 +65,9 @@ if [ "$DEPS_OK" = false ]; then
 fi
 echo "✓ Dependencies OK"
 
-# Configure system permissions
-echo
-echo "=== Configuring Permissions ==="
-echo "This requires sudo to configure Bluetooth and input device access."
-echo
-
-GROUPS_CHANGED=false
-
-# Add to input group
-if ! groups "$CURRENT_USER" | grep -q "input"; then
-    echo "Adding user to 'input' group..."
-    sudo usermod -a -G input "$CURRENT_USER" || {
-        echo "✗ Failed to add user to 'input' group"
-        exit 1
-    }
-    echo "✓ Added to 'input' group (controller access)"
-    GROUPS_CHANGED=true
-else
-    echo "✓ Already in 'input' group"
-fi
-
-# Create bluetooth group if needed
-if ! getent group bluetooth > /dev/null 2>&1; then
-    echo "Creating 'bluetooth' group..."
-    sudo groupadd -r bluetooth || {
-        echo "✗ Failed to create 'bluetooth' group"
-        exit 1
-    }
-    echo "✓ Created 'bluetooth' group"
-fi
-
-# Add to bluetooth group
-if ! groups "$CURRENT_USER" | grep -q "bluetooth"; then
-    echo "Adding user to 'bluetooth' group..."
-    sudo usermod -a -G bluetooth "$CURRENT_USER" || {
-        echo "✗ Failed to add user to 'bluetooth' group"
-        exit 1
-    }
-    echo "✓ Added to 'bluetooth' group (Bluetooth GATT access)"
-    GROUPS_CHANGED=true
-else
-    echo "✓ Already in 'bluetooth' group"
-fi
-
 # Install D-Bus policy
 echo
-echo "Installing D-Bus policy..."
+echo "=== Installing D-Bus policy ==="
 sudo mkdir -p /etc/dbus-1/system.d
 sudo cp "$INSTALL_DIR/config/bt-controller-emulator-dbus.conf" /etc/dbus-1/system.d/bt-controller-emulator.conf || {
     echo "✗ Failed to install D-Bus policy"
@@ -114,50 +75,36 @@ sudo cp "$INSTALL_DIR/config/bt-controller-emulator-dbus.conf" /etc/dbus-1/syste
 }
 echo "✓ D-Bus policy installed"
 
-# Install sudoers rule — generated with the real install path so the bridge
-# and orphan-cleanup commands always match, no matter where the repo lives.
-echo "Installing sudoers rule..."
-sudo mkdir -p /etc/sudoers.d
-sudo tee /etc/sudoers.d/bt-controller-emulator > /dev/null << EOF
-# BT Controller Emulator — passwordless btmgmt + HID L2CAP bridge
-%bluetooth ALL=(root) NOPASSWD: /usr/bin/btmgmt
-%bluetooth ALL=(root) NOPASSWD: /usr/bin/python3 ${INSTALL_DIR}/scripts/hid-l2cap-bridge.py *
-%bluetooth ALL=(root) NOPASSWD: /usr/bin/pkill -f hid-l2cap-bridge*
+# Install + enable the systemd daemon
+echo
+echo "=== Installing systemd daemon ==="
+sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null << EOF
+# BT Controller Emulator — root daemon (all privileged work lives here)
+[Unit]
+Description=Steam Deck BT Controller Emulator daemon
+Documentation=https://github.com/TheDordo/steamdeck-bt-controller-emulator
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+WorkingDirectory=${INSTALL_DIR}/src
+ExecStart=/usr/bin/python3 -m hogp.service
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
 EOF
-sudo chmod 0440 /etc/sudoers.d/bt-controller-emulator
-sudo visudo -c > /dev/null 2>&1 || {
-    echo "✗ Failed to validate sudoers rule (visudo -c failed)"
+
+sudo systemctl daemon-reload || {
+    echo "✗ systemctl daemon-reload failed"
     exit 1
 }
 
-# L2CAP bridge helper: a setcap'd copy of the system Python so the bridge
-# can bind the well-known HID PSMs without sudo (kernel needs
-# CAP_NET_BIND_SERVICE). PYTHONHOME pins the standard library location.
-echo "Setting up the L2CAP bridge helper (no sudo needed at runtime)..."
-cp -L /usr/bin/python3 "$INSTALL_DIR/.bridge-python" 2>/dev/null || true
-chmod 755 "$INSTALL_DIR/.bridge-python" 2>/dev/null || true
-if sudo setcap cap_net_bind_service+eip "$INSTALL_DIR/.bridge-python" 2>/dev/null; then
-    if PYTHONHOME=/usr "$INSTALL_DIR/.bridge-python" -c \
-        "import socket; s=socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP); s.bind(('00:00:00:00:00:00', 0x11)); print('cap-bind-ok')" \
-        2>/dev/null | grep -q cap-bind-ok; then
-        echo "✓ Bridge helper ready (gamepad mode needs no sudo)"
-    else
-        echo "⚠ Bridge helper could not bind — the bridge will fall back to sudo"
-    fi
-else
-    echo "⚠ setcap failed (filesystem restrictions?) — the bridge will fall back to sudo"
-fi
-# Passwordless USB gadget setup/cleanup for this user (paths are install-specific)
-USB_SUDOERS="/etc/sudoers.d/bt-controller-emulator-usb-${CURRENT_USER}"
-sudo tee "$USB_SUDOERS" > /dev/null << EOF
-# BT Controller Emulator — USB gadget scripts for ${CURRENT_USER}
-${CURRENT_USER} ALL=(root) NOPASSWD: ${INSTALL_DIR}/scripts/setup-usb-gadget.sh
-${CURRENT_USER} ALL=(root) NOPASSWD: ${INSTALL_DIR}/scripts/cleanup-usb-gadget.sh
-EOF
-sudo chmod 0440 "$USB_SUDOERS"
-echo "✓ Sudoers rule installed"
-
-# udev: /dev/hidg* for input group
+# udev: /dev/hidg* permissions (USB gadget mode)
+echo
 echo "Installing udev rule for USB gadget HID nodes..."
 sudo cp "$INSTALL_DIR/config/99-steamdeck-hidg.rules" /etc/udev/rules.d/99-steamdeck-hidg.rules
 sudo udevadm control --reload-rules
@@ -170,6 +117,16 @@ sudo systemctl reload dbus 2>/dev/null || {
     echo "⚠ Warning: Could not reload D-Bus (may need reboot)"
 }
 echo "✓ D-Bus reloaded"
+
+# Start the daemon now (also enabled at boot)
+echo
+echo "Starting the daemon..."
+sudo systemctl enable ${SERVICE_NAME} 2>/dev/null || true
+if ! sudo systemctl restart ${SERVICE_NAME}; then
+    echo "✗ Could not start the daemon. Check: journalctl -u ${SERVICE_NAME} -n 50"
+    exit 1
+fi
+echo "✓ Daemon running (enabled at boot)"
 
 # Create desktop launcher
 echo
@@ -206,15 +163,7 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 echo
 echo "=== Installation Complete ==="
 echo
-echo "IMPORTANT: Log out and back in (or reboot) so 'input'/'bluetooth' groups and D-Bus policy apply."
-echo
-if [ "$GROUPS_CHANGED" = true ]; then
-    echo "⚠ New group memberships — logging out is required before Bluetooth/USB will work."
-fi
-echo
-echo "Prerequisites:"
-echo "  Bluetooth — use Desktop Mode; wait for 'Active - Discoverable'"
-echo "  Wired USB — BIOS: USB Dual Role = DRD; set password with: passwd"
+echo "No logout required — the daemon is already running."
 echo
 echo "Launch: Application menu → BT Controller Emulator   (or: $INSTALL_DIR/scripts/run-gui.sh)"
 echo
@@ -223,8 +172,12 @@ echo "  1. Open the app in Desktop Mode"
 echo "  2. Pick Bluetooth or Wired USB"
 echo "  3. Start Service → connect from the other device"
 echo
+echo "Bluetooth just works now: the daemon configures the adapter, registers"
+echo "with BlueZ, binds the HID channels and auto-recovers if bluetoothd restarts."
+echo "Wired USB needs the BIOS DRD setting + a data cable (one-time)."
+echo
 echo "Diagnostics:  $INSTALL_DIR/scripts/diagnose.sh"
-echo "USB check:    $INSTALL_DIR/scripts/check-usb-gadget.sh"
+echo "Logs:         journalctl -u $SERVICE_NAME -f"
 echo
 echo "Update:       curl -fsSL $INSTALL_SCRIPT_URL | bash"
 echo "Uninstall:    curl -fsSL $UNINSTALL_SCRIPT_URL | bash"

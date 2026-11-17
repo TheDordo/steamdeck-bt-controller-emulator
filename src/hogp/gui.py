@@ -1,55 +1,34 @@
 #!/usr/bin/env python3
 """
-GTK GUI for HoG Peripheral - Steam Deck friendly interface.
+GTK4 GUI for the BT Controller Emulator (unprivileged client).
 
-Shows controller state, connection status, and input visualization.
+The GUI talks only to the root daemon (com.steamdeck.btemu) over D-Bus.
+It owns no BlueZ registrations, no btmgmt calls, no L2CAP sockets and no
+/dev/input access — Start/Stop and every HID report go through the daemon.
 """
 
 import logging
-import sys
 import os
-import threading
+import sys
 import time
-from typing import Dict, Optional
 
 import gi
 
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gtk, GLib, Gdk
+from gi.repository import Gtk, GLib
 
-# Add parent directory to path for imports
+# Allow running as `python3 -m src.hogp.gui` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hogp.bluez import (
-    get_system_bus,
-    find_adapter_path,
-    ensure_adapter_powered_and_discoverable,
-    configure_adapter_for_hog_peripheral,
-    register_application_async,
-    unregister_application_async,
-    unregister_application_sync,
-    register_advertisement_async,
-    unregister_advertisement_async,
-    unregister_advertisement_sync,
-    set_static_ble_address,
-    get_adapter_index,
-    get_primary_connected_device,
-    complete_bond_with_central,
-    set_adapter_alias,
-    reset_adapter_to_default_state,
-    configure_adapter_for_pro_controller,
-    get_adapter_address,
-    register_hid_sdp_profile,
-    unregister_hid_sdp_profile,
-    get_last_sdp_error,
-    acquire_app_bus_name,
+from hogp.api import (
+    STATUS_STOPPED, STATUS_STARTING, STATUS_STOPPING, STATUS_ACTIVE,
+    STATUS_ERROR, STATUS_DEGRADED,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD,
+    KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
+    KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_DEVICE_NAME, KEY_DEVICE_ADDR,
+    KEY_READY, KEY_KB_CAPABLE, KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
 )
-from hogp.gatt_app import GattApplication
-from hogp.adv import Advertisement
-from hogp.input_handler import InputHandler
-from hogp.usb_gadget import USBGadgetHID
-from hogp.pairing_agent import PairingAgent
-from hogp.pro_controller import ProControllerEmulator, SDP_RECORD_XML, PRO_NAME
+from hogp.client import BtEmuClient, BtEmuError
 
 logger = logging.getLogger(__name__)
 
@@ -82,24 +61,32 @@ MOD_LSHIFT = 0x02
 MOD_LALT = 0x04
 MOD_LGUI = 0x08
 
-
 _BTN_NAMES = (
     "A", "B", "X", "Y", "LB", "RB", "Back", "Start", "Guide", "L3", "R3",
 )
 
+POLL_INTERVAL_MS = 100        # status/visualizer refresh (local D-Bus call)
+START_TIMEOUT_S = 35          # surface diagnostics instead of hanging
+
+
+def _kb_ready(status) -> bool:
+    """Keyboard/mouse reports are accepted by the active engine."""
+    return bool(status) and bool(status.get(KEY_KB_CAPABLE)) and bool(status.get(KEY_READY))
+
 
 class ControllerVisualizer(Gtk.Box):
     """Live view of forwarded gamepad state + Deck-only Home/QAM shortcuts."""
-    
-    def __init__(self, hid_output_getter):
+
+    def __init__(self, send_key_cb, get_status):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.set_margin_top(8)
         self.set_margin_bottom(8)
         self.set_margin_start(12)
         self.set_margin_end(12)
-        
-        self.hid_output_getter = hid_output_getter
-        self._btn_labels: list[Gtk.Label] = []
+
+        self.send_key_cb = send_key_cb
+        self.get_status = get_status
+        self._btn_labels = []
 
         title = Gtk.Label()
         title.set_markup("<big><b>Physical input (evdev → HID)</b></big>")
@@ -142,60 +129,38 @@ class ControllerVisualizer(Gtk.Box):
         hint.set_wrap(True)
         hint.set_margin_top(8)
         self.append(hint)
-        
+
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         button_box.set_halign(Gtk.Align.CENTER)
         button_box.set_margin_top(12)
-        
+
         self.home_button = Gtk.Button(label="⌂ Home")
         self.home_button.set_size_request(150, 60)
         self.home_button.connect("clicked", self._send_home)
         button_box.append(self.home_button)
-        
+
         self.qam_button = Gtk.Button(label="⋯ QAM")
         self.qam_button.set_size_request(150, 60)
         self.qam_button.connect("clicked", self._send_qam)
         button_box.append(self.qam_button)
-        
+
         self.append(button_box)
 
     def set_input_source(self, text: str) -> None:
         self._input_label.set_label(f"Input: {text}")
-    
+
     def _send_home(self, button=None):
         """Send Ctrl+1 for Home button."""
-        hid_output = self.hid_output_getter()
-        logger.info(f"Home button clicked. hid_output={hid_output}")
-        if hid_output:
-            if hasattr(hid_output, 'send_key'):
-                hid_output.send_key(0x1e, MOD_LCTRL, hold_ms=200)
-                logger.info("Home: Sent Ctrl+1 press")
-            elif hasattr(hid_output, 'notifying') and hid_output.notifying:
-                hid_output.send_key(0x1e, MOD_LCTRL, hold_ms=200)
-                logger.info("Home: Sent Ctrl+1 press (wired)")
-    
+        if _kb_ready(self.get_status()):
+            self.send_key_cb(0x1e, MOD_LCTRL, 200)
+            logger.info("Home: Sent Ctrl+1 press")
+
     def _send_qam(self, button=None):
         """Send Ctrl+2 for QAM button."""
-        hid_output = self.hid_output_getter()
-        logger.info(f"QAM button clicked. hid_output={hid_output}")
-        if hid_output:
-            if hasattr(hid_output, 'send_key'):
-                hid_output.send_key(0x1f, MOD_LCTRL, hold_ms=200)
-                logger.info("QAM: Sent Ctrl+2 press")
-            elif hasattr(hid_output, 'notifying') and hid_output.notifying:
-                hid_output.send_key(0x1f, MOD_LCTRL, hold_ms=200)
-                logger.info("QAM: Sent Ctrl+2 press (wired)")
-    
-    def _release_keys(self):
-        """Release all keyboard keys."""
-        hid_output = self.hid_output_getter()
-        if hid_output and hasattr(hid_output, '_send_keyboard_notification'):
-            hid_output._kbd_modifiers = 0
-            hid_output._kbd_keys = [0, 0, 0, 0, 0, 0]
-            hid_output._send_keyboard_notification()
-            logger.info("Released keyboard keys")
-        return False  # Don't repeat
-        
+        if _kb_ready(self.get_status()):
+            self.send_key_cb(0x1f, MOD_LCTRL, 200)
+            logger.info("QAM: Sent Ctrl+2 press")
+
     def update_state(self, buttons, axes, triggers, hat):
         for i, lbl in enumerate(self._btn_labels):
             pressed = bool(buttons & (1 << i))
@@ -219,19 +184,20 @@ class ControllerVisualizer(Gtk.Box):
 
 class VirtualKeyboard(Gtk.Box):
     """Virtual keyboard widget that sends HID keyboard reports."""
-    
-    def __init__(self, gatt_app_getter):
+
+    def __init__(self, send_key_cb, get_status):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.set_margin_top(6)
         self.set_margin_bottom(6)
         self.set_margin_start(6)
         self.set_margin_end(6)
-        
-        self.gatt_app_getter = gatt_app_getter
-        
+
+        self.send_key_cb = send_key_cb
+        self.get_status = get_status
+
         # Common keys
         keys_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        
+
         # Row 0: F keys
         row0 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row0.set_homogeneous(True)
@@ -239,7 +205,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(f'F{i}')
             row0.append(btn)
         keys_box.append(row0)
-        
+
         # Row 1: Numbers
         row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row1.set_homogeneous(True)
@@ -247,7 +213,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row1.append(btn)
         keys_box.append(row1)
-        
+
         # Row 2: QWERTY
         row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row2.set_homogeneous(True)
@@ -255,7 +221,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row2.append(btn)
         keys_box.append(row2)
-        
+
         # Row 3: ASDFGH
         row3 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row3.set_homogeneous(True)
@@ -263,7 +229,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row3.append(btn)
         keys_box.append(row3)
-        
+
         # Row 4: ZXCVBN
         row4 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row4.set_homogeneous(True)
@@ -271,7 +237,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row4.append(btn)
         keys_box.append(row4)
-        
+
         # Row 5: Special keys
         row5 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row5.set_homogeneous(True)
@@ -279,7 +245,7 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row5.append(btn)
         keys_box.append(row5)
-        
+
         # Row 6: Arrow keys
         row6 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         row6.set_homogeneous(True)
@@ -287,19 +253,19 @@ class VirtualKeyboard(Gtk.Box):
             btn = self._create_key_button(key)
             row6.append(btn)
         keys_box.append(row6)
-        
+
         self.append(keys_box)
-        
+
         # Shortcut keys section
         shortcuts_label = Gtk.Label(label="Shortcuts")
         shortcuts_label.set_margin_top(10)
         shortcuts_label.set_markup("<b>Shortcuts</b>")
         self.append(shortcuts_label)
-        
+
         # First row: Copy, Paste, Cut, Select All, Super
         shortcuts_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         shortcuts_row1.set_halign(Gtk.Align.CENTER)
-        
+
         shortcuts1 = [
             ('Copy', 'c', MOD_LCTRL),
             ('Paste', 'v', MOD_LCTRL),
@@ -307,7 +273,7 @@ class VirtualKeyboard(Gtk.Box):
             ('Sel All', 'a', MOD_LCTRL),
             ('Super', None, MOD_LGUI),
         ]
-        
+
         for label, key, modifier in shortcuts1:
             btn = Gtk.Button(label=label)
             if key:
@@ -316,172 +282,156 @@ class VirtualKeyboard(Gtk.Box):
                 # Super key - just press modifier
                 btn.connect("clicked", lambda b, m=modifier: self._send_modifier_only(m))
             shortcuts_row1.append(btn)
-        
+
         self.append(shortcuts_row1)
-    
+
     def _create_key_button(self, key):
         """Create a button for a keyboard key."""
         label = key.upper() if len(key) == 1 else key
         btn = Gtk.Button(label=label)
         btn.connect("clicked", lambda b: self._send_key(key))
         return btn
-    
+
     def _send_key(self, key):
         """Send a single key press."""
-        hid_output = self.gatt_app_getter()
-        if not hid_output:
+        if not _kb_ready(self.get_status()):
             return
-        # Check if we can send (Bluetooth needs notifying, Wired is always ready)
-        if hasattr(hid_output, 'notifying') and not hid_output.notifying:
-            return
-        
         key_code = HID_KEY_CODES.get(key) or HID_KEY_CODES.get(key.lower())
         if key_code:
-            hid_output.send_key(key_code, 0, hold_ms=140)
+            self.send_key_cb(key_code, 0, 140)
         else:
             logger.warning(f"No HID code for key {key!r}")
-    
+
     def _send_shortcut(self, key, modifier):
         """Send a keyboard shortcut (key + modifier)."""
-        hid_output = self.gatt_app_getter()
-        if not hid_output:
+        if not _kb_ready(self.get_status()):
             return
-        if hasattr(hid_output, 'notifying') and not hid_output.notifying:
-            return
-        
         key_code = HID_KEY_CODES.get(key) or HID_KEY_CODES.get(key.lower())
         if key_code:
-            hid_output.send_key(key_code, modifier, hold_ms=200)
-    
+            self.send_key_cb(key_code, modifier, 200)
+
     def _send_modifier_only(self, modifier):
         """Send just a modifier key press (like Super key)."""
-        hid_output = self.gatt_app_getter()
-        if not hid_output:
+        if not _kb_ready(self.get_status()):
             return
-        if hasattr(hid_output, 'notifying') and not hid_output.notifying:
-            return
-        
-        # Send modifier with no key
-        hid_output.send_key(0, modifier, hold_ms=120)
+        self.send_key_cb(0, modifier, 120)
 
 
 class VirtualMediaControls(Gtk.Box):
     """Virtual media controls widget that sends HID keyboard media keys."""
-    
-    def __init__(self, gatt_app_getter):
+
+    def __init__(self, send_key_cb, get_status):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.set_margin_top(50)
         self.set_margin_bottom(50)
         self.set_margin_start(50)
         self.set_margin_end(50)
-        
-        self.gatt_app_getter = gatt_app_getter
-        
+
+        self.send_key_cb = send_key_cb
+        self.get_status = get_status
+
         # Title
         title_label = Gtk.Label()
         title_label.set_markup("<big><b>Media Controls</b></big>")
         self.append(title_label)
-        
+
         # Volume controls
         volume_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         volume_box.set_halign(Gtk.Align.CENTER)
         volume_box.set_margin_top(20)
-        
+
         vol_down_btn = Gtk.Button(label="🔉 Vol Down")
         vol_down_btn.set_size_request(150, 60)
         vol_down_btn.connect("clicked", lambda b: self._send_media_key('VolDown'))
         volume_box.append(vol_down_btn)
-        
+
         mute_btn = Gtk.Button(label="🔇 Mute")
         mute_btn.set_size_request(150, 60)
         mute_btn.connect("clicked", lambda b: self._send_media_key('Mute'))
         volume_box.append(mute_btn)
-        
+
         vol_up_btn = Gtk.Button(label="🔊 Vol Up")
         vol_up_btn.set_size_request(150, 60)
         vol_up_btn.connect("clicked", lambda b: self._send_media_key('VolUp'))
         volume_box.append(vol_up_btn)
-        
+
         self.append(volume_box)
-        
+
         # Playback controls
         playback_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         playback_box.set_halign(Gtk.Align.CENTER)
         playback_box.set_margin_top(20)
-        
+
         prev_btn = Gtk.Button(label="⏮ Previous")
         prev_btn.set_size_request(150, 60)
         prev_btn.connect("clicked", lambda b: self._send_media_key('PrevTrack'))
         playback_box.append(prev_btn)
-        
+
         play_pause_btn = Gtk.Button(label="⏯ Play/Pause")
         play_pause_btn.set_size_request(150, 60)
         play_pause_btn.connect("clicked", lambda b: self._send_media_key('PlayPause'))
         playback_box.append(play_pause_btn)
-        
+
         stop_btn = Gtk.Button(label="⏹ Stop")
         stop_btn.set_size_request(150, 60)
         stop_btn.connect("clicked", lambda b: self._send_media_key('Stop'))
         playback_box.append(stop_btn)
-        
+
         next_btn = Gtk.Button(label="⏭ Next")
         next_btn.set_size_request(150, 60)
         next_btn.connect("clicked", lambda b: self._send_media_key('NextTrack'))
         playback_box.append(next_btn)
-        
+
         self.append(playback_box)
-    
+
     def _send_media_key(self, key):
         """Send a media key press."""
-        hid_output = self.gatt_app_getter()
-        if not hid_output:
+        if not _kb_ready(self.get_status()):
             return
-        if hasattr(hid_output, 'notifying') and not hid_output.notifying:
-            return
-        
         key_code = HID_KEY_CODES.get(key)
         if key_code:
-            hid_output.send_key(key_code, 0, hold_ms=180)
+            self.send_key_cb(key_code, 0, 180)
 
 
 class VirtualTrackpad(Gtk.Box):
     """Virtual trackpad widget that sends HID mouse reports."""
-    
-    def __init__(self, gatt_app_getter):
+
+    def __init__(self, send_mouse_cb, get_status):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.set_margin_top(6)
         self.set_margin_bottom(6)
         self.set_margin_start(6)
         self.set_margin_end(6)
-        
-        self.gatt_app_getter = gatt_app_getter
-        
+
+        self.send_mouse_cb = send_mouse_cb
+        self.get_status = get_status
+
         # Info label
         info = Gtk.Label(label="Drag to move cursor • Tap to click • Double-tap & hold to drag • Scroll on right side")
         self.append(info)
-        
+
         # Main horizontal box for trackpad + scroll wheel
         trackpad_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        
+
         # Trackpad area (left side)
         self.trackpad = Gtk.DrawingArea()
         self.trackpad.set_size_request(500, 300)
         self.trackpad.set_hexpand(True)
         self.trackpad.set_vexpand(True)
         self.trackpad.set_draw_func(self._draw_trackpad, None)
-        
+
         # Add drag controller for mouse movement
         drag_controller = Gtk.GestureDrag()
         drag_controller.connect("drag-update", self._on_drag_update)
         drag_controller.connect("drag-end", self._on_drag_end)
         self.trackpad.add_controller(drag_controller)
-        
+
         # Add click controller for tap-to-click and double-tap detection
         click_controller = Gtk.GestureClick()
         click_controller.connect("released", self._on_tap_click)
         click_controller.connect("pressed", self._on_tap_press)
         self.trackpad.add_controller(click_controller)
-        
+
         # Track last position for delta calculation
         self._last_x = 0
         self._last_y = 0
@@ -489,74 +439,74 @@ class VirtualTrackpad(Gtk.Box):
         self._drag_button_held = False  # Track if we're in drag mode (button held)
         self._last_tap_time = 0
         self._tap_count = 0
-        
+
         trackpad_frame = Gtk.Frame()
         trackpad_frame.set_child(self.trackpad)
         trackpad_container.append(trackpad_frame)
-        
+
         # Scroll wheel area (right side)
         self.scroll_area = Gtk.DrawingArea()
         self.scroll_area.set_size_request(80, 300)
         self.scroll_area.set_vexpand(True)
         self.scroll_area.set_draw_func(self._draw_scroll_area, None)
-        
+
         # Add drag controller for scroll wheel
         scroll_drag_controller = Gtk.GestureDrag()
         scroll_drag_controller.connect("drag-update", self._on_scroll_drag)
         scroll_drag_controller.connect("drag-end", self._on_scroll_end)
         self.scroll_area.add_controller(scroll_drag_controller)
-        
+
         self._scroll_last_y = 0
         self._is_scrolling = False
-        
+
         scroll_frame = Gtk.Frame()
         scroll_frame.set_child(self.scroll_area)
         trackpad_container.append(scroll_frame)
-        
+
         self.append(trackpad_container)
-        
+
         # Mouse buttons
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         button_box.set_halign(Gtk.Align.CENTER)
-        
+
         left_btn = Gtk.Button(label="Left Click")
         left_btn.connect("clicked", lambda b: self._send_click(0x01))
         button_box.append(left_btn)
-        
+
         right_btn = Gtk.Button(label="Right Click")
         right_btn.connect("clicked", lambda b: self._send_click(0x02))
         button_box.append(right_btn)
-        
+
         middle_btn = Gtk.Button(label="Middle Click")
         middle_btn.connect("clicked", lambda b: self._send_click(0x04))
         button_box.append(middle_btn)
-        
+
         self.append(button_box)
-        
+
         # Sensitivity slider
         sens_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         sens_label = Gtk.Label(label="Sensitivity:")
         sens_box.append(sens_label)
-        
+
         self.sensitivity = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 5.0, 0.1)
         self.sensitivity.set_value(1.0)
         self.sensitivity.set_hexpand(True)
         sens_box.append(self.sensitivity)
-        
+
         self.append(sens_box)
-    
+
     def _draw_trackpad(self, area, cr, width, height, user_data):
         """Draw the trackpad area."""
         # Background
         cr.set_source_rgb(0.2, 0.2, 0.25)
         cr.paint()
-        
+
         # Border
         cr.set_source_rgb(0.4, 0.4, 0.5)
         cr.set_line_width(2)
         cr.rectangle(5, 5, width - 10, height - 10)
         cr.stroke()
-        
+
         # Instructions
         cr.set_source_rgb(0.6, 0.6, 0.7)
         cr.select_font_face("Sans", 0, 0)
@@ -565,7 +515,7 @@ class VirtualTrackpad(Gtk.Box):
         extents = cr.text_extents(text)
         cr.move_to(width/2 - extents.width/2, height/2)
         cr.show_text(text)
-    
+
     def _on_drag_update(self, gesture, offset_x, offset_y):
         """Handle drag motion."""
         if not self._is_dragging:
@@ -574,75 +524,71 @@ class VirtualTrackpad(Gtk.Box):
             self._last_x = start_point.x
             self._last_y = start_point.y
             return
-        
+
         # Get current position
         start_point = gesture.get_start_point()
         current_x = start_point.x + offset_x
         current_y = start_point.y + offset_y
-        
+
         # Calculate delta
         dx = int((current_x - self._last_x) * self.sensitivity.get_value())
         dy = int((current_y - self._last_y) * self.sensitivity.get_value())
-        
+
         # Update last position
         self._last_x = current_x
         self._last_y = current_y
-        
+
         # Send mouse movement
         if dx != 0 or dy != 0:
-            gatt_app = self.gatt_app_getter()
-            if gatt_app and gatt_app.notifying:
+            if _kb_ready(self.get_status()):
                 # If in drag mode, keep button pressed while moving
                 button_state = 0x01 if self._drag_button_held else 0
-                gatt_app.send_mouse_movement(dx, dy, button_state, 0)
-    
+                self.send_mouse_cb(dx, dy, button_state, 0)
+
     def _on_drag_end(self, gesture, offset_x, offset_y):
         """Handle drag end."""
         self._is_dragging = False
         # If we were in drag mode, release the button
         if self._drag_button_held:
             self._drag_button_held = False
-            gatt_app = self.gatt_app_getter()
-            if gatt_app and gatt_app.notifying:
-                gatt_app.send_mouse_movement(0, 0, 0, 0)
-    
+            if _kb_ready(self.get_status()):
+                self.send_mouse_cb(0, 0, 0, 0)
+
     def _on_tap_press(self, gesture, n_press, x, y):
         """Handle tap press - detect double-tap and hold."""
-        import time
         current_time = time.time()
-        
+
         # Check if this is a double-tap (within 500ms)
         if n_press == 2 or (current_time - self._last_tap_time < 0.5 and self._tap_count == 1):
             # This is the second tap - enter drag mode
             self._drag_button_held = True
             self._tap_count = 0
             # Press and hold the left button
-            gatt_app = self.gatt_app_getter()
-            if gatt_app and gatt_app.notifying:
-                gatt_app.send_mouse_movement(0, 0, 0x01, 0)
+            if _kb_ready(self.get_status()):
+                self.send_mouse_cb(0, 0, 0x01, 0)
         else:
             self._tap_count = 1
-        
+
         self._last_tap_time = current_time
-    
+
     def _on_tap_click(self, gesture, n_press, x, y):
         """Handle tap to click (left click)."""
         # Only trigger single click if we didn't drag and not in drag mode
         if not self._is_dragging and not self._drag_button_held and n_press == 1:
             self._send_click(0x01)  # Left click
-    
+
     def _draw_scroll_area(self, area, cr, width, height, user_data):
         """Draw the scroll wheel area."""
         # Background
         cr.set_source_rgb(0.15, 0.15, 0.20)
         cr.paint()
-        
+
         # Border
         cr.set_source_rgb(0.4, 0.4, 0.5)
         cr.set_line_width(2)
         cr.rectangle(2, 5, width - 4, height - 10)
         cr.stroke()
-        
+
         # Up arrow
         cr.set_source_rgb(0.6, 0.6, 0.7)
         cr.move_to(width/2, 30)
@@ -650,14 +596,14 @@ class VirtualTrackpad(Gtk.Box):
         cr.line_to(width/2 + 10, 45)
         cr.close_path()
         cr.fill()
-        
+
         # Down arrow
         cr.move_to(width/2, height - 30)
         cr.line_to(width/2 - 10, height - 45)
         cr.line_to(width/2 + 10, height - 45)
         cr.close_path()
         cr.fill()
-        
+
         # Text
         cr.select_font_face("Sans", 0, 1)
         cr.set_font_size(11)
@@ -665,7 +611,7 @@ class VirtualTrackpad(Gtk.Box):
         extents = cr.text_extents(text)
         cr.move_to(width/2 - extents.width/2, height/2 + extents.height/2)
         cr.show_text(text)
-    
+
     def _on_scroll_drag(self, gesture, offset_x, offset_y):
         """Handle scroll wheel drag."""
         if not self._is_scrolling:
@@ -673,82 +619,60 @@ class VirtualTrackpad(Gtk.Box):
             start_point = gesture.get_start_point()
             self._scroll_last_y = start_point.y
             return
-        
+
         # Get current position
         start_point = gesture.get_start_point()
         current_y = start_point.y + offset_y
-        
+
         # Calculate scroll delta
         dy = current_y - self._scroll_last_y
-        
+
         # Send scroll if moved enough (every 10 pixels)
         if abs(dy) >= 10:
             scroll_amount = int(dy / 10)
-            gatt_app = self.gatt_app_getter()
-            if gatt_app and gatt_app.notifying:
+            if _kb_ready(self.get_status()):
                 # Negative scroll for down, positive for up
-                gatt_app.send_mouse_movement(0, 0, 0, -scroll_amount)
+                self.send_mouse_cb(0, 0, 0, -scroll_amount)
             self._scroll_last_y = current_y
-    
+
     def _on_scroll_end(self, gesture, offset_x, offset_y):
         """Handle scroll drag end."""
         self._is_scrolling = False
-    
+
     def _send_click(self, button_mask):
         """Send a mouse button click."""
-        gatt_app = self.gatt_app_getter()
-        if not gatt_app or not gatt_app.notifying:
+        if not _kb_ready(self.get_status()):
             return
-        
+
         # Press
-        gatt_app.send_mouse_movement(0, 0, button_mask, 0)
+        self.send_mouse_cb(0, 0, button_mask, 0)
         # Release after delay
-        GLib.timeout_add(50, lambda: gatt_app.send_mouse_movement(0, 0, 0, 0) if gatt_app.notifying else None)
+        GLib.timeout_add(50, lambda: self.send_mouse_cb(0, 0, 0, 0) if _kb_ready(self.get_status()) else None)
 
 
 class HoGPeripheralGUI(Gtk.ApplicationWindow):
-    """Main GUI window."""
-    
+    """Main GUI window — thin client of the emulator daemon."""
+
     def __init__(self, app):
         super().__init__(application=app, title="BT Controller Emulator")
         # Steam Deck optimized size (1280x800 native resolution, use ~80% for window)
         self.set_default_size(1024, 650)
         # Allow window resizing
         self.set_resizable(True)
-        
-        # State
-        self._bus = None
-        self._adapter_path = None
-        self._gatt_app = None
-        self._advertisement = None
-        self._pairing_agent = None
-        self._input_handler = None
-        self._main_loop = None
-        self._registered = False
-        self._running = False
-        self._update_timeout_id = None
-        self._mode = "bluetooth"
-        self._profile = "gamepad"  # "gamepad" | "keyboard"
-        self._pro_controller = None
-        self._pro_sdp_registered = False
-        self._start_watchdog_id = None
-        self._start_error_shown = False
-        self._bond_in_progress = False
-        self._bond_attempted_for: Optional[str] = None
-        self._last_bond_attempt_at = 0.0
-        self._last_bond_error: Optional[str] = None
-        self._shutting_down = False
-        self._stop_in_progress = False
-        self._input_coalesce_id: Optional[int] = None
-        self._input_coalesce_ms = 4  # stick/trigger batching only (latency)
-        self._pending_buttons: Dict[int, bool] = {}
-        self._pending_axes: Dict[int, int] = {}
-        self._pending_triggers: Dict[int, int] = {}
-        self._pending_hat: Optional[int] = None
-        
+
+        # Daemon client + cached status
+        self.client = BtEmuClient()
+        self._status = None
+        self._poll_id = None
+        self._start_deadline = 0.0
+        self._local_error = ""
+
         # Build UI
         self._build_ui()
-        
+
+        # Status polling (also drives the visualizer)
+        self._poll_id = GLib.timeout_add(POLL_INTERVAL_MS, self._poll_status)
+
     def _build_ui(self):
         """Build the user interface."""
         # Main box
@@ -757,31 +681,31 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         main_box.set_margin_bottom(6)
         main_box.set_margin_start(6)
         main_box.set_margin_end(6)
-        
+
         # Header bar
         header = Gtk.HeaderBar()
         header.set_title_widget(Gtk.Label(label="BT Controller Emulator"))
         self.set_titlebar(header)
-        
+
         # Mode selection
         mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         mode_box.set_halign(Gtk.Align.CENTER)
-        
+
         mode_label = Gtk.Label(label="Mode:")
         mode_box.append(mode_label)
-        
+
         self.bluetooth_radio = Gtk.CheckButton(label="Bluetooth")
         self.bluetooth_radio.set_active(True)
         self.bluetooth_radio.connect("toggled", self._on_bluetooth_toggled)
         mode_box.append(self.bluetooth_radio)
-        
+
         self.wired_radio = Gtk.CheckButton(label="Wired USB")
         self.wired_radio.set_group(self.bluetooth_radio)
         self.wired_radio.connect("toggled", self._on_wired_toggled)
         mode_box.append(self.wired_radio)
-        
+
         main_box.append(mode_box)
-        
+
         # Device profile (gamepad identity vs keyboard-only)
         profile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         profile_box.set_halign(Gtk.Align.CENTER)
@@ -795,873 +719,271 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.keyboard_radio.connect("toggled", self._on_keyboard_toggled)
         profile_box.append(self.keyboard_radio)
         main_box.append(profile_box)
-        
+
         # Status box
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        
+
         self.status_label = Gtk.Label(label="Status: Stopped")
         self.status_label.set_markup("<big><b>Status: Stopped</b></big>")
         status_box.append(self.status_label)
-        
+
         self.connection_label = Gtk.Label(label="Not connected")
         status_box.append(self.connection_label)
-        
+
         self.device_info_label = Gtk.Label(label="")
         self.device_info_label.set_wrap(True)
         status_box.append(self.device_info_label)
-        
+
         main_box.append(status_box)
-        
+
         # Tabbed interface
         notebook = Gtk.Notebook()
         notebook.set_vexpand(True)
-        
-        # Helper to get active HID output (either Bluetooth GATT or USB Gadget)
-        def get_hid_output():
-            return self._gatt_app or self._usb_gadget or self._pro_controller
-        
+
         # Controller tab
-        self.visualizer = ControllerVisualizer(get_hid_output)
+        self.visualizer = ControllerVisualizer(self._send_key_via_daemon, self._get_cached_status)
         notebook.append_page(self.visualizer, Gtk.Label(label="Controller"))
-        
+
         # Keyboard tab
-        self.keyboard = VirtualKeyboard(get_hid_output)
+        self.keyboard = VirtualKeyboard(self._send_key_via_daemon, self._get_cached_status)
         notebook.append_page(self.keyboard, Gtk.Label(label="Keyboard"))
-        
+
         # Media controls tab
-        self.media = VirtualMediaControls(get_hid_output)
+        self.media = VirtualMediaControls(self._send_key_via_daemon, self._get_cached_status)
         notebook.append_page(self.media, Gtk.Label(label="Media"))
-        
+
         # Trackpad tab
-        self.trackpad = VirtualTrackpad(get_hid_output)
+        self.trackpad = VirtualTrackpad(self._send_mouse_via_daemon, self._get_cached_status)
         notebook.append_page(self.trackpad, Gtk.Label(label="Trackpad"))
-        
+
         main_box.append(notebook)
-        
+
         # Control buttons
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         button_box.set_halign(Gtk.Align.CENTER)
-        
+
         self.start_button = Gtk.Button(label="Start Service")
         self.start_button.connect("clicked", self._on_start_clicked)
         button_box.append(self.start_button)
-        
+
         self.stop_button = Gtk.Button(label="Stop Service")
         self.stop_button.set_sensitive(False)
         self.stop_button.connect("clicked", self._on_stop_clicked)
         button_box.append(self.stop_button)
-        
+
         main_box.append(button_box)
-        
+
         self.set_child(main_box)
-    
+
+    # -------------------------------------------------------- mode/profile
+
     def _on_bluetooth_toggled(self, button):
-        """Handle Bluetooth mode selection."""
-        if button.get_active() and not self._running:
-            self._mode = "bluetooth"
+        if button.get_active() and self._radios_enabled():
             logger.info("Mode: Bluetooth")
-    
+
     def _on_wired_toggled(self, button):
-        """Handle Wired mode selection."""
-        if button.get_active() and not self._running:
-            self._mode = "wired"
+        if button.get_active() and self._radios_enabled():
             logger.info("Mode: Wired USB")
 
     def _on_gamepad_toggled(self, button):
-        """Handle Gamepad profile selection."""
-        if button.get_active() and not self._running:
-            self._profile = "gamepad"
+        if button.get_active() and self._radios_enabled():
             logger.info("Profile: Gamepad")
 
     def _on_keyboard_toggled(self, button):
-        """Handle Keyboard profile selection."""
-        if button.get_active() and not self._running:
-            self._profile = "keyboard"
+        if button.get_active() and self._radios_enabled():
             logger.info("Profile: Keyboard")
-    
+
+    def _selected_mode(self) -> str:
+        return MODE_BLUETOOTH if self.bluetooth_radio.get_active() else MODE_USB
+
+    def _selected_profile(self) -> str:
+        return PROFILE_GAMEPAD if self.gamepad_radio.get_active() else PROFILE_KEYBOARD
+
+    # ------------------------------------------------------------ callbacks
+
+    def _get_cached_status(self):
+        return self._status
+
+    def _send_key_via_daemon(self, code, modifiers, hold_ms):
+        try:
+            self.client.send_key(code, modifiers, hold_ms)
+        except BtEmuError as e:
+            logger.warning("send_key: %s", e)
+
+    def _send_mouse_via_daemon(self, dx, dy, buttons, wheel):
+        try:
+            self.client.send_mouse(dx, dy, buttons, wheel)
+        except BtEmuError as e:
+            logger.warning("send_mouse: %s", e)
+
     def _on_start_clicked(self, button):
-        """Start the controller service."""
+        """Ask the daemon to start a session; the poll loop renders progress."""
         self.start_button.set_sensitive(False)
-        self.bluetooth_radio.set_sensitive(False)
-        self.wired_radio.set_sensitive(False)
-        self.gamepad_radio.set_sensitive(False)
-        self.keyboard_radio.set_sensitive(False)
-        self._start_error_shown = False
+        self._set_controls_locked(True)
+        self._local_error = ""
+        self._start_deadline = time.monotonic() + START_TIMEOUT_S
         self.status_label.set_markup("<big><b>Status: Starting...</b></big>")
-        # Watchdog: surface diagnostics instead of hanging on "Starting..."
-        self._start_watchdog_id = GLib.timeout_add(35000, self._on_start_watchdog)
-        
-        if self._mode == "bluetooth" and self._profile == "gamepad":
-            # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
-            threading.Thread(
-                target=self._prepare_pro_controller_adapter,
-                daemon=True,
-            ).start()
-        elif self._mode == "bluetooth":
-            # btmgmt runs subprocess/sudo; all D-Bus must stay on the GTK main thread
-            threading.Thread(
-                target=self._prepare_bluetooth_adapter,
-                daemon=True,
-            ).start()
-        else:
-            threading.Thread(target=self._start_wired_service, daemon=True).start()
-    
-    def _on_start_watchdog(self):
-        """Surface diagnostics when a start step never completes."""
-        self._start_watchdog_id = None
-        if self._running or self._shutting_down:
-            return False
-        if self._start_error_shown:
-            return False  # the real error is already on screen
-        self.status_label.set_markup(
-            "<big><b>Status: Starting timed out — run scripts/view-logs.sh</b></big>"
-        )
-        self.connection_label.set_label(
-            "Check Konsole/journal for the stalled step (Pro Controller start: ...)"
-        )
-        return False
+        self.connection_label.set_label("Waiting for connection...")
+        self.device_info_label.set_label("")
+        try:
+            self.client.start(self._selected_mode(), self._selected_profile())
+        except BtEmuError as e:
+            self._local_error = str(e)
+            self._set_controls_locked(False)
+            self.status_label.set_markup(
+                f"<big><b>Error: {GLib.markup_escape_text(self._local_error)}</b></big>"
+            )
 
     def _on_stop_clicked(self, button):
-        """Stop the controller service."""
-        if self._stop_in_progress:
-            return
-        self._stop_in_progress = True
+        """Ask the daemon to stop the session."""
         self.stop_button.set_sensitive(False)
-        self.status_label.set_markup("<big><b>Status: Stopping...</b></big>")
-        GLib.idle_add(self._stop_service_begin)
-    
-    def _prepare_pro_controller_adapter(self):
-        """Configure BR/EDR adapter for Pro Controller mode (blocking)."""
         try:
-            adapter_idx = get_adapter_index("hci0")
-            configure_adapter_for_pro_controller(adapter_idx)
-        except Exception as e:
-            logger.warning(f"Pro Controller adapter prep skipped: {e}")
-        GLib.idle_add(self._start_pro_controller_service)
-
-    def _prepare_bluetooth_adapter(self):
-        """Configure adapter (blocking); D-Bus work continues on main thread."""
-        try:
-            adapter_idx = get_adapter_index("hci0")
-            if os.environ.get("HOGP_STATIC_ADDR", "").strip() not in ("", "0", "false"):
-                addr = os.environ.get("HOGP_STATIC_ADDR", "C2:12:34:56:78:9A")
-                set_static_ble_address(adapter_idx, addr)
-            configure_adapter_for_hog_peripheral(adapter_idx)
-        except Exception as e:
-            logger.warning(f"Adapter prep skipped: {e}")
-        GLib.idle_add(self._start_bluetooth_service)
-
-    def _start_bluetooth_service(self):
-        """Start the BLE HoG service on the GTK/GLib main thread."""
-        self._shutting_down = False
-        self._stop_in_progress = False
-        # Clean up leftovers from a previous failed attempt so retries can
-        # re-register D-Bus objects instead of hitting "already exported".
-        if self._pairing_agent is not None:
-            try:
-                self._pairing_agent.unregister()
-            except Exception as e:
-                logger.debug(f"Stale agent cleanup: {e}")
-            self._pairing_agent = None
-
-        try:
-            # Get D-Bus connection
-            self._bus = get_system_bus()
-            if not acquire_app_bus_name(self._bus):
-                logger.warning("D-Bus name com.steamdeck.hogp not acquired; re-run installer if BT fails")
-            
-            # Find adapter
-            self._adapter_path = find_adapter_path(self._bus, "hci0")
-            if not self._adapter_path:
-                self._show_error("Bluetooth adapter not found")
-                return False
-            
-            # Set adapter alias to match our device name
-            set_adapter_alias(self._bus, self._adapter_path, "SteamDeckPad")
-            
-            # Ensure adapter is powered
-            if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
-                self._show_error("Failed to power on Bluetooth")
-                return False
-
-            self._pairing_agent = PairingAgent(self._bus, verbose=True)
-            if not self._pairing_agent.register():
-                detail = getattr(self._pairing_agent, "last_error", "unknown error")
-                self._show_error(
-                    "Could not register Bluetooth pairing agent: "
-                    f"{detail} — check 'groups' includes bluetooth, log out/in "
-                    "after install, and make sure no older app instance is "
-                    "running (pgrep -af 'hogp.gui')"
-                )
-                return False
-            
-            # Create GATT application
-            self._gatt_app = GattApplication(self._bus, device_name="SteamDeckPad", verbose=False)
-            self._gatt_app.set_report_rate(25)
-            
-            if not self._gatt_app.register():
-                self._show_error("Failed to register GATT service")
-                return False
-            
-            # Create advertisement
-            self._advertisement = Advertisement(self._bus, "SteamDeckPad", verbose=False)
-            if not self._advertisement.register():
-                self._show_error("Failed to register advertisement")
-                return False
-            
-            # Register with BlueZ (async; keeps main loop processing D-Bus)
-            self._register_with_bluez()
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to start bluetooth service: {e}")
-            self._show_error(f"Error: {e}")
-            return False
-    
-    def _start_pro_controller_service(self):
-        """Start the Pro Controller (BR/EDR HID) gamepad service on the main thread."""
-        self._shutting_down = False
-        self._stop_in_progress = False
-        # Clean up leftovers from a previous failed attempt so retries can
-        # re-register D-Bus objects instead of hitting "already exported".
-        if self._pairing_agent is not None:
-            try:
-                self._pairing_agent.unregister()
-            except Exception as e:
-                logger.debug(f"Stale agent cleanup: {e}")
-            self._pairing_agent = None
-
-        logger.info("Pro Controller start: begin (bus + adapter discovery)")
-        try:
-            self._bus = get_system_bus()
-            if not acquire_app_bus_name(self._bus):
-                logger.warning("D-Bus name com.steamdeck.hogp not acquired; re-run installer if BT fails")
-
-            self._adapter_path = find_adapter_path(self._bus, "hci0")
-            if not self._adapter_path:
-                self._show_error("Bluetooth adapter not found")
-                return False
-
-            set_adapter_alias(self._bus, self._adapter_path, PRO_NAME)
-
-            if not ensure_adapter_powered_and_discoverable(self._bus, self._adapter_path):
-                self._show_error("Failed to power on Bluetooth")
-                return False
-
-            adapter_address = get_adapter_address(self._bus, self._adapter_path) or "00:00:00:00:00:00"
-
-            self._pairing_agent = PairingAgent(self._bus, verbose=True)
-            if not self._pairing_agent.register():
-                detail = getattr(self._pairing_agent, "last_error", "unknown error")
-                self._show_error(
-                    "Could not register Bluetooth pairing agent: "
-                    f"{detail} — check 'groups' includes bluetooth, log out/in "
-                    "after install, and make sure no older app instance is "
-                    "running (pgrep -af 'hogp.gui')"
-                )
-                return False
-
-            logger.info("Pro Controller start: registering HID SDP record")
-            if not register_hid_sdp_profile(self._bus, SDP_RECORD_XML):
-                self._show_error(
-                    "Could not register HID SDP record: "
-                    f"{get_last_sdp_error() or 'unknown BlueZ error'}"
-                )
-                return False
-            self._pro_sdp_registered = True
-
-            logger.info("Pro Controller start: binding L2CAP sockets (PSM 0x11/0x13)")
-            self._pro_controller = ProControllerEmulator(adapter_address=adapter_address)
-            self._pro_controller.on_state_change = self._on_pro_controller_state
-            if not self._pro_controller.start():
-                unregister_hid_sdp_profile(self._bus)
-                self._pro_sdp_registered = False
-                detail = (
-                    getattr(self._pro_controller, "last_error", "")
-                    or "unknown reason (see /tmp/hogp-bridge.log)"
-                )
-                self._show_error(f"Could not start the HID L2CAP bridge: {detail}")
-                return False
-
-            self._registered = True
-            self._running = True
-            self.status_label.set_markup("<big><b>Status: Active - Pro Controller</b></big>")
-            self.connection_label.set_label("Waiting for Mac to connect…")
-            self.device_info_label.set_label(
-                "macOS: System Settings → Bluetooth → Pro Controller → Connect, accept the "
-                "pairing request. Game Controllers will then list a Pro Controller."
-            )
+            self.client.stop()
+        except BtEmuError as e:
+            logger.warning("stop: %s", e)
             self.stop_button.set_sensitive(True)
-            self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
-            # evdev discovery can be slow (Steam holds the controller) — keep it
-            # off the UI thread so "Active" shows immediately.
-            threading.Thread(target=self._start_input_handler, daemon=True).start()
-            return False
-        except Exception as e:
-            logger.error(f"Failed to start Pro Controller service: {e}")
-            self._show_error(f"Error: {e}")
-            return False
 
-    def _on_pro_controller_state(self, connected):
-        """UI update when the Mac connects/disconnects the L2CAP HID channels."""
+    # ------------------------------------------------------------- polling
 
-        def update():
-            if not self._pro_controller:
-                return False
-            if connected:
-                self.connection_label.set_label("✓ Paired — streaming as Pro Controller")
-            else:
-                self.connection_label.set_label("Waiting for Mac to connect…")
-            return False
-
-        GLib.idle_add(update)
-
-    def _usb_setup_args(self):
-        """CLI args for setup-usb-gadget.sh matching the selected profile."""
-        return ["--profile", "ds4" if self._profile == "gamepad" else "generic"]
-
-    def _start_wired_service(self):
-        """Start the USB Gadget wired mode service (runs in thread)."""
+    def _poll_status(self) -> bool:
         try:
-            logger.info("Starting USB Gadget HID in wired mode...")
-            
-            # Check if USB gadget is already set up
-            import os
-            import subprocess
-            gamepad_profile = "ds4" if self._profile == "gamepad" else "generic"
-            need_setup = not (
-                os.path.exists('/dev/hidg0')
-                and os.path.exists('/dev/hidg1')
-                and os.path.exists('/dev/hidg2')
-            )
-            if not need_setup:
-                # The gadget survives app restarts but not Deck reboots. Verify
-                # the requested profile matches what is actually configured so
-                # a stale or half-configured gadget is rebuilt instead of
-                # silently presenting the wrong device to the Mac.
-                try:
-                    with open('/tmp/steamdeck_hid.profile') as f:
-                        need_setup = f.read().strip() != gamepad_profile
-                except OSError:
-                    need_setup = True  # old install / reboot: rebuild once
-            if need_setup:
-                logger.info("USB gadget missing or stale (%s), running setup...", gamepad_profile)
-                GLib.idle_add(self._show_info, "Setting up USB gadget (requires password)...")
-                
-                # Find script directory (relative to this file)
-                script_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'scripts')
-                script_path = os.path.join(script_dir, 'setup-usb-gadget.sh')
-                
-                try:
-                    result = None
-                    for cmd in (
-                        ['sudo', '-n', 'bash', script_path] + self._usb_setup_args(),
-                        ['pkexec', 'bash', script_path] + self._usb_setup_args(),
-                    ):
-                        result = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                        )
-                        if result.returncode == 0:
-                            break
-                    if not result or result.returncode != 0:
-                        detail = (result.stderr or result.stdout or "unknown error").strip()
-                        GLib.idle_add(
-                            self._show_error,
-                            "USB gadget setup failed. Set a user password (passwd), enable "
-                            f"BIOS USB DRD, re-run install.sh, then retry. Details: {detail[:400]}",
-                        )
-                        return
-                    logger.info("USB gadget setup successful")
-                except subprocess.TimeoutExpired:
-                    GLib.idle_add(self._show_error, "USB gadget setup timed out")
-                    return
-                except Exception as e:
-                    GLib.idle_add(self._show_error, f"Failed to run setup script: {e}")
-                    return
-            
-            # Create USB gadget HID instance
-            self._usb_gadget = USBGadgetHID(
-                verbose=False,
-                gamepad_profile="ds4" if self._profile == "gamepad" else "generic",
-            )
-            
-            if not self._usb_gadget.open():
-                GLib.idle_add(
-                    self._show_error,
-                    "No /dev/hidg* devices. Run scripts/diagnose.sh in Konsole (BIOS DRD + data USB cable).",
-                )
-                return
-
-            if self._usb_gadget._gamepad_fd is None:
-                GLib.idle_add(
-                    self._show_error,
-                    "Gamepad HID function (/dev/hidg0) is missing. Run "
-                    "scripts/cleanup-usb-gadget.sh in Konsole, then start again "
-                    "so the gadget is rebuilt.",
-                )
-                self._usb_gadget.close()
-                self._usb_gadget = None
-                return
-            
-            self._running = True
-            if not self._start_input_handler_sync():
-                GLib.idle_add(
-                    self._show_error,
-                    "USB gadget is up but no controller input found. Use Desktop Mode; quit Steam "
-                    "if the built-in controls are busy.",
-                )
-                return
-            
-            GLib.idle_add(self._update_status_wired_active)
-            
-        except Exception as e:
-            logger.error(f"Failed to start wired service: {e}")
-            GLib.idle_add(self._show_error, f"Error: {e}")
-    
-    def _update_status_wired_active(self):
-        """Update UI for wired mode active state."""
-        self.status_label.set_markup("<big><b>Status: Active - Wired USB</b></big>")
-        self.connection_label.set_label("Connected via USB (cable)")
-        if self._profile == "gamepad":
-            self.device_info_label.set_label(
-                "USB gamepad presents as a DUALSHOCK 4 (054C:05C4). On the Mac check "
-                "System Settings → Game Controllers — a Wireless Controller should be listed. "
-                "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
-            )
-        else:
-            self.device_info_label.set_label(
-                "Mac: Game Controllers tracks Bluetooth only — SteamDeckPad may show Disconnected "
-                "here. USB gamepad is separate: System Settings → General → About → System Report → USB. "
-                "HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
-            )
-        self.stop_button.set_sensitive(True)
-        # Start update loop
-        self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
-    
-    def _register_with_bluez(self):
-        """Register application and advertisement with BlueZ."""
-        self._reg_timeout_id = GLib.timeout_add(35000, self._on_bluez_registration_timeout)
-
-        def clear_reg_timeout():
-            if getattr(self, "_reg_timeout_id", None):
-                GLib.source_remove(self._reg_timeout_id)
-                self._reg_timeout_id = None
-
-        def on_app_registered(success, error):
-            if not success:
-                clear_reg_timeout()
-                self._show_error(f"GATT registration failed: {error}")
-                return
-            
-            register_advertisement_async(
-                self._bus,
-                self._adapter_path,
-                Advertisement.ADV_PATH,
-                on_adv_registered,
-            )
-        
-        def on_adv_registered(success, error):
-            clear_reg_timeout()
-            if not success:
-                self._show_error(f"Advertisement failed: {error}")
-                return
-            
-            self._registered = True
-            self._running = True
-            self._start_input_handler()
-            self.status_label.set_markup("<big><b>Status: Active - Discoverable</b></big>")
-            self.connection_label.set_label("Waiting for connection...")
-            self.stop_button.set_sensitive(True)
-            
-            # Start update loop
-            self._update_timeout_id = GLib.timeout_add(50, self._update_visualizer)
-        
-        register_application_async(
-            self._bus,
-            self._adapter_path,
-            GattApplication.APP_PATH,
-            on_app_registered,
-        )
-
-    def _on_bluez_registration_timeout(self):
-        """Abort UI wait when BlueZ never completes registration."""
-        self._reg_timeout_id = None
-        if not self._registered:
-            self._show_error(
-                "BlueZ registration timed out. Re-run the installer to update "
-                "D-Bus policy, then log out and back in."
-            )
-        return False
-    
-    def _start_input_handler_sync(self) -> bool:
-        """Start forwarding physical controller input; return whether a device was found."""
-        self._input_handler = InputHandler(
-            device_path=None,  # Auto-detect
-            on_button_change=self._on_button,
-            on_axis_change=self._on_axis,
-            on_trigger_change=self._on_trigger,
-            on_hat_change=self._on_hat,
-            verbose=False,
-        )
-        if self._input_handler.start():
-            logger.info("Input forwarding started")
-            return True
-        logger.warning("No input device detected")
-        return False
-
-    def _start_input_handler(self):
-        """Start forwarding physical controller input (off the UI thread)."""
-
-        def work():
-            ok = self._start_input_handler_sync()
-            GLib.idle_add(self._on_input_handler_ready, ok)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_input_handler_ready(self, ok: bool):
-        if ok and self._input_handler:
-            self.visualizer.set_input_source(self._input_handler.active_device_label)
-            self._update_connection_label("Input device connected")
-        else:
-            self.visualizer.set_input_source(
-                "No gamepad found — Desktop Mode / quit Steam / evtest"
-            )
-            self._update_connection_label(
-                "No gamepad evdev node — service up, input may be missing"
-            )
-        return False
-    
-    def _schedule_input_coalesce(self) -> None:
-        if self._input_coalesce_id is None:
-            self._input_coalesce_id = GLib.timeout_add(
-                self._input_coalesce_ms, self._flush_coalesced_input
-            )
-
-    def _on_button(self, index, pressed):
-        # Buttons are latency-critical: apply on the next main-loop idle
-        # instead of waiting for the axis-coalescing window.
-        GLib.idle_add(self._apply_button, index, pressed)
-
-    def _apply_button(self, index, pressed):
-        if self._pro_controller:
-            self._pro_controller.set_button(index, pressed)
-        elif self._gatt_app:
-            self._gatt_app.set_button(index, pressed)
-        elif self._usb_gadget:
-            self._usb_gadget.set_button(index, pressed)
-        return False
-
-    def _on_axis(self, index, value):
-        self._pending_axes[index] = value
-        self._schedule_input_coalesce()
-
-    def _apply_axis(self, index, value):
-        if self._pro_controller:
-            self._pro_controller.set_axis(index, value)
-        elif self._gatt_app:
-            self._gatt_app.set_axis(index, value)
-        elif self._usb_gadget:
-            self._usb_gadget.set_axis(index, value)
-        return False
-
-    def _on_trigger(self, index, value):
-        self._pending_triggers[index] = value
-        self._schedule_input_coalesce()
-
-    def _apply_trigger(self, index, value):
-        if self._pro_controller:
-            self._pro_controller.set_trigger(index, value)
-        elif self._gatt_app:
-            self._gatt_app.set_trigger(index, value)
-        elif self._usb_gadget:
-            self._usb_gadget.set_trigger(index, value)
-        return False
-
-    def _on_hat(self, direction):
-        # D-pad is latency-critical: apply on the next main-loop idle.
-        GLib.idle_add(self._apply_hat, direction)
-
-    def _apply_hat(self, direction):
-        if self._pro_controller:
-            self._pro_controller.set_hat(direction)
-        elif self._gatt_app:
-            self._gatt_app.set_hat(direction)
-        elif self._usb_gadget:
-            self._usb_gadget.set_hat(direction)
-        return False
-
-    def _flush_coalesced_input(self):
-        self._input_coalesce_id = None
-        for index, pressed in self._pending_buttons.items():
-            self._apply_button(index, pressed)
-        self._pending_buttons.clear()
-        for index, value in self._pending_axes.items():
-            self._apply_axis(index, value)
-        self._pending_axes.clear()
-        for index, value in self._pending_triggers.items():
-            self._apply_trigger(index, value)
-        self._pending_triggers.clear()
-        if self._pending_hat is not None:
-            self._apply_hat(self._pending_hat)
-            self._pending_hat = None
-        return False
-    
-    def _update_visualizer(self):
-        """Update the controller visualization."""
-        if not self._running:
-            return False
-        
-        # Get active HID output
-        hid_output = self._gatt_app or self._usb_gadget or self._pro_controller
-        if not hid_output:
-            return False
-        
-        self.visualizer.update_state(
-            hid_output._buttons,
-            hid_output._axes,
-            hid_output._triggers,
-            hid_output._hat,
-        )
-        if self._input_handler:
-            self.visualizer.set_input_source(self._input_handler.active_device_label)
-        
-        # Update connection status (Bluetooth mode only)
-        if self._gatt_app and self._bus and self._adapter_path:
-            device_info = get_primary_connected_device(self._bus, self._adapter_path)
-            if device_info:
-                self._maybe_complete_bond(device_info)
-            if self._gatt_app.notifying:
-                if device_info:
-                    self._refresh_bt_connection_labels(device_info)
-                else:
-                    self.connection_label.set_label("✓ Sending data")
-                    self.device_info_label.set_label("")
-            elif self._registered:
-                if device_info:
-                    self._refresh_bt_connection_labels(device_info)
-                    self.connection_label.set_label("✓ Connected — accept pairing on Mac…")
-                else:
-                    self.connection_label.set_label("Waiting for connection...")
-                    self.device_info_label.set_label("")
-                    self._bond_attempted_for = None
-        
+            status = self.client.get_status()
+        except BtEmuError as e:
+            status = None
+            self._local_error = str(e)
+        self._render_status(status)
         return True
-    
-    def _refresh_bt_connection_labels(self, device_info: dict) -> None:
-        """Show GATT activity vs completed SMP bond (macOS cares about the latter)."""
-        paired = device_info.get("paired") or device_info.get("bonded")
-        trusted = device_info.get("trusted", False)
-        if self._bond_in_progress:
-            conn = "Finishing Bluetooth pairing…"
-        elif paired and trusted:
-            conn = "✓ Paired — sending HID data"
-        elif paired:
-            conn = "✓ Paired — sending HID data"
+
+    def _render_status(self, status) -> None:
+        self._status = status
+
+        if status is None:
+            # Daemon is down.
+            self.status_label.set_markup(
+                "<big><b>Error: emulator daemon not reachable</b></big>"
+            )
+            self.connection_label.set_label(
+                "Run: sudo systemctl start bt-controller-emulator"
+            )
+            self.device_info_label.set_label("")
+            self._set_controls_locked(False)
+            self.start_button.set_sensitive(True)
+            self.stop_button.set_sensitive(False)
+            return
+
+        st = status.get(KEY_STATUS)
+        detail = status.get(KEY_DETAIL, "")
+        error = status.get(KEY_ERROR, "")
+
+        if st == STATUS_ERROR:
+            self._set_controls_locked(False)
+            self.status_label.set_markup(
+                f"<big><b>Error: {GLib.markup_escape_text(detail or error)}</b></big>"
+            )
         else:
-            conn = "✓ Connected — completing pairing…"
-        self.connection_label.set_label(conn)
-        bond_line = "yes" if paired else "no (in progress)"
-        trust_line = "yes" if trusted else "no"
-        err_line = ""
-        if self._last_bond_error and not paired:
-            err_line = f"\n<b>Bond:</b> {GLib.markup_escape_text(self._last_bond_error)}"
-        self.device_info_label.set_markup(
-            f"<b>Device:</b> {device_info['name']}\n"
-            f"<b>Address:</b> {device_info['address']}\n"
-            f"<b>Paired:</b> {bond_line}  <b>Trusted:</b> {trust_line}"
-            f"{err_line}"
-        )
-    
-    def _maybe_complete_bond(self, device_info: dict) -> None:
-        """Trigger BlueZ Pair + Trusted when a central connects."""
-        if self._shutting_down or self._stop_in_progress:
-            return
-        path = device_info.get("path")
-        if not path:
-            return
-        paired = device_info.get("paired") or device_info.get("bonded")
-        if paired and device_info.get("trusted"):
-            self._bond_attempted_for = path
-            self._last_bond_error = None
-            return
-        if self._bond_in_progress:
-            return
-        now = time.monotonic()
-        if path == self._bond_attempted_for and (now - self._last_bond_attempt_at) < 20.0:
-            return
-        
-        adapter_path = self._adapter_path
-        device_path = path
-        
-        def work():
-            if self._shutting_down:
-                GLib.idle_add(self._on_bond_complete, device_path, None, None)
-                return
-            try:
-                updated, err = complete_bond_with_central(None, adapter_path)
-            except Exception as e:
-                logger.warning(f"Bond completion failed: {e}")
-                updated, err = None, str(e)
-            GLib.idle_add(self._on_bond_complete, device_path, updated, err)
-        
-        self._bond_in_progress = True
-        self._last_bond_attempt_at = now
-        threading.Thread(target=work, daemon=True, name="hogp-bond").start()
-    
-    def _on_bond_complete(self, device_path, device_info, error_msg):
-        self._bond_in_progress = False
-        self._last_bond_error = error_msg
-        paired = device_info and (device_info.get("paired") or device_info.get("bonded"))
-        if paired:
-            self._bond_attempted_for = device_path
-            self._last_bond_error = None
-        if device_info:
-            self._refresh_bt_connection_labels(device_info)
-        return False
-    
-    def _update_connection_label(self, text):
-        """Update connection label."""
-        self.connection_label.set_label(text)
-    
-    def _stop_service_begin(self) -> bool:
-        """First stop phase on the GTK main thread (non-blocking)."""
-        self._shutting_down = True
-        self._running = False
+            self.status_label.set_markup(
+                f"<big><b>Status: {GLib.markup_escape_text(detail)}</b></big>"
+            )
 
-        if self._update_timeout_id:
-            GLib.source_remove(self._update_timeout_id)
-            self._update_timeout_id = None
+        self.connection_label.set_label(str(status.get(KEY_CONN, "Not connected")))
 
-        if self._gatt_app:
-            self._gatt_app.stop_notify()
-
-        if self._pairing_agent:
-            self._pairing_agent.unregister()
-            self._pairing_agent = None
-
-        threading.Thread(target=self._stop_service_worker, daemon=True).start()
-        return False
-
-    def _stop_service_worker(self) -> None:
-        """Blocking teardown off the UI thread."""
-        adapter_path = self._adapter_path
-        registered = self._registered
-
-        try:
-            if self._input_handler:
-                self._input_handler.stop()
-                self._input_handler = None
-
-            if registered and adapter_path and self._gatt_app is not None:
-                bus = get_system_bus()
-                unregister_advertisement_sync(
-                    bus, adapter_path, Advertisement.ADV_PATH, timeout_ms=4000
+        # Device / bonding info or mode hints
+        device_name = status.get(KEY_DEVICE_NAME, "")
+        if device_name:
+            paired_line = "yes" if status.get(KEY_PAIRED) else "no"
+            trusted_line = "yes" if status.get(KEY_TRUSTED) else "no"
+            self.device_info_label.set_markup(
+                f"<b>Device:</b> {GLib.markup_escape_text(device_name)}\n"
+                f"<b>Address:</b> {GLib.markup_escape_text(str(status.get(KEY_DEVICE_ADDR, '')))}\n"
+                f"<b>Paired:</b> {paired_line}  <b>Trusted:</b> {trusted_line}"
+            )
+        elif st == STATUS_ACTIVE:
+            mode = status.get(KEY_MODE)
+            profile = status.get(KEY_PROFILE)
+            if mode == MODE_BLUETOOTH and profile == PROFILE_GAMEPAD:
+                self.device_info_label.set_label(
+                    "macOS: System Settings → Bluetooth → Pro Controller → Connect, "
+                    "accept the pairing request. Game Controllers will then list a "
+                    "Pro Controller."
                 )
-                unregister_application_sync(
-                    bus, adapter_path, GattApplication.APP_PATH, timeout_ms=4000
+            elif mode == MODE_USB and profile == PROFILE_GAMEPAD:
+                self.device_info_label.set_label(
+                    "USB gamepad presents as a DUALSHOCK 4 (054C:05C4). On the Mac "
+                    "check System Settings → Game Controllers — a Wireless Controller "
+                    "should be listed. HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, "
+                    "/dev/hidg2 mouse on Deck."
                 )
-                self._registered = False
+            elif mode == MODE_USB:
+                self.device_info_label.set_label(
+                    "Mac: Game Controllers tracks Bluetooth only — SteamDeckPad may "
+                    "show Disconnected here. USB gamepad is separate: System Settings "
+                    "→ General → About → System Report → USB. HID: /dev/hidg0 gamepad, "
+                    "/dev/hidg1 keyboard, /dev/hidg2 mouse on Deck."
+                )
+            else:
+                self.device_info_label.set_label("")
+        else:
+            self.device_info_label.set_label("")
 
-            if self._usb_gadget:
-                self._usb_gadget.close()
-                self._usb_gadget = None
+        # Start watchdog: surface diagnostics instead of hanging.
+        if st == STATUS_STARTING and self._start_deadline and time.monotonic() > self._start_deadline:
+            self.status_label.set_markup(
+                "<big><b>Status: Starting timed out — check "
+                "'journalctl -u bt-controller-emulator -f'</b></big>"
+            )
+            self.connection_label.set_label(
+                "Check Konsole/journal for the stalled step (bt-controller-emulator: ...)"
+            )
+            self._set_controls_locked(False)
+            self._start_deadline = 0.0
+        elif st == STATUS_STOPPED:
+            self._start_deadline = 0.0
+            self._set_controls_locked(False)
+        elif st == STATUS_ACTIVE or st == STATUS_DEGRADED:
+            self._start_deadline = 0.0
 
-            if self._pro_controller:
-                self._pro_controller.stop()
-                self._pro_controller = None
+        # Buttons
+        busy = st in (STATUS_STARTING, STATUS_STOPPING)
+        running = st in (STATUS_ACTIVE, STATUS_DEGRADED)
+        self.start_button.set_sensitive(st in (STATUS_STOPPED, STATUS_ERROR))
+        self.stop_button.set_sensitive(running or busy)
 
-            if self._pro_sdp_registered:
-                try:
-                    unregister_hid_sdp_profile(get_system_bus())
-                except Exception as e:
-                    logger.warning(f"Could not unregister HID SDP profile: {e}")
-                self._pro_sdp_registered = False
+        # Visualizer
+        if status.get(KEY_BUTTONS) is not None:
+            self.visualizer.update_state(
+                status.get(KEY_BUTTONS, 0),
+                status.get(KEY_AXES, [0, 0, 0, 0]),
+                status.get(KEY_TRIGGERS, [0, 0]),
+                status.get(KEY_HAT, 8),
+            )
+        input_label = status.get(KEY_INPUT, "")
+        self.visualizer.set_input_source(input_label or "waiting for service…")
 
-            if adapter_path:
-                try:
-                    reset_adapter_to_default_state(get_system_bus(), adapter_path)
-                except Exception as e:
-                    logger.warning(f"Could not reset adapter state: {e}")
-        except Exception as e:
-            logger.warning(f"Error during service shutdown: {e}")
-        finally:
-            GLib.idle_add(self._stop_service_finalize)
+    def _radios_enabled(self) -> bool:
+        return self.bluetooth_radio.get_sensitive()
 
-    def _stop_service_finalize(self) -> bool:
-        """Return UI and D-Bus objects to idle state (main thread)."""
-        if self._advertisement:
-            self._advertisement.unregister()
-            self._advertisement = None
-
-        if self._gatt_app:
-            self._gatt_app.unregister()
-            self._gatt_app = None
-
-        self.status_label.set_markup("<big><b>Status: Stopped</b></big>")
-        self.connection_label.set_label("Not connected")
-        self.device_info_label.set_label("")
-        self._bond_in_progress = False
-        self._bond_attempted_for = None
-        self._last_bond_attempt_at = 0.0
-        self._last_bond_error = None
-        if self._start_watchdog_id:
-            GLib.source_remove(self._start_watchdog_id)
-            self._start_watchdog_id = None
-        self._shutting_down = False
-        self._stop_in_progress = False
-        self.start_button.set_sensitive(True)
-        self.stop_button.set_sensitive(False)
-        self.bluetooth_radio.set_sensitive(True)
-        self.wired_radio.set_sensitive(True)
-        self.gamepad_radio.set_sensitive(True)
-        self.keyboard_radio.set_sensitive(True)
-        return False
-    
-    def _show_error(self, message):
-        """Show error message."""
-        logger.error(message)
-        self._start_error_shown = True
-        self.status_label.set_markup(f"<big><b>Error: {message}</b></big>")
-        self.start_button.set_sensitive(True)
-        self.bluetooth_radio.set_sensitive(True)
-        self.wired_radio.set_sensitive(True)
-        self.gamepad_radio.set_sensitive(True)
-        self.keyboard_radio.set_sensitive(True)
-        self._running = False
-    
-    def _show_info(self, message):
-        """Show info message."""
-        logger.info(message)
-        self.status_label.set_markup(f"<big><b>{message}</b></big>")
-        self.stop_button.set_sensitive(False)
+    def _set_controls_locked(self, locked: bool) -> None:
+        for radio in (self.bluetooth_radio, self.wired_radio,
+                      self.gamepad_radio, self.keyboard_radio):
+            radio.set_sensitive(not locked)
 
 
 class HoGApp(Gtk.Application):
-    """Main application."""
-    
     def __init__(self):
         super().__init__(application_id="com.steamdeck.hogp.gui")
-        
+
     def do_activate(self):
-        """Application activated."""
         win = HoGPeripheralGUI(self)
         win.present()
 
 
 def main():
-    """Main entrypoint for GUI."""
     logging.basicConfig(
-        level=logging.DEBUG,  # Changed to DEBUG for more verbose logging
+        level=logging.DEBUG,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    
-    app = HoGApp()
-    return app.run(None)
+    HoGApp().run(None)
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    main()

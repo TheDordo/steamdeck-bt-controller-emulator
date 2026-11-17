@@ -21,12 +21,11 @@ Protocol references:
     * esp-cpp/espp switch_pro (subcommand reply engine, ACK values)
 """
 
+import errno
 import logging
-import os
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 from typing import Optional
@@ -44,13 +43,6 @@ PRO_CLASS_OF_DEVICE = 0x002508  # Peripheral / Gamepad
 # L2CAP PSMs used by the HID profile
 HID_CTRL_PSM = 0x11
 HID_INTR_PSM = 0x13
-
-# Abstract unix sockets used between this app and the root L2CAP bridge.
-# The kernel requires CAP_NET_BIND_SERVICE for well-known PSMs, so the
-# bridge binds 0x11/0x13 and relays to us over these. Names are argv-safe
-# plain strings; the '\0' abstract-namespace prefix is added at bind/connect.
-UNIX_CTRL_NAME = "hogp-pro-ctrl"
-UNIX_INTR_NAME = "hogp-pro-intr"
 
 # HIDP transaction header byte for DATA packets
 HIDP_DATA = 0xA0
@@ -260,6 +252,100 @@ def flash_read(offset: int, size: int) -> bytes:
     return bytes(out)
 
 
+def _free_hidp() -> None:
+    """Best-effort unload of the kernel hidp module (HID host role). The
+    kernel module binds the well-known HID PSMs when a Bluetooth keyboard/
+    mouse is connected to the Deck, which would block our listener."""
+    try:
+        subprocess.run(["modprobe", "-r", "hidp"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _diagnose_busy_psms() -> str:
+    """Collect evidence about who holds the well-known HID PSMs."""
+    parts = []
+    try:
+        out = subprocess.run(
+            ["cat", "/proc/net/l2cap"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [l for l in out.stdout.splitlines() if "0011" in l or "0013" in l]
+        parts.append(
+            "L2CAP listeners on PSM 0x11/0x13 (kernel 'hidp' lines mean a "
+            "Bluetooth keyboard/mouse session on this machine):\n"
+            + ("\n".join(lines) if lines else "  (none listed)")
+        )
+    except Exception:
+        parts.append("(could not read /proc/net/l2cap)")
+    try:
+        out = subprocess.run(
+            ["lsmod"], capture_output=True, text=True, timeout=5,
+        )
+        hidp = [l for l in out.stdout.splitlines() if l.startswith("hidp")]
+        parts.append(
+            "hidp module: " + ("LOADED: " + hidp[0] if hidp else "not loaded")
+        )
+    except Exception:
+        parts.append("(could not run lsmod)")
+    try:
+        out = subprocess.run(
+            ["ss", "-f", "bluetooth", "-lpn"],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = [
+            l for l in out.stdout.splitlines()
+            if " 17 " in l or " 19 " in l or "psm" in l.lower()
+            or "0x11" in l or "0x13" in l
+        ]
+        parts.append(
+            "ss bluetooth listeners (PIDs shown):\n"
+            + ("\n".join(lines) if lines else "  (none listed)")
+        )
+    except Exception:
+        parts.append("(ss -f bluetooth unsupported)")
+    return "\n".join(parts)
+
+
+def _bind_l2cap_with_retries(bdaddr: str, psm: int, attempts: int = 30, delay: float = 0.5) -> Optional[socket.socket]:
+    """Bind one well-known HID L2CAP PSM, tolerating a briefly-busy port
+    (a previous instance still dying) and freeing the kernel hidp module's
+    well-known PSMs if it holds them. Runs as root inside the daemon, so
+    CAP_NET_BIND_SERVICE is not an issue."""
+    last_err = None
+    _free_hidp()  # free the ports before the first attempt
+    for attempt in range(attempts):
+        listener = None
+        try:
+            listener = socket.socket(
+                socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
+            )
+            listener.bind((bdaddr, psm))
+            listener.listen(1)
+            return listener
+        except OSError as e:
+            last_err = e
+            if listener is not None:
+                try:
+                    listener.close()
+                except Exception:
+                    pass
+            if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+                raise
+            if attempt == 3 or attempt == attempts - 2:
+                # hidp can be re-loaded by BlueZ mid-flight; retry unloading.
+                _free_hidp()
+            time.sleep(delay)
+    logger.error(
+        "HID L2CAP PSM 0x%x is still busy (%s).\n%s\n"
+        "Recovery: disconnect Bluetooth keyboards/mice from this machine "
+        "('bluetoothctl devices Connected' + 'bluetoothctl disconnect <MAC>'), "
+        "then start the service again.",
+        psm, last_err, _diagnose_busy_psms(),
+    )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pro Controller emulator
 # ---------------------------------------------------------------------------
@@ -287,12 +373,10 @@ class ProControllerEmulator:
         self._connected = False
         self._streaming = False
 
-        self._ctl_sock: Optional[socket.socket] = None   # unix listener, control channel
-        self._itr_sock: Optional[socket.socket] = None   # unix listener, interrupt channel
+        self._ctl_sock: Optional[socket.socket] = None   # L2CAP listener, control channel
+        self._itr_sock: Optional[socket.socket] = None   # L2CAP listener, interrupt channel
         self._ctl_conn: Optional[socket.socket] = None   # accepted control conn
         self._itr_conn: Optional[socket.socket] = None   # accepted interrupt conn
-        self._bridge_proc: Optional[subprocess.Popen] = None  # sudo L2CAP bridge
-        self._bridge_log = None  # bridge stderr capture (GUI has no console)
         self.last_error: Optional[str] = None  # detailed start failure reason
         self._conn_lock = threading.Lock()
 
@@ -336,100 +420,30 @@ class ProControllerEmulator:
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> bool:
-        """Create the local channel sockets and spawn the privileged L2CAP
-        bridge (PSM 0x11/0x13 need CAP_NET_BIND_SERVICE). Adapter/SDP setup
-        happens via bluez helpers before this is called."""
+        """Bind the HID L2CAP PSMs (0x11/0x13) directly and start accepting
+        connections. Runs inside the root daemon, so no bridge or sudo is
+        needed. Adapter/SDP setup happens via bluez helpers before this."""
         self.last_error = None
         if self._running:
             return True
         try:
-            self._ctl_sock = self._bind_unix(UNIX_CTRL_NAME)
-            self._itr_sock = self._bind_unix(UNIX_INTR_NAME)
+            self._ctl_sock = _bind_l2cap_with_retries(self.adapter_address, HID_CTRL_PSM)
+            self._itr_sock = _bind_l2cap_with_retries(self.adapter_address, HID_INTR_PSM)
         except OSError as e:
             self.last_error = f"local channel sockets: {e}"
-            logger.error("Could not create local channel sockets: %s", e)
+            logger.error("Could not create L2CAP listeners: %s", e)
             self.stop()
             return False
-
-        bridge_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", "scripts", "hid-l2cap-bridge.py",
-        )
-        bridge_python = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", ".bridge-python",
-        )
-        bridge_log_path = "/tmp/hogp-bridge.log"
-        try:
-            self._bridge_log = open(bridge_log_path, "w")
-        except OSError:
-            self._bridge_log = None
-        # Kill orphaned bridges from previous crashed runs (they hold the
-        # well-known PSMs). Orphans normally run as this same user, so a
-        # plain pkill works; the sudo variant is a best-effort extra. The
-        # bracketed pattern avoids matching pkill's own command line.
-        for killer in (
-            ["pkill", "-f", "hid-l2cap-bridg[e]"],
-            ["sudo", "-n", "/usr/bin/pkill", "-f", "hid-l2cap-bridg[e]"],
-        ):
-            try:
-                subprocess.run(killer, capture_output=True, timeout=5)
-            except Exception:
-                pass
-        # Preferred: the setcap'd interpreter created by install.sh — no
-        # sudo, no sudoers, no policy wrappers. Falls back to sudo when the
-        # helper is missing (e.g. before re-running install.sh).
-        if os.path.exists(bridge_python):
-            cmd = [
-                bridge_python, bridge_path,
-                "--ctrl", UNIX_CTRL_NAME,
-                "--intr", UNIX_INTR_NAME,
-                "--bdaddr", self.adapter_address,
-            ]
-            env = dict(os.environ, PYTHONHOME="/usr")
-            mode = "setcap helper"
-        else:
-            cmd = [
-                "sudo", "-n", sys.executable, bridge_path,
-                "--ctrl", UNIX_CTRL_NAME,
-                "--intr", UNIX_INTR_NAME,
-                "--bdaddr", self.adapter_address,
-            ]
-            env = None
-            mode = "sudo fallback"
-        try:
-            self._bridge_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=self._bridge_log,
-                env=env,
-            )
-        except (FileNotFoundError, ValueError, OSError) as e:
-            self.last_error = (
-                f"launch: {e} (mode: {mode}, bridge: {bridge_path}, "
-                f"python: {sys.executable})"
-            )
-            logger.error("Could not launch the L2CAP bridge: %s", e)
-            self.stop()
-            return False
-
-        # Fail fast when passwordless sudo is missing (bridge exits at once).
-        time.sleep(1.0)
-        if self._bridge_proc.poll() not in (None, 0):
-            self.last_error = (
-                f"bridge exited immediately ({bridge_path}): "
-                + self._bridge_log_tail(bridge_log_path)
-            )
-            logger.error("HID L2CAP bridge exited immediately: %s", self.last_error)
+        if self._ctl_sock is None or self._itr_sock is None:
+            self.last_error = "PSM 0x11/0x13 busy — another HID service holds the ports"
             self.stop()
             return False
 
         self._running = True
         self._spawn(self._accept_loop, (self._ctl_sock, "control"))
         self._spawn(self._accept_loop, (self._itr_sock, "interrupt"))
-        self._spawn(self._monitor_bridge)
         logger.info(
-            "Pro Controller emulator listening (PSM 0x%x/0x%x via sudo bridge)",
+            "Pro Controller emulator listening (L2CAP PSM 0x%x/0x%x, direct bind)",
             HID_CTRL_PSM, HID_INTR_PSM,
         )
         return True
@@ -447,68 +461,14 @@ class ProControllerEmulator:
                 except OSError:
                     pass
         self._ctl_sock = self._itr_sock = self._ctl_conn = self._itr_conn = None
-        if self._bridge_proc is not None:
-            try:
-                self._bridge_proc.terminate()
-            except Exception:
-                pass
-            try:
-                self._bridge_proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._bridge_proc.kill()
-                except Exception:
-                    pass
-            self._bridge_proc = None
-        if self._bridge_log is not None:
-            try:
-                self._bridge_log.close()
-            except Exception:
-                pass
-            self._bridge_log = None
         self._connected = False
         self._streaming = False
         self._threads = []
-
-    def _bind_unix(self, name: str) -> socket.socket:
-        """Listen on an abstract unix SOCK_SEQPACKET socket (no filesystem
-        cleanup needed); the root bridge connects here after accepting L2CAP."""
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        sock.bind("\0" + name)
-        sock.listen(1)
-        return sock
 
     def _spawn(self, target, args=()) -> None:
         t = threading.Thread(target=target, args=args, daemon=True)
         t.start()
         self._threads.append(t)
-
-    @staticmethod
-    def _bridge_log_tail(path: str, limit: int = 300) -> str:
-        """Last lines of the bridge's stderr log (surfaced in UI errors)."""
-        try:
-            with open(path, "r", errors="replace") as f:
-                text = f.read().strip()
-            return text[-limit:] if text else "(empty bridge log)"
-        except OSError:
-            return "(no bridge log)"
-
-    def _monitor_bridge(self) -> None:
-        """Warn when the privileged bridge dies unexpectedly."""
-        proc = self._bridge_proc
-        if proc is None:
-            return
-        proc.wait()
-        if self._running and self._bridge_proc is proc:
-            logger.error(
-                "HID L2CAP bridge exited unexpectedly: %s — if the PSMs were "
-                "busy: pgrep -af hogp (kill stray app instances) or "
-                "'sudo modprobe -r hidp' (disconnect BT keyboards/mice first)",
-                self._bridge_log_tail("/tmp/hogp-bridge.log"),
-            )
-            self._connected = False
-            self._streaming = False
-            self._notify_state(False)
 
     def _accept_loop(self, sock: socket.socket, label: str) -> None:
         while self._running:
@@ -532,7 +492,7 @@ class ProControllerEmulator:
                 became_connected = self._ctl_conn is not None and self._itr_conn is not None
             if label == "control":
                 self._spawn(self._control_read_loop, (conn,))
-            if became_connected:
+            if became_connected and not self._streaming:
                 self._connected = True
                 self._streaming = True
                 self._spawn(self._stream_loop)
@@ -563,6 +523,8 @@ class ProControllerEmulator:
                 self._ctl_conn = None
             self._connected = self._ctl_conn is not None and self._itr_conn is not None
         if not self._connected:
+            # Also end the stream loop so a reconnect starts a fresh one.
+            self._streaming = False
             self._notify_state(False)
 
     def _handle_control_packet(self, data: bytes) -> None:
@@ -793,6 +755,10 @@ class ProControllerEmulator:
     @property
     def notifying(self) -> bool:
         return self._connected
+
+    @property
+    def running(self) -> bool:
+        return self._running
 
     @property
     def connected(self) -> bool:
