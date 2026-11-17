@@ -440,6 +440,11 @@ def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 15.0) -> bool:
     return False
 
 
+# Remembers that this system's btmgmt needs the decimal '<major> <minor>'
+# form, so the hanging single-argument probe is not repeated every cycle.
+_CLASS_DECIMAL_FORM = {"active": False}
+
+
 def btmgmt_set_class(adapter_index: int, cod: int) -> bool:
     """Set the Class of Device, adapting to btmgmt/kernel versions.
 
@@ -455,24 +460,27 @@ def btmgmt_set_class(adapter_index: int, cod: int) -> bool:
     registered service-class bits (e.g. audio) on top either way."""
     major_byte = (cod >> 8) & 0x1F   # 5-bit major device class
     minor_byte = cod & 0xFF          # CoD byte 0 (format 0 + minor class)
-    try:
-        result = _run_btmgmt(adapter_index, "class", f"0x{cod:06x}", timeout=6.0)
-    except Exception as e:
-        result = None
-        logger.warning("btmgmt class 0x%06x: %s", cod, e)
-    if result is not None and result.returncode == 0:
-        logger.info("btmgmt class 0x%06x ok (single-argument form)", cod)
-        return True
-    text = (result.stderr or result.stdout or "") if result is not None else ""
+    result = None
+    text = ""
+    if not _CLASS_DECIMAL_FORM["active"]:
+        try:
+            result = _run_btmgmt(adapter_index, "class", f"0x{cod:06x}", timeout=3.0)
+        except Exception as e:
+            logger.warning("btmgmt class 0x%06x: %s", cod, e)
+        if result is not None and result.returncode == 0:
+            logger.info("btmgmt class 0x%06x ok (single-argument form)", cod)
+            return True
+        text = (result.stderr or result.stdout or "") if result is not None else ""
     low = text.lower()
-    if result is None or "minor" in low or "invalid" in low:
+    if result is None or "minor" in low or "invalid" in low or _CLASS_DECIMAL_FORM["active"]:
         logger.info(
-            "btmgmt requires the decimal '<major> <minor>' form — retrying (%d %d)",
+            "btmgmt class via decimal '<major> <minor>' form (%d %d)",
             major_byte, minor_byte,
         )
-        return btmgmt_ok(
-            adapter_index, "class", str(major_byte), str(minor_byte), timeout=20.0,
-        )
+        if btmgmt_ok(adapter_index, "class", str(major_byte), str(minor_byte), timeout=20.0):
+            _CLASS_DECIMAL_FORM["active"] = True
+            return True
+        return False
     logger.warning("btmgmt class 0x%06x failed: %s", cod, text.strip() or "unknown")
     return False
 
@@ -497,9 +505,27 @@ class AdapterSettings:
 
 
 _SETTINGS_TOKEN_RE = re.compile(r"^\s*current settings:\s*(.*)$", re.IGNORECASE)
-_NAME_RE = re.compile(r"^\s*name\s*(.*)$")
-_CLASS_RE = re.compile(r"class\s+(0x[0-9a-fA-F]+)")
+# MULTILINE is essential: the name line sits mid-output ("\tname Pro Controller").
+_NAME_RE = re.compile(r"^\s*name\s*(.*)$", re.MULTILINE)
+# Flexible: one token ('0x4c010c') or three spaced bytes ('0x4c 0x01 0x0c').
+_CLASS_RE = re.compile(r"class\s+((?:0x[0-9a-fA-F]+\s*)+)", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"[^\s]+")
+
+
+def _parse_class_text(text: str):
+    """Parse the class hex(es) from btmgmt output into an int CoD."""
+    m = _CLASS_RE.search(text)
+    if not m:
+        return None
+    tokens = re.findall(r"0x[0-9a-fA-F]+", m.group(1))
+    try:
+        if len(tokens) == 3:
+            return (int(tokens[0], 16) << 16) | (int(tokens[1], 16) << 8) | int(tokens[2], 16)
+        if len(tokens) == 1:
+            return int(tokens[0], 16)
+    except ValueError:
+        pass
+    return None
 
 
 def snapshot_adapter_settings(bus: Gio.DBusConnection, adapter_path: str, adapter_index: int) -> AdapterSettings:
@@ -518,9 +544,9 @@ def snapshot_adapter_settings(bus: Gio.DBusConnection, adapter_path: str, adapte
     if m:
         name = m.group(1).strip()
         state.name = name if name else None
-    m = _CLASS_RE.search(info)
-    if m:
-        state.class_of_device = m.group(1)
+    cod = _parse_class_text(info)
+    if cod is not None:
+        state.class_of_device = f"0x{cod:06x}"
     m = _SETTINGS_TOKEN_RE.search(info)
     if m:
         tokens = {t.lower() for t in _TOKEN_RE.findall(m.group(1))}
@@ -629,18 +655,21 @@ def adapter_matches(adapter_index: int, want_name: str, want_class: str) -> bool
     except Exception:
         return False
     name_match = _NAME_RE.search(info)
-    class_match = _CLASS_RE.search(info)
     name_ok = bool(name_match) and name_match.group(1).strip() == want_name
     class_ok = False
-    if class_match:
-        try:
-            cod = int(class_match.group(1), 16)
-            # Major class 5 (Peripheral) + minor class 2 (Gamepad) — the
-            # identity a real Pro Controller advertises (0x002508). Service
-            # class bits are ignored: bluetoothd merges its own audio etc.
-            class_ok = ((cod >> 8) & 0x1F) == 0x05 and ((cod >> 2) & 0x3F) == 0x02
-        except ValueError:
-            class_ok = False
+    cod = _parse_class_text(info)
+    if cod is not None:
+        # Major class 5 (Peripheral) + minor class 2 (Gamepad) — the
+        # identity a real Pro Controller advertises (0x002508). Service
+        # class bits are ignored: bluetoothd merges its own audio etc.
+        class_ok = ((cod >> 8) & 0x1F) == 0x05 and ((cod >> 2) & 0x3F) == 0x02
+    if not (name_ok and class_ok):
+        logger.debug(
+            "identity check failed: name=%r class=0x%06x (want %s / major 5 minor 2)",
+            name_match.group(1).strip() if name_match else None,
+            cod if cod is not None else 0,
+            want_name,
+        )
     return name_ok and class_ok
 
 
@@ -688,21 +717,25 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     btmgmt_ok(adapter_index, "power", "off")
     btmgmt_ok(adapter_index, "bredr", "on")
     btmgmt_ok(adapter_index, "le", "on")
-    btmgmt_ok(adapter_index, "name", "Pro Controller")
-    btmgmt_set_class(adapter_index, 0x002508)
     btmgmt_ok(adapter_index, "ssp", "on")
     btmgmt_ok(adapter_index, "sc", "on")
     btmgmt_ok(adapter_index, "connectable", "on")
     btmgmt_ok(adapter_index, "pairable", "on")
+    btmgmt_ok(adapter_index, "power", "on")
     # BR/EDR discoverability: without inquiry scan the Mac never lists the
     # Deck in Bluetooth settings — a fresh "Pro Controller" identity is
     # invisible until then.
     btmgmt_ok(adapter_index, "discov", "on")
-    btmgmt_ok(adapter_index, "power", "on")
 
-    # Verify and, if needed, re-apply the identity (power-cycle retries are
-    # fine here — the session has not started yet).
-    return ensure_pro_controller_identity(adapter_index, allow_power_cycle=True)
+    # Identity LAST: every settings toggle can make bluetoothd re-apply its
+    # stored name/class, so write ours after everything else has settled.
+    btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
+    btmgmt_set_class(adapter_index, 0x002508)
+    time.sleep(0.5)
+
+    # Verify and, if needed, re-apply (no power-cycle here — the session
+    # starts right after and re-applying name/class is safe while powered).
+    return ensure_pro_controller_identity(adapter_index, allow_power_cycle=False)
 
 
 # ---------------------------------------------------------------------------
