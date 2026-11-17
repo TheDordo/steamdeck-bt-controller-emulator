@@ -441,28 +441,39 @@ def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 15.0) -> bool:
 
 
 def btmgmt_set_class(adapter_index: int, cod: int) -> bool:
-    """Set the Class of Device, adapting to btmgmt versions.
+    """Set the Class of Device, adapting to btmgmt/kernel versions.
 
-    Older releases take a single hex CoD ('class 0x002508'); newer ones
-    (SteamOS prerelease images) require '<major> <minor>' byte arguments and
-    fail with "Missing minor argument" otherwise. Returns True on success."""
-    major = (cod >> 8) & 0xFFFF
-    minor = cod & 0xFF
+    Older systems: 'class 0x002508' (one hex argument; btmgmt splits the
+    CoD into its major/minor bytes).
+
+    Newer systems (SteamOS prerelease): 'class <major> <minor>' with DECIMAL
+    arguments (atoi in client/mgmt.c) sent as the mgmt major/minor bytes, and
+    the kernel rejects any major byte with bits 5-7 set and any minor byte
+    whose low 2 format bits are nonzero (net/bluetooth/mgmt.c
+    set_device_class -> MGMT_STATUS_INVALID_PARAMS). The effective major
+    byte is therefore masked to the 5-bit major class; bluetoothd merges its
+    registered service-class bits (e.g. audio) on top either way."""
+    major_byte = (cod >> 8) & 0x1F   # 5-bit major device class
+    minor_byte = cod & 0xFF          # CoD byte 0 (format 0 + minor class)
     try:
-        result = _run_btmgmt(adapter_index, "class", f"0x{cod:06x}", timeout=20.0)
+        result = _run_btmgmt(adapter_index, "class", f"0x{cod:06x}", timeout=6.0)
     except Exception as e:
+        result = None
         logger.warning("btmgmt class 0x%06x: %s", cod, e)
-        return False
-    if result.returncode == 0:
+    if result is not None and result.returncode == 0:
         logger.info("btmgmt class 0x%06x ok (single-argument form)", cod)
         return True
-    text = (result.stderr or result.stdout or "")
-    if "minor" in text.lower():
-        logger.info("btmgmt uses the '<major> <minor>' form — retrying")
-        return btmgmt_ok(
-            adapter_index, "class", f"0x{major:x}", f"0x{minor:02x}", timeout=20.0,
+    text = (result.stderr or result.stdout or "") if result is not None else ""
+    low = text.lower()
+    if result is None or "minor" in low or "invalid" in low:
+        logger.info(
+            "btmgmt requires the decimal '<major> <minor>' form — retrying (%d %d)",
+            major_byte, minor_byte,
         )
-    logger.warning("btmgmt class 0x%06x failed: %s", cod, text.strip() or result.returncode)
+        return btmgmt_ok(
+            adapter_index, "class", str(major_byte), str(minor_byte), timeout=20.0,
+        )
+    logger.warning("btmgmt class 0x%06x failed: %s", cod, text.strip() or "unknown")
     return False
 
 
@@ -623,10 +634,11 @@ def adapter_matches(adapter_index: int, want_name: str, want_class: str) -> bool
     class_ok = False
     if class_match:
         try:
-            # Match the major device class byte (0x25 = Gamepad/Peripheral).
-            # Some btmgmt builds force an extra service-class bit, which is
-            # harmless — the major class is what drives the host's icon.
-            class_ok = ((int(class_match.group(1), 16) >> 8) & 0x1F) == 0x25
+            cod = int(class_match.group(1), 16)
+            # Major class 5 (Peripheral) + minor class 2 (Gamepad) — the
+            # identity a real Pro Controller advertises (0x002508). Service
+            # class bits are ignored: bluetoothd merges its own audio etc.
+            class_ok = ((cod >> 8) & 0x1F) == 0x05 and ((cod >> 2) & 0x3F) == 0x02
         except ValueError:
             class_ok = False
     return name_ok and class_ok
