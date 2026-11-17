@@ -72,17 +72,24 @@ class PairingAgent:
             self._registered_with_manager = False
 
     def _register_with_agent_manager(self) -> None:
-        self.bus.call_sync(
-            BLUEZ_SERVICE,
-            "/org/bluez",
-            AGENT_MANAGER_IFACE,
-            "RegisterAgent",
-            GLib.Variant("(os)", (self.AGENT_PATH, self.CAPABILITY)),
-            None,
-            Gio.DBusCallFlags.NONE,
-            5000,
-            None,
-        )
+        try:
+            self.bus.call_sync(
+                BLUEZ_SERVICE,
+                "/org/bluez",
+                AGENT_MANAGER_IFACE,
+                "RegisterAgent",
+                GLib.Variant("(os)", (self.AGENT_PATH, self.CAPABILITY)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                5000,
+                None,
+            )
+        except GLib.Error as e:
+            if "AlreadyExists" not in str(e):
+                raise
+            # Our agent from a previous failed start is still registered
+            # with BlueZ; that is fine — keep going.
+            logger.warning(f"Agent already registered with BlueZ ({e}); continuing")
         try:
             self.bus.call_sync(
                 BLUEZ_SERVICE,
@@ -171,11 +178,20 @@ class PairingAgent:
                     method,
                 )
 
-        reg_id = self.bus.register_object(
-            self.AGENT_PATH,
-            node_info.interfaces[0],
-            handler,
-            None,
-            None,
-        )
-        self._registrations.append(reg_id)
+        try:
+            reg_id = self.bus.register_object(
+                self.AGENT_PATH,
+                node_info.interfaces[0],
+                handler,
+                None,
+                None,
+            )
+        except GLib.Error as e:
+            if "already exported" not in str(e):
+                raise
+            # A previous failed start in this process exported the object;
+            # reuse it instead of failing the retry.
+            logger.info("Agent1 object already exported — reusing it")
+            reg_id = None
+        if reg_id is not None:
+            self._registrations.append(reg_id)

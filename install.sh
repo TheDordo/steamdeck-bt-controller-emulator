@@ -114,14 +114,21 @@ sudo cp "$INSTALL_DIR/config/bt-controller-emulator-dbus.conf" /etc/dbus-1/syste
 }
 echo "✓ D-Bus policy installed"
 
-# Install sudoers rule
+# Install sudoers rule — generated with the real install path so the bridge
+# and orphan-cleanup commands always match, no matter where the repo lives.
 echo "Installing sudoers rule..."
 sudo mkdir -p /etc/sudoers.d
-sudo cp "$INSTALL_DIR/config/bt-controller-emulator-sudoers" /etc/sudoers.d/bt-controller-emulator || {
-    echo "✗ Failed to install sudoers rule"
+sudo tee /etc/sudoers.d/bt-controller-emulator > /dev/null << EOF
+# BT Controller Emulator — passwordless btmgmt + HID L2CAP bridge
+%bluetooth ALL=(root) NOPASSWD: /usr/bin/btmgmt
+%bluetooth ALL=(root) NOPASSWD: /usr/bin/python3 ${INSTALL_DIR}/scripts/hid-l2cap-bridge.py *
+%bluetooth ALL=(root) NOPASSWD: /usr/bin/pkill -f hid-l2cap-bridge*
+EOF
+sudo chmod 0440 /etc/sudoers.d/bt-controller-emulator
+sudo visudo -c > /dev/null 2>&1 || {
+    echo "✗ Failed to validate sudoers rule (visudo -c failed)"
     exit 1
 }
-sudo chmod 0440 /etc/sudoers.d/bt-controller-emulator
 # Passwordless USB gadget setup/cleanup for this user (paths are install-specific)
 USB_SUDOERS="/etc/sudoers.d/bt-controller-emulator-usb-${CURRENT_USER}"
 sudo tee "$USB_SUDOERS" > /dev/null << EOF

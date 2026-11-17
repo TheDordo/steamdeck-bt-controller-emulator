@@ -955,6 +955,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         """Start the BLE HoG service on the GTK/GLib main thread."""
         self._shutting_down = False
         self._stop_in_progress = False
+        # Clean up leftovers from a previous failed attempt so retries can
+        # re-register D-Bus objects instead of hitting "already exported".
+        if self._pairing_agent is not None:
+            try:
+                self._pairing_agent.unregister()
+            except Exception as e:
+                logger.debug(f"Stale agent cleanup: {e}")
+            self._pairing_agent = None
+
         try:
             # Get D-Bus connection
             self._bus = get_system_bus()
@@ -1013,6 +1022,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         """Start the Pro Controller (BR/EDR HID) gamepad service on the main thread."""
         self._shutting_down = False
         self._stop_in_progress = False
+        # Clean up leftovers from a previous failed attempt so retries can
+        # re-register D-Bus objects instead of hitting "already exported".
+        if self._pairing_agent is not None:
+            try:
+                self._pairing_agent.unregister()
+            except Exception as e:
+                logger.debug(f"Stale agent cleanup: {e}")
+            self._pairing_agent = None
+
         logger.info("Pro Controller start: begin (bus + adapter discovery)")
         try:
             self._bus = get_system_bus()
