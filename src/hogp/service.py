@@ -1258,6 +1258,13 @@ class EmulatorService:
                 self._register_advertisement(gen, 0, restart_input=False)
 
         if session.get("profile") == PROFILE_GAMEPAD:
+            # Steam/SteamOS can re-assert the hostname identity (name "steamdeck"
+            # + laptop class). Keep the Pro Controller identity pinned while the
+            # session runs — without power-cycling, so an established HID
+            # connection is never dropped.
+            bluez.ensure_pro_controller_identity(
+                bluez.get_adapter_index(ADAPTER_NAME), allow_power_cycle=False,
+            )
             pro = session.get("pro")
             if pro is not None and not pro.running and not self._shutting_down:
                 logger.warning("Pro Controller listener died — restarting session")

@@ -595,6 +595,38 @@ def adapter_matches(adapter_index: int, want_name: str, want_class: str) -> bool
     return name_ok and class_ok
 
 
+def ensure_pro_controller_identity(
+    adapter_index: int = 0, allow_power_cycle: bool = True,
+) -> bool:
+    """Make the adapter advertise name 'Pro Controller' + class 0x002508.
+
+    On SteamOS the local name and class can be re-asserted by Steam (which
+    sets the hostname identity) or lost when a btmgmt call times out on
+    prerelease images. This verifies the effective identity and re-applies
+    it up to 3 times. With allow_power_cycle=False (watchdog during an
+    active session) re-application happens without touching the power state,
+    so an established HID connection is never dropped.
+
+    Returns True when the identity was verified at the end."""
+    for attempt in (1, 2, 3):
+        if adapter_matches(adapter_index, "Pro Controller", "0x002508"):
+            return True
+        logger.warning("Adapter identity drifted (attempt %d) — re-applying name/class", attempt)
+        if allow_power_cycle:
+            btmgmt_ok(adapter_index, "power", "off")
+        btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
+        btmgmt_ok(adapter_index, "class", "0x002508", timeout=20.0)
+        if allow_power_cycle:
+            btmgmt_ok(adapter_index, "power", "on")
+        time.sleep(0.5)
+    ok = adapter_matches(adapter_index, "Pro Controller", "0x002508")
+    if ok:
+        logger.info("Adapter identity verified: Pro Controller / 0x002508")
+    else:
+        logger.error("Could not apply the Pro Controller name/class — the Mac may see the Deck as a laptop")
+    return ok
+
+
 def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     """
     Classic BR/EDR posture for the Pro Controller gamepad mode.
@@ -604,7 +636,6 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     Device under the name "Pro Controller".
     """
     logger.info("Configuring adapter for Pro Controller (BR/EDR HID) mode...")
-    ok = True
     btmgmt_ok(adapter_index, "power", "off")
     btmgmt_ok(adapter_index, "bredr", "on")
     btmgmt_ok(adapter_index, "le", "on")
@@ -620,22 +651,9 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     btmgmt_ok(adapter_index, "discov", "on")
     btmgmt_ok(adapter_index, "power", "on")
 
-    # Verify the effective identity. btmgmt can hang/timeout on prerelease
-    # images, silently leaving the Deck's default laptop class in place —
-    # macOS then shows a "laptop + audio sink" instead of a gamepad.
-    # Re-apply until the name/class stick (3 attempts).
-    for attempt in (1, 2, 3):
-        if adapter_matches(adapter_index, "Pro Controller", "0x002508"):
-            logger.info("Adapter identity verified: Pro Controller / 0x002508")
-            break
-        logger.warning("Adapter identity not applied yet (attempt %d) — re-applying", attempt)
-        btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
-        btmgmt_ok(adapter_index, "class", "0x002508", timeout=20.0)
-        time.sleep(0.5)
-    else:
-        ok = False
-        logger.error("Could not apply the Pro Controller name/class — the Mac may see the Deck as a laptop")
-    return ok
+    # Verify and, if needed, re-apply the identity (power-cycle retries are
+    # fine here — the session has not started yet).
+    return ensure_pro_controller_identity(adapter_index, allow_power_cycle=True)
 
 
 # ---------------------------------------------------------------------------
