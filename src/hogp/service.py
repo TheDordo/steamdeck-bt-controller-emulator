@@ -146,6 +146,13 @@ class EmulatorService:
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         )
         logger.info("bt-controller-emulator daemon starting (pid %d)", os.getpid())
+        if os.geteuid() != 0:
+            logger.warning(
+                "Daemon is NOT running as root (euid=%d) — btmgmt, the HID "
+                "L2CAP PSMs and /dev/hidg* will fail. Start it via systemd: "
+                "sudo systemctl start bt-controller-emulator",
+                os.geteuid(),
+            )
 
         self.bus = bluez.get_system_bus()
         if not self._acquire_bus_name():
@@ -1025,6 +1032,17 @@ class EmulatorService:
                 input_handler.stop()
             except Exception as e:
                 logger.debug("input stop: %s", e)
+
+        # Release the HID L2CAP PSMs. _handle_stop stops the Pro engine on
+        # the main thread, but _fail_session skips that path — stopping here
+        # too (idempotent) guarantees a failed session can never leave the
+        # ports bound and make the next Start fail with "PSM 0x11/0x13 busy".
+        pro = session.get("pro")
+        if pro is not None:
+            try:
+                pro.stop()
+            except Exception as e:
+                logger.debug("pro stop: %s", e)
 
         if session.get("mode") == MODE_BLUETOOTH:
             adapter_path = session.get("adapter_path")

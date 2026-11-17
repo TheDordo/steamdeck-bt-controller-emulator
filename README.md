@@ -187,7 +187,20 @@ The GUI shows the exact failure. The most common causes, in order:
 1. **Daemon not running** — `sudo systemctl start bt-controller-emulator`, or re-run [install.sh](#installation).
 2. **Pairing agent error (`AlreadyExists`)** — another process holds BlueZ's default agent. `sudo systemctl restart bluetooth` clears it; nothing else should register an agent now that the daemon owns it.
 3. **SDP record error** — BlueZ rejected the profile registration. `journalctl -u bluetooth -n 50` + `journalctl -u bt-controller-emulator -n 100`.
-4. **`Address already in use` on PSM 0x11/0x13** — a Bluetooth keyboard/mouse connected **to the Deck** holds the kernel HID ports (`hidp`). The daemon tries to unload `hidp` itself and retries; otherwise disconnect those devices (`bluetoothctl devices Connected` + `bluetoothctl disconnect <MAC>`) and start again.
+4. **`Could not bind HID L2CAP sockets: PSM 0x11/0x13 busy`** — something else on the Deck holds the HID ports. The daemon already tries the usual fixes itself before giving up: it kills leftover `hid-l2cap-bridge` processes from an older install, unloads the kernel `hidp` module, and finally restarts `bluetooth.service` once. If the error persists, the message now shows the exact kernel errno and evidence of who holds the ports (full details in `journalctl -u bt-controller-emulator`). Two things to check first:
+
+   - **Daemon not running as root** — well-known PSMs need CAP_NET_BIND_SERVICE, and a manually-started daemon fails every bind with `EACCES`. Verify: `ps -eo pid,user,args | grep hogp.service` — the user column must be `root`. Start it via `sudo systemctl start bt-controller-emulator`.
+   - **A Bluetooth keyboard/mouse connected to the Deck itself** — `hidp` holds the ports for active connections and cannot be unloaded while one is up: `bluetoothctl devices Connected` → `bluetoothctl disconnect <MAC>` → Start again.
+
+   Manual checks (no `ss -f bluetooth` needed — some SteamOS iproute2 builds lack it):
+
+   ```bash
+   cat /proc/net/l2cap | grep -E '0011|0013'             # kernel view of the HID ports
+   ps -eo pid,user,args | grep hogp.service              # daemon must run as root
+   bluetoothctl devices Connected                         # Deck-side BT keyboards/mice
+   sudo systemctl restart bt-controller-emulator          # frees the daemon's own sockets
+   sudo systemctl restart bluetooth                       # catch-all: frees bluetoothd's L2CAP sockets
+   ```
 
 ### Gamepad pairs as "Pro Controller" but Mac shows nothing in Game Controllers
 

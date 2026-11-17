@@ -23,12 +23,14 @@ Protocol references:
 
 import errno
 import logging
+import os
+import re
 import socket
 import struct
 import subprocess
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from .battery import battery_charging, pro_controller_battery_level, read_battery_percent
 
@@ -254,28 +256,72 @@ def flash_read(offset: int, size: int) -> bytes:
 
 def _free_hidp() -> None:
     """Best-effort unload of the kernel hidp module (HID host role). The
-    kernel module binds the well-known HID PSMs when a Bluetooth keyboard/
-    mouse is connected to the Deck, which would block our listener."""
+    kernel module holds the well-known HID PSMs while a Bluetooth keyboard/
+    mouse is connected to the Deck, which blocks our listener."""
     try:
         subprocess.run(["modprobe", "-r", "hidp"], capture_output=True, timeout=5)
     except Exception:
         pass
 
 
+def _kill_orphaned_hid_bridges() -> None:
+    """Kill leftover HID L2CAP bridge processes from pre-rewrite installs.
+    The old fork spawned scripts/hid-l2cap-bridge.py via sudo; after a crash
+    the orphan keeps PSM 0x11/0x13 bound forever. The daemon runs as root,
+    so plain pkill works. The bracketed pattern avoids matching pkill's own
+    command line."""
+    try:
+        result = subprocess.run(
+            ["pkill", "-f", "hid-l2cap-bridg[e]"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            logger.info("Killed orphaned HID L2CAP bridge process(es) from an older install")
+    except Exception as e:
+        logger.debug("pkill hid-l2cap-bridge: %s", e)
+
+
+def _restart_bluetoothd() -> bool:
+    """Restart bluetooth.service as a last resort to free the well-known HID
+    PSMs: it closes every L2CAP socket bluetoothd owns and drops Deck-side
+    HID connections. The daemon's name-owner watch tolerates the brief bus
+    outage (sessions only self-heal when already active)."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", "bluetooth"],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("bluetooth.service restarted")
+            return True
+        logger.warning("systemctl restart bluetooth failed: %s", result.stderr.strip())
+        return False
+    except Exception as e:
+        logger.warning("systemctl restart bluetooth failed: %s", e)
+        return False
+
+
 def _diagnose_busy_psms() -> str:
-    """Collect evidence about who holds the well-known HID PSMs."""
+    """Collect evidence about who holds the well-known HID PSMs.
+
+    Uses only /proc + bluetoothctl (some SteamOS images ship an iproute2
+    without 'ss -f bluetooth' support)."""
     parts = []
     try:
         out = subprocess.run(
             ["cat", "/proc/net/l2cap"],
             capture_output=True, text=True, timeout=5,
         )
-        lines = [l for l in out.stdout.splitlines() if "0011" in l or "0013" in l]
+        all_lines = out.stdout.splitlines()
+        relevant = [l for l in all_lines if "0011" in l or "0013" in l]
         parts.append(
-            "L2CAP listeners on PSM 0x11/0x13 (kernel 'hidp' lines mean a "
-            "Bluetooth keyboard/mouse session on this machine):\n"
-            + ("\n".join(lines) if lines else "  (none listed)")
+            "Kernel L2CAP view — PSM 0x11/0x13 entries (LISTEN or CONNECTED):\n"
+            + ("\n".join(relevant) if relevant else "  (none listed)")
         )
+        if all_lines:
+            parts.append(
+                "Full kernel L2CAP view:\n" + "\n".join("  " + l for l in all_lines[:15])
+            )
     except Exception:
         parts.append("(could not read /proc/net/l2cap)")
     try:
@@ -290,60 +336,124 @@ def _diagnose_busy_psms() -> str:
         parts.append("(could not run lsmod)")
     try:
         out = subprocess.run(
-            ["ss", "-f", "bluetooth", "-lpn"],
-            capture_output=True, text=True, timeout=5,
+            ["bluetoothctl", "devices", "Connected"],
+            capture_output=True, text=True, timeout=10,
+        )
+        lines = [
+            l.strip() for l in out.stdout.splitlines()
+            if l.strip() and "devices Connected" not in l
+        ]
+        parts.append(
+            "Bluetooth devices connected to this Deck:\n"
+            + ("\n".join("  " + l for l in lines) if lines else "  (none)")
+        )
+    except Exception:
+        parts.append("(bluetoothctl unavailable)")
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, timeout=5,
         )
         lines = [
             l for l in out.stdout.splitlines()
-            if " 17 " in l or " 19 " in l or "psm" in l.lower()
-            or "0x11" in l or "0x13" in l
+            if "hogp" in l or "hid-l2cap" in l or "btemu" in l
         ]
         parts.append(
-            "ss bluetooth listeners (PIDs shown):\n"
-            + ("\n".join(lines) if lines else "  (none listed)")
+            "emulator-related processes:\n"
+            + ("\n".join(lines) if lines else "  (none)")
         )
     except Exception:
-        parts.append("(ss -f bluetooth unsupported)")
+        parts.append("(could not run ps)")
     return "\n".join(parts)
 
 
-def _bind_l2cap_with_retries(bdaddr: str, psm: int, attempts: int = 30, delay: float = 0.5) -> Optional[socket.socket]:
-    """Bind one well-known HID L2CAP PSM, tolerating a briefly-busy port
-    (a previous instance still dying) and freeing the kernel hidp module's
-    well-known PSMs if it holds them. Runs as root inside the daemon, so
-    CAP_NET_BIND_SERVICE is not an issue."""
+def _bind_l2cap_with_retries(
+    bdaddr: str, psm: int, attempts: int = 20, delay: float = 0.5,
+) -> Tuple[Optional[socket.socket], Optional[str]]:
+    """Bind one well-known HID L2CAP PSM, tolerating a briefly-busy port.
+
+    Clearance steps, in order:
+      1. kill orphaned bridge processes from pre-rewrite installs,
+      2. unload the kernel hidp module (holds the PSMs while a Bluetooth
+         keyboard/mouse is connected to the Deck),
+      3. if the port is still busy after retries, restart bluetooth.service
+         ONCE as a last resort (closes L2CAP sockets it owns, drops Deck-side
+         HID connections) and retry briefly.
+
+    Runs as root inside the daemon, so CAP_NET_BIND_SERVICE is not an issue.
+
+    Returns (listener, error_detail): the listener socket, or None with a
+    diagnostic describing who holds the port when all attempts fail."""
+
+    def attempt_once() -> socket.socket:
+        listener = socket.socket(
+            socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
+        )
+        listener.bind((bdaddr, psm))
+        listener.listen(1)
+        return listener
+
+    # Well-known PSMs require CAP_NET_BIND_SERVICE. Running the daemon by
+    # hand as a normal user fails every bind with EACCES — fail fast with a
+    # clear message instead of retrying and reporting "PSM busy".
+    if os.geteuid() != 0:
+        message = (
+            f"the daemon is not running as root (euid={os.geteuid()}) — "
+            "well-known HID PSMs need CAP_NET_BIND_SERVICE. Start it via "
+            "systemd: sudo systemctl start bt-controller-emulator"
+        )
+        logger.error("HID L2CAP PSM 0x%x bind: %s", psm, message)
+        return None, message
+
     last_err = None
+    _kill_orphaned_hid_bridges()
     _free_hidp()  # free the ports before the first attempt
     for attempt in range(attempts):
-        listener = None
         try:
-            listener = socket.socket(
-                socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
-            )
-            listener.bind((bdaddr, psm))
-            listener.listen(1)
-            return listener
+            return attempt_once(), None
         except OSError as e:
             last_err = e
-            if listener is not None:
-                try:
-                    listener.close()
-                except Exception:
-                    pass
             if e.errno not in (errno.EADDRINUSE, errno.EACCES):
                 raise
             if attempt == 3 or attempt == attempts - 2:
-                # hidp can be re-loaded by BlueZ mid-flight; retry unloading.
+                # hidp can be re-loaded by BlueZ mid-flight; retry clearing.
+                _kill_orphaned_hid_bridges()
                 _free_hidp()
             time.sleep(delay)
-    logger.error(
-        "HID L2CAP PSM 0x%x is still busy (%s).\n%s\n"
-        "Recovery: disconnect Bluetooth keyboards/mice from this machine "
-        "('bluetoothctl devices Connected' + 'bluetoothctl disconnect <MAC>'), "
-        "then start the service again.",
-        psm, last_err, _diagnose_busy_psms(),
+
+    # Last resort: one bluetoothd restart frees everything BlueZ holds.
+    if _restart_bluetoothd():
+        logger.warning(
+            "Restarted bluetooth.service to free PSM 0x%x — final bind attempts", psm,
+        )
+        time.sleep(2)
+        for _ in range(8):
+            try:
+                return attempt_once(), None
+            except OSError as e:
+                last_err = e
+                if e.errno not in (errno.EADDRINUSE, errno.EACCES):
+                    raise
+                time.sleep(0.5)
+
+    err_name = (
+        errno.errorcode.get(last_err.errno, f"E{last_err.errno}")
+        if last_err is not None else "?"
     )
-    return None
+    diagnosis = _diagnose_busy_psms()
+    logger.error(
+        "HID L2CAP PSM 0x%x bind failed with %s (%s) after clearing bridges, "
+        "unloading hidp and restarting bluetooth.service.\n%s\n%s",
+        psm, err_name, last_err, diagnosis,
+        (
+            "Remaining cause: a Bluetooth keyboard/mouse connected to the "
+            "Deck itself (bluetoothctl devices Connected → bluetoothctl "
+            "disconnect <MAC>), or another HID emulator process."
+            if err_name == "EADDRINUSE" else
+            "EACCES means the daemon lacks CAP_NET_BIND_SERVICE "
+            "(not running as root?)."
+        ),
+    )
+    return None, diagnosis
 
 
 # ---------------------------------------------------------------------------
@@ -427,15 +537,32 @@ class ProControllerEmulator:
         if self._running:
             return True
         try:
-            self._ctl_sock = _bind_l2cap_with_retries(self.adapter_address, HID_CTRL_PSM)
-            self._itr_sock = _bind_l2cap_with_retries(self.adapter_address, HID_INTR_PSM)
+            self._ctl_sock, ctl_err = _bind_l2cap_with_retries(self.adapter_address, HID_CTRL_PSM)
+            if self._ctl_sock is None:
+                # Same conflict will block the interrupt PSM — fail fast.
+                self._itr_sock, itr_err = None, None
+            else:
+                self._itr_sock, itr_err = _bind_l2cap_with_retries(self.adapter_address, HID_INTR_PSM)
         except OSError as e:
             self.last_error = f"local channel sockets: {e}"
             logger.error("Could not create L2CAP listeners: %s", e)
             self.stop()
             return False
         if self._ctl_sock is None or self._itr_sock is None:
-            self.last_error = "PSM 0x11/0x13 busy — another HID service holds the ports"
+            detail = (itr_err or ctl_err or "(no details)").replace("\n", " ")
+            if "not running as root" in detail:
+                # EACCES misdiagnosis guard: show the real reason verbatim.
+                self.last_error = detail[:400]
+            else:
+                self.last_error = (
+                    "PSM 0x11/0x13 busy — another HID service holds the ports. "
+                    "The daemon cleared stray bridges, unloaded hidp, and "
+                    "restarted bluetooth.service; if this persists, disconnect "
+                    "Bluetooth keyboards/mice that are paired to the Deck "
+                    "itself (bluetoothctl devices Connected → bluetoothctl "
+                    "disconnect <MAC>), then Start again. "
+                    "Details: " + detail[:400]
+                )
             self.stop()
             return False
 
