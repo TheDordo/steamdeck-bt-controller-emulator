@@ -129,6 +129,24 @@ sudo visudo -c > /dev/null 2>&1 || {
     echo "✗ Failed to validate sudoers rule (visudo -c failed)"
     exit 1
 }
+
+# L2CAP bridge helper: a setcap'd copy of the system Python so the bridge
+# can bind the well-known HID PSMs without sudo (kernel needs
+# CAP_NET_BIND_SERVICE). PYTHONHOME pins the standard library location.
+echo "Setting up the L2CAP bridge helper (no sudo needed at runtime)..."
+cp -L /usr/bin/python3 "$INSTALL_DIR/.bridge-python" 2>/dev/null || true
+chmod 755 "$INSTALL_DIR/.bridge-python" 2>/dev/null || true
+if sudo setcap cap_net_bind_service+eip "$INSTALL_DIR/.bridge-python" 2>/dev/null; then
+    if PYTHONHOME=/usr "$INSTALL_DIR/.bridge-python" -c \
+        "import socket; s=socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP); s.bind(('00:00:00:00:00:00', 0x11)); print('cap-bind-ok')" \
+        2>/dev/null | grep -q cap-bind-ok; then
+        echo "✓ Bridge helper ready (gamepad mode needs no sudo)"
+    else
+        echo "⚠ Bridge helper could not bind — the bridge will fall back to sudo"
+    fi
+else
+    echo "⚠ setcap failed (filesystem restrictions?) — the bridge will fall back to sudo"
+fi
 # Passwordless USB gadget setup/cleanup for this user (paths are install-specific)
 USB_SUDOERS="/etc/sudoers.d/bt-controller-emulator-usb-${CURRENT_USER}"
 sudo tee "$USB_SUDOERS" > /dev/null << EOF

@@ -355,37 +355,59 @@ class ProControllerEmulator:
             os.path.dirname(os.path.abspath(__file__)),
             "..", "..", "scripts", "hid-l2cap-bridge.py",
         )
+        bridge_python = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", ".bridge-python",
+        )
         bridge_log_path = "/tmp/hogp-bridge.log"
         try:
             self._bridge_log = open(bridge_log_path, "w")
         except OSError:
             self._bridge_log = None
         # Kill orphaned bridges from previous crashed runs (they hold the
-        # well-known PSMs). The bracketed pattern avoids matching pkill's
-        # own command line. Absolute paths are used so the sudoers rule
-        # matches byte-for-byte regardless of sudo's secure_path.
-        try:
-            subprocess.run(
-                ["sudo", "-n", "/usr/bin/pkill", "-f", "hid-l2cap-bridg[e]"],
-                capture_output=True,
-                timeout=5,
-            )
-        except Exception:
-            pass
+        # well-known PSMs). Orphans normally run as this same user, so a
+        # plain pkill works; the sudo variant is a best-effort extra. The
+        # bracketed pattern avoids matching pkill's own command line.
+        for killer in (
+            ["pkill", "-f", "hid-l2cap-bridg[e]"],
+            ["sudo", "-n", "/usr/bin/pkill", "-f", "hid-l2cap-bridg[e]"],
+        ):
+            try:
+                subprocess.run(killer, capture_output=True, timeout=5)
+            except Exception:
+                pass
+        # Preferred: the setcap'd interpreter created by install.sh — no
+        # sudo, no sudoers, no policy wrappers. Falls back to sudo when the
+        # helper is missing (e.g. before re-running install.sh).
+        if os.path.exists(bridge_python):
+            cmd = [
+                bridge_python, bridge_path,
+                "--ctrl", UNIX_CTRL_NAME,
+                "--intr", UNIX_INTR_NAME,
+                "--bdaddr", self.adapter_address,
+            ]
+            env = dict(os.environ, PYTHONHOME="/usr")
+            mode = "setcap helper"
+        else:
+            cmd = [
+                "sudo", "-n", sys.executable, bridge_path,
+                "--ctrl", UNIX_CTRL_NAME,
+                "--intr", UNIX_INTR_NAME,
+                "--bdaddr", self.adapter_address,
+            ]
+            env = None
+            mode = "sudo fallback"
         try:
             self._bridge_proc = subprocess.Popen(
-                [
-                    "sudo", "-n", sys.executable, bridge_path,
-                    "--ctrl", UNIX_CTRL_NAME,
-                    "--intr", UNIX_INTR_NAME,
-                    "--bdaddr", self.adapter_address,
-                ],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=self._bridge_log,
+                env=env,
             )
         except (FileNotFoundError, ValueError, OSError) as e:
             self.last_error = (
-                f"launch: {e} (bridge: {bridge_path}, python: {sys.executable})"
+                f"launch: {e} (mode: {mode}, bridge: {bridge_path}, "
+                f"python: {sys.executable})"
             )
             logger.error("Could not launch the L2CAP bridge: %s", e)
             self.stop()
