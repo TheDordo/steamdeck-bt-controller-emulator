@@ -440,6 +440,32 @@ def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 15.0) -> bool:
     return False
 
 
+def btmgmt_set_class(adapter_index: int, cod: int) -> bool:
+    """Set the Class of Device, adapting to btmgmt versions.
+
+    Older releases take a single hex CoD ('class 0x002508'); newer ones
+    (SteamOS prerelease images) require '<major> <minor>' byte arguments and
+    fail with "Missing minor argument" otherwise. Returns True on success."""
+    major = (cod >> 8) & 0xFFFF
+    minor = cod & 0xFF
+    try:
+        result = _run_btmgmt(adapter_index, "class", f"0x{cod:06x}", timeout=20.0)
+    except Exception as e:
+        logger.warning("btmgmt class 0x%06x: %s", cod, e)
+        return False
+    if result.returncode == 0:
+        logger.info("btmgmt class 0x%06x ok (single-argument form)", cod)
+        return True
+    text = (result.stderr or result.stdout or "")
+    if "minor" in text.lower():
+        logger.info("btmgmt uses the '<major> <minor>' form — retrying")
+        return btmgmt_ok(
+            adapter_index, "class", f"0x{major:x}", f"0x{minor:02x}", timeout=20.0,
+        )
+    logger.warning("btmgmt class 0x%06x failed: %s", cod, text.strip() or result.returncode)
+    return False
+
+
 @dataclass
 class AdapterSettings:
     """Adapter settings we touch, snapshotted before a session and restored
@@ -534,7 +560,10 @@ def restore_adapter_settings(
     if state.name is not None:
         btmgmt_ok(adapter_index, "name", state.name)
     if state.class_of_device is not None:
-        btmgmt_ok(adapter_index, "class", state.class_of_device)
+        try:
+            btmgmt_set_class(adapter_index, int(state.class_of_device, 16))
+        except ValueError:
+            logger.warning("Could not parse snapshotted class: %r", state.class_of_device)
     btmgmt_ok(adapter_index, "bredr", "on" if state.bredr else "off")
     btmgmt_ok(adapter_index, "le", "on" if state.le else "off")
     btmgmt_ok(adapter_index, "ssp", "on" if state.ssp else "off")
@@ -575,7 +604,7 @@ def configure_adapter_for_hog_peripheral(adapter_index: int = 0) -> bool:
     if not btmgmt_ok(adapter_index, "bredr", "off"):
         ok = False
     btmgmt_ok(adapter_index, "le", "on")
-    btmgmt_ok(adapter_index, "class", "0x002508")   # Peripheral / Gamepad
+    btmgmt_set_class(adapter_index, 0x002508)   # Peripheral / Gamepad
     btmgmt_ok(adapter_index, "connectable", "on")
     btmgmt_ok(adapter_index, "pairable", "on")
     btmgmt_ok(adapter_index, "power", "on")
@@ -591,7 +620,15 @@ def adapter_matches(adapter_index: int, want_name: str, want_class: str) -> bool
     name_match = _NAME_RE.search(info)
     class_match = _CLASS_RE.search(info)
     name_ok = bool(name_match) and name_match.group(1).strip() == want_name
-    class_ok = bool(class_match) and class_match.group(1).lower() == want_class.lower()
+    class_ok = False
+    if class_match:
+        try:
+            # Match the major device class byte (0x25 = Gamepad/Peripheral).
+            # Some btmgmt builds force an extra service-class bit, which is
+            # harmless — the major class is what drives the host's icon.
+            class_ok = ((int(class_match.group(1), 16) >> 8) & 0x1F) == 0x25
+        except ValueError:
+            class_ok = False
     return name_ok and class_ok
 
 
@@ -615,7 +652,7 @@ def ensure_pro_controller_identity(
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "off")
         btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
-        btmgmt_ok(adapter_index, "class", "0x002508", timeout=20.0)
+        btmgmt_set_class(adapter_index, 0x002508)
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "on")
         time.sleep(0.5)
@@ -640,7 +677,7 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     btmgmt_ok(adapter_index, "bredr", "on")
     btmgmt_ok(adapter_index, "le", "on")
     btmgmt_ok(adapter_index, "name", "Pro Controller")
-    btmgmt_ok(adapter_index, "class", "0x002508")
+    btmgmt_set_class(adapter_index, 0x002508)
     btmgmt_ok(adapter_index, "ssp", "on")
     btmgmt_ok(adapter_index, "sc", "on")
     btmgmt_ok(adapter_index, "connectable", "on")
