@@ -422,10 +422,10 @@ def _run_btmgmt(adapter_index: int, *args: str, timeout: float = 8.0) -> "subpro
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 15.0) -> bool:
+def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 8.0) -> bool:
     """Run btmgmt, returning True on success (logs failures). btmgmt can hang
-    while bluetoothd restarts; a generous timeout keeps best-effort calls
-    from stalling the daemon's teardown path."""
+    while bluetoothd restarts; the timeout bounds how long a worker thread
+    is busy and keeps best-effort calls from piling up."""
     try:
         result = _run_btmgmt(adapter_index, *args, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -477,7 +477,7 @@ def btmgmt_set_class(adapter_index: int, cod: int) -> bool:
             "btmgmt class via decimal '<major> <minor>' form (%d %d)",
             major_byte, minor_byte,
         )
-        if btmgmt_ok(adapter_index, "class", str(major_byte), str(minor_byte), timeout=20.0):
+        if btmgmt_ok(adapter_index, "class", str(major_byte), str(minor_byte), timeout=8.0):
             _CLASS_DECIMAL_FORM["active"] = True
             return True
         return False
@@ -692,7 +692,7 @@ def ensure_pro_controller_identity(
         logger.warning("Adapter identity drifted (attempt %d) — re-applying name/class", attempt)
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "off")
-        btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
+        btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=8.0)
         btmgmt_set_class(adapter_index, 0x002508)
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "on")
@@ -749,7 +749,7 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
 
     # Identity LAST: every settings toggle can make bluetoothd re-apply its
     # stored name/class, so write ours after everything else has settled.
-    btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=20.0)
+    btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=8.0)
     btmgmt_set_class(adapter_index, 0x002508)
     time.sleep(0.5)
 

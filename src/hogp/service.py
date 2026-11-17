@@ -136,6 +136,10 @@ class EmulatorService:
         self._bond_in_progress = False
         self._last_bond_attempt = 0.0
         self._last_bond_device = None
+        # True while the watchdog's btmgmt identity/posture verification runs
+        # in a worker thread (btmgmt can hang on prerelease images — it must
+        # never block the main loop, which would freeze the GUI).
+        self._identity_check_busy = False
 
         # Serializes adapter posture work (btmgmt) against stop-time restore.
         self._adapter_lock = threading.Lock()
@@ -1280,10 +1284,11 @@ class EmulatorService:
             # + laptop class) and flip pairing settings. Keep the Pro Controller
             # identity and pairing posture pinned while the session runs — without
             # power-cycling, so an established HID connection is never dropped.
-            bluez.ensure_pro_controller_identity(
-                bluez.get_adapter_index(ADAPTER_NAME), allow_power_cycle=False,
-            )
-            bluez.ensure_pro_controller_posture(bluez.get_adapter_index(ADAPTER_NAME))
+            # Run in a worker: btmgmt hangs for seconds on prerelease images and
+            # must never block the main loop (that froze the GUI).
+            if not self._identity_check_busy:
+                self._identity_check_busy = True
+                self._spawn_worker(self._identity_worker, gen)
             pro = session.get("pro")
             if pro is not None and not pro.running and not self._shutting_down:
                 logger.warning("Pro Controller listener died — restarting session")
@@ -1294,6 +1299,24 @@ class EmulatorService:
 
         self._emit_status()
         return True
+
+    def _identity_worker(self, gen: int) -> None:
+        """Watchdog worker: verify/re-assert the Pro Controller identity and
+        pairing posture. Runs off the main loop because btmgmt can hang."""
+        try:
+            idx = bluez.get_adapter_index(ADAPTER_NAME)
+            if self._session is not None and self._session.get("generation") == gen:
+                bluez.ensure_pro_controller_identity(idx, allow_power_cycle=False)
+                bluez.ensure_pro_controller_posture(idx)
+        except Exception as e:
+            logger.warning("identity worker: %s", e)
+        finally:
+
+            def done():
+                self._identity_check_busy = False
+                return False
+
+            GLib.idle_add(done)
 
     def _update_device_status(self, device: Optional[Dict]) -> None:
         if device is None:
