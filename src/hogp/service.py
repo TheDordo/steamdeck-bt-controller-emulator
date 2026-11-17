@@ -575,10 +575,14 @@ class EmulatorService:
             if session.get("profile") == PROFILE_GAMEPAD:
                 bluez.configure_adapter_for_pro_controller(idx)
                 bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
+                # BR/EDR discoverable so hosts can find "Pro Controller".
+                bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
                 bluez.set_static_ble_address(idx, STATIC_BLE_ADDRESS)
                 bluez.configure_adapter_for_hog_peripheral(idx)
                 bluez.set_adapter_alias(bus, adapter_path, HOGP_DEVICE_NAME)
+                # LE mode: the advertisement handles visibility.
+                bluez.set_adapter_discoverable(bus, adapter_path, False)
             bluez.ensure_adapter_powered(bus, adapter_path)
             GLib.idle_add(self._after_adapter_ready, gen)
 
@@ -593,8 +597,10 @@ class EmulatorService:
             idx = bluez.get_adapter_index(ADAPTER_NAME)
             if session.get("profile") == PROFILE_GAMEPAD:
                 bluez.configure_adapter_for_pro_controller(idx)
+                bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
                 bluez.configure_adapter_for_hog_peripheral(idx)
+                bluez.set_adapter_discoverable(bus, adapter_path, False)
             bluez.ensure_adapter_powered(bus, adapter_path)
             GLib.idle_add(self._after_adapter_ready, gen)
 

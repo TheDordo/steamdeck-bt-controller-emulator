@@ -21,6 +21,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 
 HID_CTRL_PSM = 0x11
 HID_INTR_PSM = 0x13
@@ -105,6 +106,32 @@ def debugfs_l2cap() -> str:
 
 
 def main() -> int:
+    # Watch mode: keep binding and report the moment a conflict appears.
+    # Run it in one terminal while clicking Start Service in the GUI.
+    if "--watch" in sys.argv:
+        try:
+            seconds = float(sys.argv[sys.argv.index("--watch") + 1])
+        except (IndexError, ValueError):
+            seconds = 30.0
+        print(f"Watching PSM 0x11 for {seconds:.0f}s — click Start Service "
+              "in the other window now…")
+        end = time.monotonic() + seconds
+        failures = 0
+        while time.monotonic() < end:
+            result = try_bind("00:00:00:00:00:00", HID_CTRL_PSM)
+            if result != "OK":
+                failures += 1
+                print(f"[t+{time.monotonic():.1f}] PSM 0x11: {result}")
+                # A conflict is visible — dump the evidence while it lasts.
+                print("--- debugfs channels right now ---")
+                for line in debugfs_l2cap().splitlines():
+                    mark = "   <<< PSM 0x11/0x13" if (" 17 " in line or " 19 " in line) else ""
+                    print("  " + line + mark)
+                break
+            time.sleep(0.1)
+        print(f"Done. conflicts seen: {failures}")
+        return 0
+
     print("=== HID L2CAP PSM diagnostic ===")
     print(f"euid: {os.geteuid()}  (must be 0 — well-known PSMs need CAP_NET_BIND_SERVICE)")
     addr = adapter_address()
@@ -142,7 +169,8 @@ def main() -> int:
 
     print("--- debugfs L2CAP channel table (PSM + state per channel) ---")
     for line in debugfs_l2cap().splitlines():
-        mark = "   <<< PSM 0x11/0x13" if ("0x0011" in line or "0x0013" in line) else ""
+        # debugfs prints the PSM in decimal: 17 = 0x11, 19 = 0x13.
+        mark = "   <<< PSM 0x11/0x13" if (" 17 " in line or " 19 " in line) else ""
         print("  " + line + mark)
     print()
 

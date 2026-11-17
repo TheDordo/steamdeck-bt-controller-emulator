@@ -147,6 +147,17 @@ def set_adapter_alias(bus: Gio.DBusConnection, adapter_path: str, alias: str) ->
     return set_adapter_property(bus, adapter_path, "Alias", GLib.Variant("s", alias))
 
 
+def set_adapter_discoverable(
+    bus: Gio.DBusConnection, adapter_path: str, discoverable: bool = True,
+) -> bool:
+    """Toggle BR/EDR discoverable mode (inquiry scan). Needed by the Pro
+    Controller mode so hosts can find the Deck in a Bluetooth scan; stays
+    off in LE mode where the advertisement handles visibility."""
+    return set_adapter_property(
+        bus, adapter_path, "Discoverable", GLib.Variant("b", discoverable)
+    )
+
+
 def ensure_adapter_powered(bus: Gio.DBusConnection, adapter_path: str) -> bool:
     """Power the adapter on and allow pairing."""
     if not set_adapter_property(bus, adapter_path, "Powered", GLib.Variant("b", True)):
@@ -591,6 +602,10 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     btmgmt_ok(adapter_index, "sc", "on")
     btmgmt_ok(adapter_index, "connectable", "on")
     btmgmt_ok(adapter_index, "pairable", "on")
+    # BR/EDR discoverability: without inquiry scan the Mac never lists the
+    # Deck in Bluetooth settings — a fresh "Pro Controller" identity is
+    # invisible until then.
+    btmgmt_ok(adapter_index, "discov", "on")
     btmgmt_ok(adapter_index, "power", "on")
     return ok
 

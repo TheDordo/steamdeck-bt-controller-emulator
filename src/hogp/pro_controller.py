@@ -490,7 +490,11 @@ def _bind_l2cap_with_retries(
             time.sleep(delay)
 
     # Last resort: one bluetoothd restart frees everything BlueZ holds.
-    if _restart_bluetoothd():
+    # NOTE: on SteamOS prerelease images, bluetoothd re-registers its own
+    # HID channels at startup, so a restart can re-arm the conflict instead
+    # of fixing it. BTEMU_SKIP_BT_RESTART=1 in the service environment
+    # disables the restart for those images.
+    if not os.environ.get("BTEMU_SKIP_BT_RESTART") and _restart_bluetoothd():
         logger.warning(
             "Restarted bluetooth.service to free PSM 0x%x — final bind attempts", psm,
         )

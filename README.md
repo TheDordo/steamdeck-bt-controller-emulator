@@ -247,6 +247,16 @@ The daemon calls `Device1.Pair()` and sets `Trusted` when HID notifications star
 
 Some prerelease builds do not expose built-in controls to evdev while Steam or the kernel holds them. Use `diagnose.sh` and `evtest`. Mitigations: Desktop Mode, exit Steam before starting the service, **Stable** channel, or USB mode with DRD.
 
+### Pro Controller fails with PSM 0x11/0x13 busy on Preview / Main
+
+Newer prerelease images ship a bluetoothd whose `input` plugin registers the HID L2CAP PSMs itself. Symptoms: Start fails with **PSM 0x11/0x13 busy** even with nothing paired, and `sudo python3 scripts/check-psm.py` shows bluetoothd channels on PSMs 17/19 in the debugfs table.
+
+```bash
+sudo bash ~/steamdeck-bt-controller-emulator/scripts/disable-bluez-input.sh
+```
+
+Revert with `--undo`. While the plugin is disabled, the Deck cannot use Bluetooth keyboards/mice connected to itself — nothing else is affected (the emulator's own pairing/audio paths don't need it).
+
 ### General pairing / mapping tips
 
 - Confirm matching PIN when prompted (often acknowledge on PC first, then Deck)
