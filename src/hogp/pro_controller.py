@@ -561,6 +561,8 @@ class ProControllerEmulator:
                     "Bluetooth keyboards/mice that are paired to the Deck "
                     "itself (bluetoothctl devices Connected → bluetoothctl "
                     "disconnect <MAC>), then Start again. "
+                    "Tip: the Keyboard profile (BLE HOGP) does not use these "
+                    "ports — switch to it if a BT keyboard/gamepad is enough. "
                     "Details: " + detail[:400]
                 )
             self.stop()
