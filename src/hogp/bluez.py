@@ -411,8 +411,10 @@ def _run_btmgmt(adapter_index: int, *args: str, timeout: float = 8.0) -> "subpro
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
-def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 8.0) -> bool:
-    """Run btmgmt, returning True on success (logs failures)."""
+def btmgmt_ok(adapter_index: int, *args: str, timeout: float = 15.0) -> bool:
+    """Run btmgmt, returning True on success (logs failures). btmgmt can hang
+    while bluetoothd restarts; a generous timeout keeps best-effort calls
+    from stalling the daemon's teardown path."""
     try:
         result = _run_btmgmt(adapter_index, *args, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:

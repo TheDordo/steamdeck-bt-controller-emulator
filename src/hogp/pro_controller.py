@@ -301,36 +301,105 @@ def _restart_bluetoothd() -> bool:
         return False
 
 
+def _socket_inode_owners() -> dict:
+    """Map L2CAP socket inode (string) -> 'pid (comm)' by walking /proc.
+    Works on any kernel — no iproute2/debugfs needed."""
+    owners: dict = {}
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return owners
+    for pid in pids:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            comm = "?"
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target.startswith("socket:["):
+                owners.setdefault(target[8:-1], f"{pid} ({comm})")
+    return owners
+
+
+def _debugfs_l2cap() -> str:
+    """Best-effort debugfs dump of the L2CAP channel table. Unlike
+    /proc/net/l2cap on newer kernels, it includes the PSM and state of every
+    channel — the definitive answer to 'who holds PSM 0x11/0x13'."""
+    mount_point = "/sys/kernel/debug"
+    path = f"{mount_point}/bluetooth/l2cap"
+    try:
+        if not os.path.exists(path):
+            os.makedirs(mount_point, exist_ok=True)
+            subprocess.run(
+                ["mount", "-t", "debugfs", "debugfs", mount_point],
+                capture_output=True, timeout=10,
+            )
+        if os.path.exists(path):
+            out = subprocess.run(
+                ["cat", path], capture_output=True, text=True, timeout=5,
+            )
+            return out.stdout.strip() or "(empty debugfs l2cap table)"
+        return "(debugfs mount failed)"
+    except Exception as e:
+        return f"(debugfs unavailable: {e})"
+
+
 def _diagnose_busy_psms() -> str:
     """Collect evidence about who holds the well-known HID PSMs.
 
-    Uses only /proc + bluetoothctl (some SteamOS images ship an iproute2
-    without 'ss -f bluetooth' support)."""
+    Uses only /proc + bluetoothctl + debugfs (some SteamOS images ship an
+    iproute2 without 'ss -f bluetooth' support, and kernels >= 6.10 removed
+    the PSM column from /proc/net/l2cap)."""
     parts = []
+    owners = _socket_inode_owners()
     try:
         out = subprocess.run(
             ["cat", "/proc/net/l2cap"],
             capture_output=True, text=True, timeout=5,
         )
         all_lines = out.stdout.splitlines()
+        # Legacy kernels print address/PSM columns; kernels >= 6.10 print
+        # 'sk RefCnt Rmem Wmem User Inode Parent'. Handle both.
         relevant = [l for l in all_lines if "0011" in l or "0013" in l]
         parts.append(
-            "Kernel L2CAP view — PSM 0x11/0x13 entries (LISTEN or CONNECTED):\n"
-            + ("\n".join(relevant) if relevant else "  (none listed)")
+            "Kernel L2CAP view — PSM 0x11/0x13 entries:\n"
+            + ("\n".join(relevant) if relevant else "  (none in the legacy column — see socket owners below)")
         )
-        if all_lines:
+        if all_lines and not all_lines[0].startswith("sk "):
             parts.append(
                 "Full kernel L2CAP view:\n" + "\n".join("  " + l for l in all_lines[:15])
             )
+        # New-format rows: attribute every socket to its owning process.
+        for line in all_lines:
+            if line.startswith("sk ") or not line.strip():
+                continue
+            fields = line.split()
+            if len(fields) >= 6:
+                inode = fields[5]
+                owner = owners.get(inode)
+                if owner:
+                    parts.append(
+                        f"L2CAP socket inode {inode} is held by process {owner}"
+                    )
     except Exception:
         parts.append("(could not read /proc/net/l2cap)")
+    parts.append("debugfs channel table (PSM + state per channel):\n  " + _debugfs_l2cap())
     try:
         out = subprocess.run(
             ["lsmod"], capture_output=True, text=True, timeout=5,
         )
         hidp = [l for l in out.stdout.splitlines() if l.startswith("hidp")]
         parts.append(
-            "hidp module: " + ("LOADED: " + hidp[0] if hidp else "not loaded")
+            "hidp module: " + ("LOADED: " + hidp[0] if hidp else "not loaded / built-in")
         )
     except Exception:
         parts.append("(could not run lsmod)")
@@ -453,7 +522,8 @@ def _bind_l2cap_with_retries(
             "(not running as root?)."
         ),
     )
-    return None, diagnosis
+    # Lead with the exact port + errno so it survives the GUI truncation.
+    return None, f"bind PSM 0x{psm:04x} failed: {err_name} ({last_err}). " + diagnosis
 
 
 # ---------------------------------------------------------------------------

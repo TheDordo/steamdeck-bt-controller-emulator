@@ -268,7 +268,9 @@ class EmulatorService:
             None,
         )
 
-    def _on_name_owner_changed(self, conn, sender, path, iface, signal, params) -> None:
+    def _on_name_owner_changed(self, conn, sender, path, iface, signal, params, *user_data) -> None:
+        """NameOwnerChanged handler. PyGObject appends the user_data argument
+        passed to signal_subscribe (even when None) — accept and ignore it."""
         try:
             name, _old, new = params.unpack()
         except Exception:

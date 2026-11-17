@@ -128,7 +128,9 @@ class BtEmuClient:
         return status
 
     def subscribe_status(self, callback: Callable[[str], None]) -> int:
-        """Subscribe to StatusChanged; returns the subscription id."""
+        """Subscribe to StatusChanged; returns the subscription id.
+        PyGObject appends the user_data argument (even when None) to the
+        callback — accept it via *extra."""
         return self.bus.signal_subscribe(
             BUS_NAME,
             MANAGER_IFACE,
@@ -136,7 +138,7 @@ class BtEmuClient:
             OBJECT_PATH,
             None,
             Gio.DBusSignalFlags.NONE,
-            lambda conn, sender, path, iface, signal, params: callback(params.unpack()[0]),
+            lambda conn, sender, path, iface, signal, params, *extra: callback(params.unpack()[0]),
             None,
         )
 
