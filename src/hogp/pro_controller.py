@@ -26,6 +26,7 @@ import os
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 from typing import Optional
@@ -361,10 +362,11 @@ class ProControllerEmulator:
             self._bridge_log = None
         # Kill orphaned bridges from previous crashed runs (they hold the
         # well-known PSMs). The bracketed pattern avoids matching pkill's
-        # own command line.
+        # own command line. Absolute paths are used so the sudoers rule
+        # matches byte-for-byte regardless of sudo's secure_path.
         try:
             subprocess.run(
-                ["sudo", "-n", "pkill", "-f", "hid-l2cap-bridg[e]"],
+                ["sudo", "-n", "/usr/bin/pkill", "-f", "hid-l2cap-bridg[e]"],
                 capture_output=True,
                 timeout=5,
             )
@@ -373,7 +375,7 @@ class ProControllerEmulator:
         try:
             self._bridge_proc = subprocess.Popen(
                 [
-                    "sudo", "-n", "python3", bridge_path,
+                    "sudo", "-n", sys.executable, bridge_path,
                     "--ctrl", UNIX_CTRL_NAME,
                     "--intr", UNIX_INTR_NAME,
                     "--bdaddr", self.adapter_address,
@@ -382,7 +384,9 @@ class ProControllerEmulator:
                 stderr=self._bridge_log,
             )
         except (FileNotFoundError, ValueError, OSError) as e:
-            self.last_error = f"launch: {e}"
+            self.last_error = (
+                f"launch: {e} (bridge: {bridge_path}, python: {sys.executable})"
+            )
             logger.error("Could not launch the L2CAP bridge: %s", e)
             self.stop()
             return False
@@ -391,7 +395,7 @@ class ProControllerEmulator:
         time.sleep(1.0)
         if self._bridge_proc.poll() not in (None, 0):
             self.last_error = (
-                "bridge exited immediately: "
+                f"bridge exited immediately ({bridge_path}): "
                 + self._bridge_log_tail(bridge_log_path)
             )
             logger.error("HID L2CAP bridge exited immediately: %s", self.last_error)
