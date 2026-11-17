@@ -127,6 +127,10 @@ class EmulatorService:
         self._pending_triggers: Dict[int, int] = {}
         self._pending_hat: Optional[int] = None
         self._coalesce_source: Optional[int] = None
+        # Guards the pending dicts: the evdev reader thread writes them while
+        # the main thread drains them (dicts must never be iterated during a
+        # concurrent write — the drain swaps them out under this lock).
+        self._input_lock = threading.Lock()
 
         # Bonding throttle
         self._bond_in_progress = False
@@ -144,6 +148,12 @@ class EmulatorService:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+            handlers=[
+                logging.StreamHandler(),
+                # SteamOS journals are volatile and can look "empty"; always
+                # mirror to a plain file too.
+                logging.FileHandler("/tmp/bt-controller-emulator.log"),
+            ],
         )
         logger.info("bt-controller-emulator daemon starting (pid %d)", os.getpid())
         if os.geteuid() != 0:
@@ -944,12 +954,14 @@ class EmulatorService:
         return False
 
     def _on_axis_cb(self, index: int, value: int) -> None:
-        self._pending_axes[index] = value
+        with self._input_lock:
+            self._pending_axes[index] = value
         # GLib.timeout_add is only safe on the main thread — marshal there.
         GLib.idle_add(self._schedule_coalesce)
 
     def _on_trigger_cb(self, index: int, value: int) -> None:
-        self._pending_triggers[index] = value
+        with self._input_lock:
+            self._pending_triggers[index] = value
         GLib.idle_add(self._schedule_coalesce)
 
     def _on_hat_cb(self, direction: int) -> None:
@@ -972,16 +984,21 @@ class EmulatorService:
 
     def _flush_coalesced_input(self) -> bool:
         self._coalesce_source = None
-        if self._session is None:
-            self._pending_axes.clear()
-            self._pending_triggers.clear()
-            return False
-        for index, value in self._pending_axes.items():
-            self._set_axis(index, value)
-        self._pending_axes.clear()
-        for index, value in self._pending_triggers.items():
-            self._set_trigger(index, value)
-        self._pending_triggers.clear()
+        # Swap the pending dicts out under the lock instead of clearing in
+        # place: the evdev thread may write new values at any moment, and
+        # iterating a dict that a writer mutates raises RuntimeError. New
+        # writes land in the fresh dicts and are picked up by the next flush
+        # (the queued _schedule_coalesce callback re-arms the timer).
+        with self._input_lock:
+            axes = self._pending_axes
+            self._pending_axes = {}
+            triggers = self._pending_triggers
+            self._pending_triggers = {}
+        if self._session is not None:
+            for index, value in axes.items():
+                self._set_axis(index, value)
+            for index, value in triggers.items():
+                self._set_trigger(index, value)
         return False
 
     # ---------------------------------------------------------- stop/fail
@@ -1108,10 +1125,11 @@ class EmulatorService:
                     logger.debug("gatt unregister: %s", e)
             self._session = None
 
-        self._pending_buttons.clear()
-        self._pending_axes.clear()
-        self._pending_triggers.clear()
-        self._pending_hat = None
+        with self._input_lock:
+            self._pending_buttons.clear()
+            self._pending_axes.clear()
+            self._pending_triggers.clear()
+            self._pending_hat = None
         if self._coalesce_source is not None:
             GLib.source_remove(self._coalesce_source)
             self._coalesce_source = None
@@ -1259,12 +1277,13 @@ class EmulatorService:
 
         if session.get("profile") == PROFILE_GAMEPAD:
             # Steam/SteamOS can re-assert the hostname identity (name "steamdeck"
-            # + laptop class). Keep the Pro Controller identity pinned while the
-            # session runs — without power-cycling, so an established HID
-            # connection is never dropped.
+            # + laptop class) and flip pairing settings. Keep the Pro Controller
+            # identity and pairing posture pinned while the session runs — without
+            # power-cycling, so an established HID connection is never dropped.
             bluez.ensure_pro_controller_identity(
                 bluez.get_adapter_index(ADAPTER_NAME), allow_power_cycle=False,
             )
+            bluez.ensure_pro_controller_posture(bluez.get_adapter_index(ADAPTER_NAME))
             pro = session.get("pro")
             if pro is not None and not pro.running and not self._shutting_down:
                 logger.warning("Pro Controller listener died — restarting session")

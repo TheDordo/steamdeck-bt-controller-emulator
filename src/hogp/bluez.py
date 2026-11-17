@@ -705,6 +705,25 @@ def ensure_pro_controller_identity(
     return ok
 
 
+def ensure_pro_controller_posture(adapter_index: int = 0) -> None:
+    """Re-assert the pairing-related adapter settings while the Pro session
+    runs. Steam/bluetoothd can flip connectable/pairable/bondable/
+    discoverable back mid-session; keep them pinned so the host can always
+    find and pair the gamepad."""
+    try:
+        info = _run_btmgmt(adapter_index, "info", timeout=6.0).stdout or ""
+    except Exception:
+        return
+    settings_match = _SETTINGS_TOKEN_RE.search(info)
+    tokens = set()
+    if settings_match:
+        tokens = {t.lower() for t in _TOKEN_RE.findall(settings_match.group(1))}
+    for setting in ("connectable", "pairable", "bondable", "discoverable"):
+        if setting not in tokens:
+            logger.warning("Adapter setting %r drifted — re-asserting", setting)
+            btmgmt_ok(adapter_index, setting, "on")
+
+
 def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     """
     Classic BR/EDR posture for the Pro Controller gamepad mode.
@@ -721,6 +740,7 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
     btmgmt_ok(adapter_index, "sc", "on")
     btmgmt_ok(adapter_index, "connectable", "on")
     btmgmt_ok(adapter_index, "pairable", "on")
+    btmgmt_ok(adapter_index, "bondable", "on")
     btmgmt_ok(adapter_index, "power", "on")
     # BR/EDR discoverability: without inquiry scan the Mac never lists the
     # Deck in Bluetooth settings — a fresh "Pro Controller" identity is
