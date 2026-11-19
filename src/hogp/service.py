@@ -44,7 +44,15 @@ from .battery import read_battery_percent
 from .gatt_app import GattApplication
 from .input_handler import InputHandler
 from .pairing_agent import PairingAgent
-from .pro_controller import ProControllerEmulator, SDP_RECORD_XML, PRO_NAME
+from .pro_controller import (
+    PRO_NAME,
+    PRO_PRODUCT_ID,
+    PRO_VENDOR_ID,
+    PRO_VENDOR_ID_SOURCE,
+    PRO_VERSION,
+    SDP_RECORD_XML,
+    ProControllerEmulator,
+)
 from .usb_gadget import USBGadgetHID
 
 logger = logging.getLogger(__name__)
@@ -587,6 +595,11 @@ class EmulatorService:
             session["adapter_snapshot"] = bluez.snapshot_adapter_settings(bus, adapter_path, idx)
 
             if session.get("profile") == PROFILE_GAMEPAD:
+                # Anything that may restart bluetoothd (Device ID config,
+                # PSM bind last resort) runs BEFORE the posture/agent/SDP
+                # registration — a restart wipes all of those.
+                if not self._prepare_pro_worker(gen):
+                    return
                 bluez.configure_adapter_for_pro_controller(idx)
                 bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
                 # BR/EDR discoverable so hosts can find "Pro Controller".
@@ -610,13 +623,93 @@ class EmulatorService:
             adapter_path = session["adapter_path"]
             idx = bluez.get_adapter_index(ADAPTER_NAME)
             if session.get("profile") == PROFILE_GAMEPAD:
+                if not self._prepare_pro_worker(gen):
+                    return
                 bluez.configure_adapter_for_pro_controller(idx)
+                bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
                 bluez.configure_adapter_for_hog_peripheral(idx)
                 bluez.set_adapter_discoverable(bus, adapter_path, False)
             bluez.ensure_adapter_powered(bus, adapter_path)
             GLib.idle_add(self._after_adapter_ready, gen)
+
+    def _wait_for_adapter(self, timeout: float = 15.0) -> Optional[str]:
+        """Worker-thread wait for bluetoothd + the adapter to come back
+        after a restart. Returns the adapter path or None."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if bluez.bluez_has_owner(self.bus):
+                path = bluez.find_adapter_path(self.bus, ADAPTER_NAME)
+                if path:
+                    time.sleep(1.0)  # let bluetoothd finish adapter init
+                    return path
+            time.sleep(0.5)
+        return None
+
+    def _prepare_pro_worker(self, gen: int) -> bool:
+        """Worker (under _adapter_lock): Device ID config + L2CAP PSM bind.
+
+        Both can restart bluetooth.service, so they must run before the
+        adapter posture, agent and SDP record are applied. On failure the
+        session is failed (on the main loop) and False is returned."""
+        session = self._session
+
+        def fail(message: str) -> bool:
+            GLib.idle_add(lambda: (self._fail_session(gen, message), False)[1])
+            return False
+
+        # 1) VID/PID: macOS's GameController framework only adopts a Pro
+        #    Controller whose SDP Device ID record says 057E:2009.
+        did = bluez.pro_device_id_value(
+            PRO_VENDOR_ID_SOURCE, PRO_VENDOR_ID, PRO_PRODUCT_ID, PRO_VERSION,
+        )
+        changed = bluez.ensure_device_id_config(did)
+        if changed is None:
+            logger.error(
+                "Could not write DeviceID=%s to %s — macOS will not recognise "
+                "the Pro Controller (it will pair but deliver no input)",
+                did, bluez.BLUEZ_MAIN_CONF,
+            )
+        elif changed:
+            logger.warning(
+                "Restarting bluetooth.service to publish Device ID %s. If the "
+                "Mac paired before, remove 'Pro Controller' there and pair "
+                "again so it re-reads the SDP records.", did,
+            )
+            subprocess.run(["systemctl", "restart", "bluetooth"], capture_output=True, timeout=30)
+            path = self._wait_for_adapter()
+            if path is None:
+                return fail("Bluetooth adapter did not return after restarting "
+                            "bluetoothd to apply the Pro Controller Device ID")
+            session["adapter_path"] = path
+
+        # 2) HID L2CAP PSMs 0x11/0x13. Binding may itself restart
+        #    bluetoothd as a last resort (see pro_controller.py).
+        if session.get("cancelled") or session.get("generation") != gen:
+            return False
+        adapter_address = (
+            bluez.get_adapter_address(self.bus, session["adapter_path"])
+            or "00:00:00:00:00:00"
+        )
+        pro = ProControllerEmulator(adapter_address=adapter_address)
+        pro.on_state_change = lambda connected: GLib.idle_add(self._on_pro_state, gen, connected)
+        if not pro.start():
+            return fail(
+                "Could not bind HID L2CAP sockets: "
+                f"{pro.last_error or 'PSM 0x11/0x13 busy'}"
+            )
+        if session.get("cancelled") or session.get("generation") != gen:
+            pro.stop()
+            return False
+        session["pro"] = pro
+        if pro.restarted_bluetoothd:
+            path = self._wait_for_adapter()
+            if path is None:
+                return fail("Bluetooth adapter did not return after restarting "
+                            "bluetoothd to free PSM 0x11/0x13")
+            session["adapter_path"] = path
+        return True
 
     def _after_adapter_ready(self, gen: int) -> bool:
         session = self._session
@@ -786,20 +879,11 @@ class EmulatorService:
             return
         session["sdp_registered"] = True
 
-        adapter_address = (
-            bluez.get_adapter_address(self.bus, session["adapter_path"])
-            or "00:00:00:00:00:00"
-        )
-        pro = ProControllerEmulator(adapter_address=adapter_address)
-        pro.on_state_change = lambda connected: GLib.idle_add(self._on_pro_state, gen, connected)
-        if not pro.start():
-            self._fail_session(
-                gen,
-                f"Could not bind HID L2CAP sockets: "
-                f"{pro.last_error or 'PSM 0x11/0x13 busy'}",
-            )
+        # Listeners were bound by the adapter worker (_prepare_pro_worker).
+        pro = session.get("pro")
+        if pro is None or not pro.running:
+            self._fail_session(gen, "Pro Controller listeners are not running")
             return
-        session["pro"] = pro
         session["registered"] = True
         session["recoveries"] = 0
 

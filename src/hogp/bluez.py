@@ -14,6 +14,7 @@ Adapter property reads/writes and btmgmt are safe to call synchronously.
 """
 
 import logging
+import os
 import re
 import subprocess
 import time
@@ -998,6 +999,74 @@ HID_SDP_PROFILE_PATH = "/com/steamdeck/hogp/procon"  # D-Bus paths forbid '-' in
 _HID_SDP_STATE = {"last_error": None}  # last RegisterProfile failure detail
 
 _OBJECT_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_]+/)*[A-Za-z0-9_]*$")
+
+# ---------------------------------------------------------------------------
+# Device ID (PnP) record: VID/PID the host sees
+# ---------------------------------------------------------------------------
+#
+# The SDP Device ID record (UUID 0x1200) and the EIR Device ID are published
+# by bluetoothd itself from main.conf's [General] DeviceID — they cannot be
+# added through ProfileManager1 without creating a second, conflicting
+# primary record. Out of the box BlueZ advertises 1D6B:0246 (Linux
+# Foundation), so macOS sees an unknown HID device and the GameController
+# framework never adopts it. The Pro Controller needs usb:057E:2009.
+
+BLUEZ_MAIN_CONF = "/etc/bluetooth/main.conf"
+_DEVICE_ID_MARKER = "# set by bt-controller-emulator (Pro Controller VID/PID)"
+_DEVICE_ID_LINE_RE = re.compile(r"^\s*DeviceID\s*=.*$", re.MULTILINE)
+
+
+def pro_device_id_value(source: int, vendor: int, product: int, version: int) -> str:
+    prefix = "usb" if source == 0x0002 else "bluetooth"
+    return f"{prefix}:{vendor:04X}:{product:04X}:{version:04X}"
+
+
+def ensure_device_id_config(device_id: str, path: str = BLUEZ_MAIN_CONF) -> Optional[bool]:
+    """Make bluetoothd's main.conf publish `device_id` (e.g. usb:057E:2009:0001).
+
+    Returns True when the file was changed (bluetoothd must restart to
+    publish it), False when it was already set, None when it could not be
+    written. The original file is backed up once to <path>.btemu-bak.
+    """
+    try:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except FileNotFoundError:
+            text = ""
+        wanted = f"DeviceID = {device_id}"
+        active = _DEVICE_ID_LINE_RE.findall(text)
+        if len(active) == 1 and active[0].strip().replace(" ", "") == wanted.replace(" ", ""):
+            return False
+
+        backup = path + ".btemu-bak"
+        if text and not os.path.exists(backup):
+            with open(backup, "w") as f:
+                f.write(text)
+
+        # Drop any active DeviceID lines (and our old marker), then insert
+        # ours right under [General] (creating the section if missing).
+        lines = [
+            l for l in text.splitlines()
+            if not _DEVICE_ID_LINE_RE.match(l) and l.strip() != _DEVICE_ID_MARKER
+        ]
+        insert = [_DEVICE_ID_MARKER, wanted]
+        for i, l in enumerate(lines):
+            if l.strip() == "[General]":
+                lines[i + 1:i + 1] = insert
+                break
+        else:
+            lines = ["[General]"] + insert + [""] + lines
+        tmp = path + ".btemu-tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+        logger.info("Set %s in %s (bluetoothd restart required)", wanted, path)
+        return True
+    except OSError as e:
+        logger.error("Could not set DeviceID in %s: %s", path, e)
+        return None
+
 
 
 def _is_valid_object_path(path) -> bool:

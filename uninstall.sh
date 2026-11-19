@@ -74,6 +74,17 @@ if [ -f "$UDEV_RULE" ]; then
     echo "✓ Removed udev rule for hidg"
 fi
 
+# Restore bluetoothd's original Device ID (the daemon set the Pro
+# Controller VID/PID 057E:2009 in main.conf for the Gamepad profile)
+MAIN_CONF="/etc/bluetooth/main.conf"
+if [ -f "$MAIN_CONF.btemu-bak" ]; then
+    sudo mv "$MAIN_CONF.btemu-bak" "$MAIN_CONF" && echo "✓ Restored $MAIN_CONF"
+    sudo systemctl restart bluetooth 2>/dev/null || true
+elif [ -f "$MAIN_CONF" ] && grep -q "set by bt-controller-emulator" "$MAIN_CONF"; then
+    sudo sed -i '/set by bt-controller-emulator/{N;d;}' "$MAIN_CONF" && echo "✓ Removed emulator DeviceID from $MAIN_CONF"
+    sudo systemctl restart bluetooth 2>/dev/null || true
+fi
+
 # Reload D-Bus
 echo
 echo "Reloading D-Bus configuration..."

@@ -205,13 +205,15 @@ The GUI shows the exact failure. The most common causes, in order:
 ### Gamepad pairs as "Pro Controller" but Mac shows nothing in Game Controllers
 
 1. Confirm the Deck UI shows **✓ Paired — streaming as Pro Controller** (both L2CAP channels connected).
-2. Check `journalctl -u bt-controller-emulator`: you should see subcommand traffic (`Pro Controller subcommand 0x02 …`) — that proves macOS is running the Pro init protocol.
+2. Check `journalctl -u bt-controller-emulator`: you should see subcommand traffic (`Pro Controller subcommand 0x02 …`, always logged) — that proves macOS is running the Pro init protocol.
 3. On the Mac, remove the **Pro Controller** entry, toggle Bluetooth off/on, and pair again.
 4. If pairing spins forever: the Deck must be **pairable + connectable** with Class of Device `0x002508`; the daemon sets this at start. Re-run install.sh if the D-Bus policy blocks it.
 5. macOS 13+ is required for Pro Controller support (macOS 26 Tahoe / 27 Golden Gate both include it).
 
 ### Pairs but no input (Bluetooth gamepad)
 
+- macOS identifies the Pro Controller by its SDP **Device ID (VID 057E / PID 2009)**, which bluetoothd publishes from `/etc/bluetooth/main.conf`. The daemon sets `DeviceID = usb:057E:2009:0001` there on the first Gamepad start (original backed up to `main.conf.btemu-bak`, restored by uninstall.sh) and restarts bluetooth once. **If the Mac paired before this, remove "Pro Controller" on the Mac and pair again** — macOS caches the old SDP records.
+- `journalctl -u bt-controller-emulator` must show `Pro Controller subcommand 0x02 …` lines after connecting; if it shows only "channel connected", the Mac isn't running the Pro init (usually the cached Device ID above).
 - The Mac must be the one initiating the L2CAP HID connection — if another host (Android/Windows) previously paired, forget the Deck there or it may hold the connection.
 - On the Deck, quit Steam (Desktop Mode) so the built-in controller is exposed to evdev (`evtest` must show a gamepad).
 - Watch the Controller tab visualizer while pressing sticks/buttons — if it doesn't move, the problem is evdev, not Bluetooth.

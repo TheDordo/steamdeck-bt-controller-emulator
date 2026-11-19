@@ -46,10 +46,42 @@ PRO_CLASS_OF_DEVICE = 0x002508  # Peripheral / Gamepad
 HID_CTRL_PSM = 0x11
 HID_INTR_PSM = 0x13
 
-# HIDP transaction header byte for DATA packets
-HIDP_DATA = 0xA0
-HIDP_DATA_INPUT = HIDP_DATA | 0x01   # 0xA1  (device -> host, interrupt)
-HIDP_DATA_OUTPUT = HIDP_DATA | 0x02  # 0xA2  (host -> device, control)
+# HIDP transaction types (high nibble of the header byte)
+HIDP_TRANS_HANDSHAKE = 0x00
+HIDP_TRANS_HID_CONTROL = 0x10
+HIDP_TRANS_GET_REPORT = 0x40
+HIDP_TRANS_SET_REPORT = 0x50
+HIDP_TRANS_GET_PROTOCOL = 0x60
+HIDP_TRANS_SET_PROTOCOL = 0x70
+HIDP_TRANS_GET_IDLE = 0x80
+HIDP_TRANS_SET_IDLE = 0x90
+HIDP_TRANS_DATA = 0xA0
+
+# HIDP report types (low 2 bits of DATA / GET_REPORT / SET_REPORT headers)
+HIDP_REPORT_INPUT = 0x01
+HIDP_REPORT_OUTPUT = 0x02
+HIDP_REPORT_FEATURE = 0x03
+
+# HIDP handshake result codes
+HIDP_HSHK_SUCCESSFUL = 0x00
+HIDP_HSHK_ERR_INVALID_REPORT_ID = 0x02
+HIDP_HSHK_ERR_UNSUPPORTED_REQUEST = 0x03
+
+# HID_CONTROL operations
+HIDP_CTRL_VIRTUAL_CABLE_UNPLUG = 0x05
+
+HIDP_DATA = HIDP_TRANS_DATA
+HIDP_DATA_INPUT = HIDP_DATA | HIDP_REPORT_INPUT    # 0xA1  (device -> host)
+HIDP_DATA_OUTPUT = HIDP_DATA | HIDP_REPORT_OUTPUT  # 0xA2  (host -> device)
+
+# Identity the host reads from the SDP Device ID (PnP) record. macOS's
+# GameController framework recognises the Pro Controller by VID/PID, NOT by
+# name or HID descriptor — without these it treats the Deck as an unknown
+# generic HID device and no input ever reaches games.
+PRO_VENDOR_ID_SOURCE = 0x0002  # USB Implementers Forum
+PRO_VENDOR_ID = 0x057E         # Nintendo
+PRO_PRODUCT_ID = 0x2009        # Switch Pro Controller
+PRO_VERSION = 0x0001
 
 # Output report IDs (host -> device)
 OUTPUT_RUMBLE_SUBCMD = 0x01
@@ -79,6 +111,7 @@ INPUT_SUBCMD_REPLY = 0x21
 
 INPUT_REPORT_INTERVAL_S = 0.008  # ~125 Hz baseline (real Pro streams at 120 Hz)
 MIN_SEND_INTERVAL_S = 0.004     # event-driven sends are not throttled below this
+TRIGGER_THRESHOLD = 32          # 0..255 analog trigger -> digital ZL/ZR
 
 # ---------------------------------------------------------------------------
 # HID report map (the real Pro Controller's Bluetooth HID descriptor,
@@ -232,11 +265,36 @@ LEFT_STICK_CAL = bytes([0xDC, 0xC5, 0x5D, 0xD0, 0x07, 0x7D, 0xDC, 0xC5, 0x5D])
 # Right stick: center | min_below | max_above.
 RIGHT_STICK_CAL = bytes([0xD0, 0x07, 0x7D, 0xDC, 0xC5, 0x5D, 0xDC, 0xC5, 0x5D])
 
+# IMU factory calibration (accel origin, accel sensitivity 0x4000, gyro
+# origin, gyro sensitivity 0x343B) — sane values from a real controller.
+# All-zero calibration makes host drivers divide by zero (NaN motion).
+IMU_FACTORY_CAL = bytes([
+    0xD3, 0xFF, 0xD5, 0xFF, 0x55, 0x01, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40,
+    0x19, 0x00, 0xDD, 0xFF, 0xDC, 0xFF, 0x3B, 0x34, 0x3B, 0x34, 0x3B, 0x34,
+])
+# 6-axis horizontal offsets (6 bytes) + left stick parameters (18 bytes:
+# deadzone / range ratio), as shipped on real Pro Controllers.
+SENSOR_STICK_PARAMS = bytes([
+    0x50, 0xFD, 0x00, 0x00, 0xC6, 0x0F,
+    0x0F, 0x30, 0x61, 0x96, 0x30, 0xF3, 0xD4, 0x14, 0x54, 0x41, 0x15, 0x54,
+    0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63,
+])
+RIGHT_STICK_PARAMS = SENSOR_STICK_PARAMS[6:]
+# Body / button / left grip / right grip colors (RGB).
+CONTROLLER_COLORS = bytes([
+    0x32, 0x32, 0x32, 0xFF, 0xFF, 0xFF, 0x32, 0x32, 0x32, 0x32, 0x32, 0x32, 0x00,
+])
+
 FLASH_SEGMENTS = {
-    0x6020: bytes(24),        # IMU factory calibration (unused: zeroed)
-    0x603D: LEFT_STICK_CAL,   # left stick factory calibration
-    0x6046: RIGHT_STICK_CAL,  # right stick factory calibration
-    0x6000: bytes(16),        # serial number region (zeros)
+    0x6000: bytes([0xFF] * 16),  # serial number region (0xFF = no serial)
+    0x6012: bytes([0x03]),       # device type: Pro Controller
+    0x601B: bytes([0x01]),       # color info present
+    0x6020: IMU_FACTORY_CAL,     # IMU factory calibration
+    0x603D: LEFT_STICK_CAL,      # left stick factory calibration
+    0x6046: RIGHT_STICK_CAL,     # right stick factory calibration
+    0x6050: CONTROLLER_COLORS,   # body/button/grip colors
+    0x6080: SENSOR_STICK_PARAMS, # sensor offsets + left stick params
+    0x6098: RIGHT_STICK_PARAMS,  # right stick params
     0x8010: bytes(2),         # user-cal magic left  (absent -> factory used)
     0x801B: bytes(2),         # user-cal magic right (absent -> factory used)
     0x8026: bytes(2),         # user IMU cal magic    (absent -> factory used)
@@ -435,6 +493,11 @@ def _diagnose_busy_psms() -> str:
     return "\n".join(parts)
 
 
+# Set when a bind had to restart bluetooth.service: everything registered
+# with BlueZ before that point (agent, SDP record, adapter posture) is gone.
+_BIND_STATE = {"restarted_bluetoothd": False}
+
+
 def _bind_l2cap_with_retries(
     bdaddr: str, psm: int, attempts: int = 20, delay: float = 0.5,
 ) -> Tuple[Optional[socket.socket], Optional[str]]:
@@ -495,6 +558,7 @@ def _bind_l2cap_with_retries(
     # of fixing it. BTEMU_SKIP_BT_RESTART=1 in the service environment
     # disables the restart for those images.
     if not os.environ.get("BTEMU_SKIP_BT_RESTART") and _restart_bluetoothd():
+        _BIND_STATE["restarted_bluetoothd"] = True
         logger.warning(
             "Restarted bluetooth.service to free PSM 0x%x — final bind attempts", psm,
         )
@@ -565,6 +629,8 @@ class ProControllerEmulator:
         self._conn_lock = threading.Lock()
 
         self._threads = []
+        self._stream_gen = 0
+        self.restarted_bluetoothd = False  # set by start() when a bind restarted bluetoothd
         self._timer = 0
         self._input_report_mode = None
         self._send_lock = threading.Lock()
@@ -608,8 +674,10 @@ class ProControllerEmulator:
         connections. Runs inside the root daemon, so no bridge or sudo is
         needed. Adapter/SDP setup happens via bluez helpers before this."""
         self.last_error = None
+        self.restarted_bluetoothd = False
         if self._running:
             return True
+        _BIND_STATE["restarted_bluetoothd"] = False
         try:
             self._ctl_sock, ctl_err = _bind_l2cap_with_retries(self.adapter_address, HID_CTRL_PSM)
             if self._ctl_sock is None:
@@ -622,6 +690,8 @@ class ProControllerEmulator:
             logger.error("Could not create L2CAP listeners: %s", e)
             self.stop()
             return False
+        finally:
+            self.restarted_bluetoothd = _BIND_STATE["restarted_bluetoothd"]
         if self._ctl_sock is None or self._itr_sock is None:
             detail = (itr_err or ctl_err or "(no details)").replace("\n", " ")
             if "not running as root" in detail:
@@ -680,6 +750,15 @@ class ProControllerEmulator:
             except OSError:
                 break
             logger.info(f"Pro Controller: {label} channel connected from {addr}")
+            try:
+                # Bounded send time: writes happen on the daemon's main loop
+                # (input coalescing) — a stalled radio link must never block
+                # it. 50 ms, as struct timeval.
+                conn.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 0, 50000)
+                )
+            except OSError as e:
+                logger.debug(f"SO_SNDTIMEO: {e}")
             with self._conn_lock:
                 if label == "control":
                     old = self._ctl_conn
@@ -693,12 +772,17 @@ class ProControllerEmulator:
                     except OSError:
                         pass
                 became_connected = self._ctl_conn is not None and self._itr_conn is not None
-            if label == "control":
-                self._spawn(self._control_read_loop, (conn,))
-            if became_connected and not self._streaming:
+            # Hosts send output reports (rumble + subcommands) as HIDP DATA
+            # on the INTERRUPT channel; HIDP transactions (SET_REPORT etc.)
+            # arrive on the control channel. Both must be read, or the
+            # host's init handshake (device info, report mode 0x30, …)
+            # never gets answered and it never starts using the controller.
+            self._spawn(self._read_loop, (conn, label))
+            if became_connected:
                 self._connected = True
-                self._streaming = True
-                self._spawn(self._stream_loop)
+                if not self._streaming:
+                    self._streaming = True
+                    self._spawn(self._stream_loop)
                 self._notify_state(True)
         logger.debug(f"Pro Controller: {label} accept loop ended")
 
@@ -711,8 +795,8 @@ class ProControllerEmulator:
 
     # -- HIDP control channel ------------------------------------------------
 
-    def _control_read_loop(self, conn: socket.socket) -> None:
-        """Read output reports + HIDP control transactions from the Mac."""
+    def _read_loop(self, conn: socket.socket, label: str) -> None:
+        """Read host traffic on one channel (control or interrupt)."""
         while self._running:
             try:
                 data = conn.recv(1024)
@@ -720,29 +804,85 @@ class ProControllerEmulator:
                 break
             if not data:
                 break
-            self._handle_control_packet(data)
+            try:
+                if label == "control":
+                    self._handle_control_packet(data)
+                else:
+                    self._handle_interrupt_packet(data)
+            except Exception as e:  # never let one bad packet kill the link
+                logger.warning(f"Pro Controller: error handling {label} packet {data.hex()}: {e}")
+        logger.info(f"Pro Controller: {label} channel disconnected")
         with self._conn_lock:
-            if self._ctl_conn is conn:
-                self._ctl_conn = None
-            self._connected = self._ctl_conn is not None and self._itr_conn is not None
-        if not self._connected:
-            # Also end the stream loop so a reconnect starts a fresh one.
+            if label == "control":
+                if self._ctl_conn is conn:
+                    self._ctl_conn = None
+            elif self._itr_conn is conn:
+                self._itr_conn = None
+            still_connected = self._ctl_conn is not None and self._itr_conn is not None
+            was_connected = self._connected
+            self._connected = still_connected
+        if was_connected and not still_connected:
+            # End the stream loop so a reconnect starts a fresh one and
+            # renegotiates the report mode.
             self._streaming = False
+            self._input_report_mode = None
             self._notify_state(False)
 
-    def _handle_control_packet(self, data: bytes) -> None:
-        if not data:
-            return
+    def _handle_interrupt_packet(self, data: bytes) -> None:
         header = data[0]
         if header == HIDP_DATA_OUTPUT:
             self._handle_output_report(data[1:])
-        else:
-            # GET_REPORT / SET_REPORT / GET|SET_PROTOCOL / GET|SET_IDLE etc.
-            # Reply with a successful HIDP handshake; macOS tolerates this the
-            # same way it does with real HID peripherals that keep it minimal.
-            if self.verbose:
-                logger.debug(f"HIDP control packet {data.hex()} -> handshake")
-            self._write_control(b"\x00")
+        elif self.verbose:
+            logger.debug(f"Interrupt packet {data.hex()} ignored")
+
+    def _handle_control_packet(self, data: bytes) -> None:
+        """HIDP transactions on the control channel. Every request except
+        HID_CONTROL and DATA must be answered (HANDSHAKE or DATA), otherwise
+        the host stalls waiting and eventually drops the link."""
+        header = data[0]
+        trans = header & 0xF0
+        param = header & 0x0F
+        if self.verbose:
+            logger.debug(f"HIDP control packet {data.hex()}")
+
+        if trans == HIDP_TRANS_HID_CONTROL:
+            # No reply allowed. VIRTUAL_CABLE_UNPLUG = host forgot us.
+            if param == HIDP_CTRL_VIRTUAL_CABLE_UNPLUG:
+                logger.info("Pro Controller: host sent VIRTUAL_CABLE_UNPLUG")
+            return
+        if trans == HIDP_TRANS_DATA:
+            if (param & 0x03) == HIDP_REPORT_OUTPUT:
+                self._handle_output_report(data[1:])
+            return
+        if trans == HIDP_TRANS_SET_REPORT:
+            # SET_REPORT(Output) carries a full output report — some host
+            # stacks deliver rumble/subcommands this way instead of DATA.
+            if (param & 0x03) == HIDP_REPORT_OUTPUT:
+                self._handle_output_report(data[1:])
+            self._write_control(bytes([HIDP_TRANS_HANDSHAKE | HIDP_HSHK_SUCCESSFUL]))
+            return
+        if trans == HIDP_TRANS_GET_REPORT:
+            report_type = param & 0x03
+            report_id = data[1] if len(data) > 1 else 0
+            if report_type == HIDP_REPORT_INPUT and report_id in (0, INPUT_STANDARD_FULL):
+                self._write_control(
+                    bytes([HIDP_TRANS_DATA | HIDP_REPORT_INPUT]) + self._build_standard_report()
+                )
+            else:
+                self._write_control(
+                    bytes([HIDP_TRANS_HANDSHAKE | HIDP_HSHK_ERR_INVALID_REPORT_ID])
+                )
+            return
+        if trans == HIDP_TRANS_GET_PROTOCOL:
+            self._write_control(bytes([HIDP_TRANS_DATA, 0x01]))  # report protocol
+            return
+        if trans == HIDP_TRANS_GET_IDLE:
+            self._write_control(bytes([HIDP_TRANS_DATA, 0x00]))
+            return
+        if trans in (HIDP_TRANS_SET_PROTOCOL, HIDP_TRANS_SET_IDLE):
+            self._write_control(bytes([HIDP_TRANS_HANDSHAKE | HIDP_HSHK_SUCCESSFUL]))
+            return
+        self._write_control(bytes([HIDP_TRANS_HANDSHAKE | HIDP_HSHK_ERR_UNSUPPORTED_REQUEST]))
 
     def _handle_output_report(self, payload: bytes) -> None:
         if len(payload) < 1:
@@ -753,8 +893,9 @@ class ProControllerEmulator:
                 return
             subcmd = payload[10]
             subcmd_data = payload[11:]
-            if self.verbose:
-                logger.info(f"Pro Controller subcommand {subcmd:#04x} data={bytes(subcmd_data).hex()}")
+            # Always logged: the init handshake is a handful of packets and
+            # is THE proof that the host is driving the Pro protocol.
+            logger.info(f"Pro Controller subcommand {subcmd:#04x} data={bytes(subcmd_data[:16]).hex()}")
             self._reply_to_subcommand(subcmd, subcmd_data)
         elif report_id == OUTPUT_RUMBLE_ONLY:
             pass  # rumble-only; nothing to do
@@ -820,11 +961,10 @@ class ProControllerEmulator:
         else:
             logger.debug(f"Subcommand {subcmd:#04x} not implemented - generic ACK")
 
+        # Bytes 0..12 mirror the standard report header (timer, battery,
+        # buttons, sticks, vibrator) like a real controller's 0x21 replies.
+        reply[0:13] = self._build_standard_report()[0:13]
         reply[0] = INPUT_SUBCMD_REPLY
-        reply[1] = self._timer & 0xFF
-        reply[2] = ((self._battery_level << 5) & 0xE0) | (
-            0x10 if self._battery_charging else 0x00
-        )
         reply[13] = ack
         reply[14] = reply_id
         self._write_interrupt(bytes([HIDP_DATA_INPUT]) + bytes(reply))
@@ -872,8 +1012,9 @@ class ProControllerEmulator:
         if self._buttons & (1 << 9):  b4 |= 0x08   # L3 -> L stick
         if self._buttons & (1 << 8):  b4 |= 0x10   # Guide -> Home
         if self._buttons & (1 << 4):  b5 |= 0x40   # LB -> L
-        if self._triggers[0] > 0:     b5 |= 0x80   # LT -> ZL
-        if self._triggers[1] > 0:     b3 |= 0x80   # RT -> ZR
+        # ZL/ZR are digital: threshold so trigger noise doesn't hold them.
+        if self._triggers[0] >= TRIGGER_THRESHOLD: b5 |= 0x80   # LT -> ZL
+        if self._triggers[1] >= TRIGGER_THRESHOLD: b3 |= 0x80   # RT -> ZR
         # dpad bits (0=N,1=NE,2=E,3=SE,4=S,5=SW,6=W,7=NW)
         hat = self._hat if self._hat != 8 else -1
         if hat in (0, 1, 7):          b5 |= 0x02   # Up
@@ -892,9 +1033,12 @@ class ProControllerEmulator:
         return bytes(report)
 
     def _pack_stick(self, x: int, y: int) -> bytes:
-        """int16 pair -> 3 nibble-packed bytes, calibrated around 2000."""
+        """int16 pair -> 3 nibble-packed bytes, calibrated around 2000.
+
+        The shared state uses evdev's convention (Y grows downward); the
+        Pro Controller reports Y growing UPWARD, so Y is inverted here."""
         raw_x = _STICK_CENTER + int(x / 32767.0 * _STICK_DELTA)
-        raw_y = _STICK_CENTER + int(y / 32767.0 * _STICK_DELTA)
+        raw_y = _STICK_CENTER - int(y / 32767.0 * _STICK_DELTA)
         raw_x = max(0, min(0xFFF, raw_x))
         raw_y = max(0, min(0xFFF, raw_y))
         return bytes([
@@ -922,17 +1066,29 @@ class ProControllerEmulator:
 
     def _stream_loop(self) -> None:
         """Baseline 0x30 stream; state changes also trigger immediate sends."""
+        self._stream_gen += 1
+        gen = self._stream_gen
         logger.info("Pro Controller: streaming input reports")
         last = 0.0
-        while self._running and self._streaming:
+        failures = 0
+        while self._running and self._streaming and gen == self._stream_gen:
             now = time.monotonic()
             if now - last >= INPUT_REPORT_INTERVAL_S:
                 last = now
                 self._timer = (self._timer + 1) & 0xFF
-                if not self._send_now(self._build_standard_report()):
-                    break
+                if self._send_now(self._build_standard_report()):
+                    failures = 0
+                else:
+                    # Transient L2CAP errors (buffer full during a radio
+                    # hiccup) must not end the stream for a live link —
+                    # only give up once the interrupt channel is gone.
+                    failures += 1
+                    if self._itr_conn is None or failures > 250:
+                        break
+                    time.sleep(0.02)
             time.sleep(0.002)
-        self._streaming = False
+        if gen == self._stream_gen:
+            self._streaming = False
         logger.info("Pro Controller: stream loop ended")
 
     # -- channel writes -------------------------------------------------------
