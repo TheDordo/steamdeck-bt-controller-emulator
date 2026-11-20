@@ -7,10 +7,14 @@ Emulates a Bluetooth or **wired USB** gamepad / keyboard / trackpad peripheral t
 | Transport | Gamepad identity on the Mac | Keyboard/mouse |
 |-----------|-----------------------------|----------------|
 | Bluetooth (LE) — **recommended** | **Xbox Wireless Controller** (Series X\|S, 045E:0B13) with rumble on the Deck | not in this mode |
-| Bluetooth (BR/EDR) | **DUALSHOCK 4** v2 ("Wireless Controller", 054C:09CC) — light bar shown on screen, on-screen touchpad, rumble on the Deck; **Deck works as a Bluetooth speaker** | not in this mode |
-| Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") | not in this mode |
+| Bluetooth (BR/EDR) | **DUALSHOCK 4** v2 ("Wireless Controller", 054C:09CC) — ⚠️ untested; light bar shown on screen, on-screen touchpad, rumble on the Deck; **Deck works as a Bluetooth speaker** | not in this mode |
+| Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") — ⚠️ currently broken | not in this mode |
 | Bluetooth (LE) | — | HID-over-GATT gamepad/keyboard/mouse ("SteamDeckPad") |
-| Wired USB | **Xbox Series X\|S** (045E:0B12, GIP — macOS's built-in XboxGamepad driver), **DUALSHOCK 4** (054C:05C4) or **Switch Pro Controller** (057E:2009) | none — gamepad-only, like the real controllers (the **Keyboard** profile has keyboard + mouse) |
+| Wired USB | **Xbox Series X\|S** (045E:0B12, GIP — macOS's built-in XboxGamepad driver), **DUALSHOCK 4** (054C:05C4) or **Switch Pro Controller** (057E:2009, ⚠️ currently broken) | none — gamepad-only, like the real controllers (the **Keyboard** profile has keyboard + mouse) |
+
+> **Status:**
+> - **Switch Pro Controller is currently broken** (Bluetooth and wired USB). Use Xbox or DS4 instead.
+> - **DUALSHOCK 4 over Bluetooth is untested.**
 
 ![controller view](assets/controller-tab.png) ![keyboard view](assets/keyboard-tab.png) ![media view](assets/media-tab.png) ![trackpad view](assets/trackpad-tab.png)
 
@@ -98,8 +102,8 @@ cd ~/steamdeck-bt-controller-emulator
 Pick **Bluetooth** or **Wired USB**, then pick a **Profile**:
 
 - **Xbox (BT)** — Bluetooth LE Xbox Wireless Controller. Works with macOS Game Controllers and Steam on the Mac; host rumble plays on the Deck's haptics. Bluetooth only.
-- **DS4** — DUALSHOCK 4 over Bluetooth (classic) or USB. The Controller tab shows the light bar color the host sets and an on-screen touchpad (drag to touch, **Pad Click** to click); host rumble plays on the Deck's haptics. Over Bluetooth the Deck can also be the Mac's audio output.
-- **Pro (BT)** — Nintendo Switch Pro Controller over Bluetooth.
+- **DS4** — DUALSHOCK 4 over Bluetooth (classic) or USB. *Bluetooth mode is untested.* The Controller tab shows the light bar color the host sets and an on-screen touchpad (drag to touch, **Pad Click** to click); host rumble plays on the Deck's haptics. Over Bluetooth the Deck can also be the Mac's audio output.
+- **Pro** — Nintendo Switch Pro Controller over Bluetooth or USB. **Currently broken** — use Xbox or DS4.
 - **Keyboard** — BLE HOGP gamepad/keyboard/mouse (Bluetooth) or generic HID gamepad + keyboard + mouse (USB).
 
 Switching profiles requires **Stop Service → switch → Start** (and re-pair/re-plug on the host) — the identity changes at connect time.
@@ -155,13 +159,13 @@ You can keep both pairings on the Mac and switch by stopping/starting the servic
 
 ### Gamepad over Wired USB (Xbox / DS4 / Pro)
 
-All three controller identities work wired; pick the profile, then **Wired USB** → **Start Service**:
+Xbox and DS4 work wired (Pro is currently broken); pick the profile, then **Wired USB** → **Start Service**:
 
 | Profile | Shows up on the Mac as | How it talks |
 |---|---|---|
 | **Xbox** | Xbox Series X\|S controller (045E:0B12) | GIP over a vendor USB interface (FunctionFS) — macOS's built-in `XboxGamepad` driver; Steam via SDL. Gamepad only. Rumble → Deck haptics |
 | **DS4** | DUALSHOCK 4 (054C:05C4) | USB HID; touchpad + light bar on the Controller tab; calibration/MAC feature reports preloaded on kernels with `GADGET_HID_WRITE_GET_REPORT` |
-| **Pro** | Switch Pro Controller (057E:2009) | USB HID with the Pro's USB handshake (0x80 commands) + subcommands; HD rumble → Deck haptics |
+| **Pro** ⚠️ broken | Switch Pro Controller (057E:2009) | USB HID with the Pro's USB handshake (0x80 commands) + subcommands; HD rumble → Deck haptics |
 
 Switching wired profiles rebuilds the gadget automatically — re-plug the cable if the Mac doesn't pick up the new identity.
 
