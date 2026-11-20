@@ -54,16 +54,23 @@ from .pro_controller import (
     ProControllerEmulator,
 )
 from .usb_gadget import USBGadgetHID
-from .xbox import XBOX_NAME, XboxGattApplication
+from .xbox import (
+    XBOX_NAME,
+    XBOX_PRODUCT_ID,
+    XBOX_VENDOR_ID,
+    XBOX_VERSION,
+    XboxGattApplication,
+)
 
 logger = logging.getLogger(__name__)
 
 ADAPTER_NAME = "hci0"
 HOGP_DEVICE_NAME = "SteamDeckPad"
+PRO_DEVICE_ID = bluez.pro_device_id_value(
+    PRO_VENDOR_ID_SOURCE, PRO_VENDOR_ID, PRO_PRODUCT_ID, PRO_VERSION,
+)
+XBOX_DEVICE_ID = bluez.pro_device_id_value(0x0002, XBOX_VENDOR_ID, XBOX_PRODUCT_ID, XBOX_VERSION)
 STATIC_BLE_ADDRESS = "C2:12:34:56:78:9A"
-# Separate LE identity for the Xbox profile: macOS caches the GATT database
-# per address, so sharing SteamDeckPad's address would serve a stale map.
-XBOX_STATIC_BLE_ADDRESS = "C2:12:34:56:78:9B"
 REPORT_RATE_HZ = 25
 
 # Recovery bounds for the self-healing watchdog
@@ -611,11 +618,11 @@ class EmulatorService:
                 # BR/EDR discoverable so hosts can find "Pro Controller".
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
-                bluez.set_static_ble_address(
-                    idx,
-                    XBOX_STATIC_BLE_ADDRESS
-                    if session.get("profile") == PROFILE_XBOX else STATIC_BLE_ADDRESS,
-                )
+                if session.get("profile") == PROFILE_XBOX and not self._apply_device_id_worker(
+                    gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
+                ):
+                    return
+                bluez.set_static_ble_address(idx, STATIC_BLE_ADDRESS)
                 bluez.configure_adapter_for_hog_peripheral(idx)
                 bluez.set_adapter_alias(bus, adapter_path, self._hogp_name(session))
                 # LE mode: the advertisement handles visibility.
@@ -639,8 +646,13 @@ class EmulatorService:
                 bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
+                if session.get("profile") == PROFILE_XBOX and not self._apply_device_id_worker(
+                    gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
+                ):
+                    return
                 bluez.configure_adapter_for_hog_peripheral(idx)
-                bluez.set_adapter_discoverable(bus, adapter_path, False)
+                bluez.set_adapter_alias(bus, session["adapter_path"], self._hogp_name(session))
+                bluez.set_adapter_discoverable(bus, session["adapter_path"], False)
             bluez.ensure_adapter_powered(bus, adapter_path)
             GLib.idle_add(self._after_adapter_ready, gen)
 
@@ -657,6 +669,42 @@ class EmulatorService:
             time.sleep(0.5)
         return None
 
+    def _apply_device_id_worker(self, gen: int, did: str, label: str) -> bool:
+        """Worker (under _adapter_lock): make bluetoothd publish `did`.
+
+        bluetoothd advertises the main.conf DeviceID in THREE places the host
+        can read: the classic SDP Device ID record, the EIR Device ID, and
+        its own built-in GATT Device Information service (PnP ID). macOS
+        prefers those over our GATT PnP ID, so every profile must set its
+        own VID/PID here — a leftover Nintendo ID made the Xbox profile load
+        macOS's Switch Pro driver. Restarts bluetoothd only when it changes.
+        Returns False (and fails the session) if the adapter doesn't return."""
+        session = self._session
+        changed = bluez.ensure_device_id_config(did)
+        if changed is None:
+            logger.error(
+                "Could not write DeviceID=%s to %s — the host may not recognise "
+                "the %s (pairs but no input)", did, bluez.BLUEZ_MAIN_CONF, label,
+            )
+            return True
+        if not changed:
+            logger.info("bluetoothd Device ID already %s", did)
+            return True
+        logger.warning(
+            "Restarting bluetooth.service to publish Device ID %s (%s). If the "
+            "Mac paired with this Deck before, forget the device there and pair "
+            "again — macOS caches the old vendor/product ID.", did, label,
+        )
+        subprocess.run(["systemctl", "restart", "bluetooth"], capture_output=True, timeout=30)
+        path = self._wait_for_adapter()
+        if path is None:
+            GLib.idle_add(lambda: (self._fail_session(
+                gen, f"Bluetooth adapter did not return after restarting "
+                     f"bluetoothd to apply the {label} Device ID"), False)[1])
+            return False
+        session["adapter_path"] = path
+        return True
+
     def _prepare_pro_worker(self, gen: int) -> bool:
         """Worker (under _adapter_lock): Device ID config + L2CAP PSM bind.
 
@@ -671,28 +719,8 @@ class EmulatorService:
 
         # 1) VID/PID: macOS's GameController framework only adopts a Pro
         #    Controller whose SDP Device ID record says 057E:2009.
-        did = bluez.pro_device_id_value(
-            PRO_VENDOR_ID_SOURCE, PRO_VENDOR_ID, PRO_PRODUCT_ID, PRO_VERSION,
-        )
-        changed = bluez.ensure_device_id_config(did)
-        if changed is None:
-            logger.error(
-                "Could not write DeviceID=%s to %s — macOS will not recognise "
-                "the Pro Controller (it will pair but deliver no input)",
-                did, bluez.BLUEZ_MAIN_CONF,
-            )
-        elif changed:
-            logger.warning(
-                "Restarting bluetooth.service to publish Device ID %s. If the "
-                "Mac paired before, remove 'Pro Controller' there and pair "
-                "again so it re-reads the SDP records.", did,
-            )
-            subprocess.run(["systemctl", "restart", "bluetooth"], capture_output=True, timeout=30)
-            path = self._wait_for_adapter()
-            if path is None:
-                return fail("Bluetooth adapter did not return after restarting "
-                            "bluetoothd to apply the Pro Controller Device ID")
-            session["adapter_path"] = path
+        if not self._apply_device_id_worker(gen, PRO_DEVICE_ID, "Pro Controller"):
+            return False
 
         # 2) HID L2CAP PSMs 0x11/0x13. Binding may itself restart
         #    bluetoothd as a last resort (see pro_controller.py).

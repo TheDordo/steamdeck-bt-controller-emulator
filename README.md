@@ -120,7 +120,7 @@ python3 -m src.hogp stop
 3. **System Settings → Game Controllers** lists an Xbox controller; Steam on the Mac sees it as an Xbox Series controller
 4. Rumble from games is played on the Deck's haptics (evdev force feedback — needs the Deck's built-in controller as the input device; check `journalctl -u bt-controller-emulator` for "no FF_RUMBLE support")
 
-The Xbox profile uses its own Bluetooth LE address (`C2:12:34:56:78:9B`), so it pairs as a separate device from SteamDeckPad. If you change the Xbox profile's GATT layout later, forget the device on the Mac and pair again (macOS caches GATT).
+Each profile sets bluetoothd's Device ID in `/etc/bluetooth/main.conf` (Xbox `045E:0B13`, Pro `057E:2009`) and restarts bluetooth once when switching. macOS caches the vendor/product ID per Deck address, so **after switching profiles, Forget the device on the Mac and pair again** — `system_profiler SPBluetoothDataType` on the Mac must show Vendor ID 0x045E / Product ID 0x0B13 for the Xbox profile.
 
 ### Pro Controller over Bluetooth (macOS / Android / Linux)
 
