@@ -8,7 +8,9 @@ peripheral:
       (BR/EDR HID over L2CAP; macOS GameController-native)
     * Bluetooth + Keyboard profile -> BLE HID-over-GATT gamepad/keyboard/
       mouse ("SteamDeckPad")
-    * Wired USB + Gamepad profile  -> DUALSHOCK 4 identity (054C:05C4)
+    * Wired USB + Xbox profile     -> Xbox Series X|S (045E:0B12, GIP/FunctionFS)
+    * Wired USB + DS4 profile      -> DUALSHOCK 4 identity (054C:05C4)
+    * Wired USB + Gamepad profile  -> Switch Pro Controller (057E:2009)
     * Wired USB + Keyboard profile -> generic HID gamepad/keyboard/mouse
 
 Architecture

@@ -10,6 +10,14 @@
 #                      recognises this as a natively supported controller.
 #   --profile generic  Plain HID gamepad (VID 0x1209, 13-byte reports).
 #                      Works with Steam/games that accept generic HID pads.
+#   --profile pro      Nintendo Switch Pro Controller (057E:2009, 64-byte
+#                      reports, USB 0x80 handshake handled by the daemon).
+#   --profile xbox     Xbox Series X|S controller (045E:0B12). Not HID: a
+#                      FunctionFS vendor interface (class FF/47/D0) speaking
+#                      GIP. macOS drives it with its built-in XboxGamepad
+#                      driver. Gamepad-only, like the real controller. The
+#                      daemon writes the FunctionFS descriptors and binds
+#                      the UDC (this script stops before binding).
 #
 # Requires: configfs mounted, USB gadget drivers loaded, root/sudo access
 #
@@ -19,10 +27,10 @@ set -euo pipefail
 PROFILE="ds4"
 if [ "${1:-}" = "--profile" ]; then
     PROFILE="${2:-ds4}"
-    if [ "$PROFILE" != "ds4" ] && [ "$PROFILE" != "generic" ]; then
-        echo "Error: profile must be 'ds4' or 'generic'"
-        exit 1
-    fi
+    case "$PROFILE" in
+        ds4|generic|pro|xbox) ;;
+        *) echo "Error: profile must be 'ds4', 'generic', 'pro' or 'xbox'"; exit 1 ;;
+    esac
 fi
 
 GADGET_NAME="steamdeck_hid"
@@ -41,6 +49,22 @@ if [ "$PROFILE" = "ds4" ]; then
     PRODUCT="Wireless Controller"
     SERIAL="a01e0d000000"
     GAMEPAD_REPORT_LENGTH=64
+elif [ "$PROFILE" = "pro" ]; then
+    VENDOR_ID="0x057E"      # Nintendo
+    PRODUCT_ID="0x2009"     # Switch Pro Controller
+    DEVICE_BCD="0x0210"
+    MANUFACTURER="Nintendo Co., Ltd."
+    PRODUCT="Pro Controller"
+    SERIAL="000000000001"
+    GAMEPAD_REPORT_LENGTH=64
+elif [ "$PROFILE" = "xbox" ]; then
+    VENDOR_ID="0x045E"      # Microsoft
+    PRODUCT_ID="0x0B12"     # Xbox Series X|S controller (USB)
+    DEVICE_BCD="0x0509"
+    MANUFACTURER="Microsoft"
+    PRODUCT="Controller"
+    SERIAL="3039373132333332"
+    GAMEPAD_REPORT_LENGTH=0  # n/a (FunctionFS)
 else
     VENDOR_ID="0x1209"      # pid.codes (Open Source)
     PRODUCT_ID="0x0001"     # Generic HID Device
@@ -100,10 +124,21 @@ echo "${PRODUCT_ID}" > idProduct
 echo "${DEVICE_BCD}" > bcdDevice
 echo "${USB_BCD}" > bcdUSB
 
-# Device class (0x00 = defined at interface level)
-echo "0x00" > bDeviceClass
-echo "0x00" > bDeviceSubClass
-echo "0x00" > bDeviceProtocol
+# Device class: real Xbox controllers declare the GIP class at device level;
+# everything else defines it per interface.
+if [ "$PROFILE" = "xbox" ]; then
+    echo "0xFF" > bDeviceClass
+    echo "0x47" > bDeviceSubClass
+    echo "0xD0" > bDeviceProtocol
+else
+    echo "0x00" > bDeviceClass
+    echo "0x00" > bDeviceSubClass
+    echo "0x00" > bDeviceProtocol
+fi
+# FunctionFS descriptors are full/high speed only: never negotiate SuperSpeed.
+if [ -f max_speed ]; then
+    echo "high-speed" > max_speed 2>/dev/null || true
+fi
 
 # Create English strings
 mkdir -p strings/0x409
@@ -116,6 +151,22 @@ echo "Creating configuration..."
 mkdir -p "configs/${CONFIG_NAME}/strings/0x409"
 echo "${CONFIG_STRING}" > "configs/${CONFIG_NAME}/strings/0x409/configuration"
 echo "${MAX_POWER}" > "configs/${CONFIG_NAME}/MaxPower"
+
+if [ "$PROFILE" = "xbox" ]; then
+    # ---- Xbox: one FunctionFS function, no keyboard/mouse interfaces ----
+    modprobe usb_f_fs 2>/dev/null || true
+    FFS_MOUNT="/dev/ffs-xbox"
+    mkdir -p functions/ffs.xbox
+    ln -s functions/ffs.xbox "configs/${CONFIG_NAME}/"
+    mkdir -p "${FFS_MOUNT}"
+    if ! mountpoint -q "${FFS_MOUNT}"; then
+        mount -t functionfs xbox "${FFS_MOUNT}"
+    fi
+    echo "${PROFILE}" > /tmp/steamdeck_hid.profile
+    echo "✓ FunctionFS mounted at ${FFS_MOUNT} — the daemon writes the GIP"
+    echo "  descriptors to ${FFS_MOUNT}/ep0 and binds the UDC."
+    exit 0
+fi
 
 # Create HID functions (3 separate interfaces for gamepad, keyboard, mouse)
 echo "Creating HID functions..."
@@ -209,6 +260,9 @@ if [ "$PROFILE" = "ds4" ]; then
     echo
     echo "Gamepad presents as a DUALSHOCK 4 (054C:05C4) — macOS Game Controllers"
     echo "should list it as a Wireless Controller / DUALSHOCK 4."
+elif [ "$PROFILE" = "pro" ]; then
+    echo
+    echo "Gamepad presents as a Switch Pro Controller (057E:2009)."
 fi
 echo
 echo "To disable: Run cleanup-usb-gadget.sh or:"

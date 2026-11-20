@@ -7,9 +7,10 @@ Emulates a Bluetooth or **wired USB** gamepad / keyboard / trackpad peripheral t
 | Transport | Gamepad identity on the Mac | Keyboard/mouse |
 |-----------|-----------------------------|----------------|
 | Bluetooth (LE) — **recommended** | **Xbox Wireless Controller** (Series X\|S, 045E:0B13) with rumble on the Deck | not in this mode |
+| Bluetooth (BR/EDR) | **DUALSHOCK 4** v2 ("Wireless Controller", 054C:09CC) — light bar shown on screen, on-screen touchpad, rumble on the Deck; **Deck works as a Bluetooth speaker** | not in this mode |
 | Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") | not in this mode |
 | Bluetooth (LE) | — | HID-over-GATT gamepad/keyboard/mouse ("SteamDeckPad") |
-| Wired USB | **DUALSHOCK 4** (VID 0x054C / PID 0x05C4) | separate HID interfaces, always present |
+| Wired USB | **Xbox Series X\|S** (045E:0B12, GIP — macOS's built-in XboxGamepad driver), **DUALSHOCK 4** (054C:05C4) or **Switch Pro Controller** (057E:2009) | separate HID interfaces with DS4/Pro; none with Xbox (gamepad-only, like the real one) |
 
 ![controller view](assets/controller-tab.png) ![keyboard view](assets/keyboard-tab.png) ![media view](assets/media-tab.png) ![trackpad view](assets/trackpad-tab.png)
 
@@ -97,7 +98,8 @@ cd ~/steamdeck-bt-controller-emulator
 Pick **Bluetooth** or **Wired USB**, then pick a **Profile**:
 
 - **Xbox (BT)** — Bluetooth LE Xbox Wireless Controller. Works with macOS Game Controllers and Steam on the Mac; host rumble plays on the Deck's haptics. Bluetooth only.
-- **Pro / DS4** — Pro Controller over Bluetooth, DUALSHOCK 4 over USB.
+- **DS4** — DUALSHOCK 4 over Bluetooth (classic) or USB. The Controller tab shows the light bar color the host sets and an on-screen touchpad (drag to touch, **Pad Click** to click); host rumble plays on the Deck's haptics. Over Bluetooth the Deck can also be the Mac's audio output.
+- **Pro (BT)** — Nintendo Switch Pro Controller over Bluetooth.
 - **Keyboard** — BLE HOGP gamepad/keyboard/mouse (Bluetooth) or generic HID gamepad + keyboard + mouse (USB).
 
 Switching profiles requires **Stop Service → switch → Start** (and re-pair/re-plug on the host) — the identity changes at connect time.
@@ -106,9 +108,12 @@ CLI (no GUI):
 
 ```bash
 python3 -m src.hogp start --mode bluetooth --profile xbox      # Xbox Wireless Controller (BLE)
+python3 -m src.hogp start --mode bluetooth --profile ds4       # DUALSHOCK 4 (+ Deck speaker)
 python3 -m src.hogp start --mode bluetooth --profile gamepad   # Pro Controller
 python3 -m src.hogp start --mode bluetooth --profile keyboard  # SteamDeckPad (HOGP)
-python3 -m src.hogp start --mode usb --profile gamepad         # DUALSHOCK 4
+python3 -m src.hogp start --mode usb --profile xbox            # wired Xbox Series X|S
+python3 -m src.hogp start --mode usb --profile ds4             # wired DUALSHOCK 4
+python3 -m src.hogp start --mode usb --profile gamepad         # wired Switch Pro Controller
 python3 -m src.hogp status
 python3 -m src.hogp stop
 ```
@@ -121,6 +126,15 @@ python3 -m src.hogp stop
 4. Rumble from games is played on the Deck's haptics (evdev force feedback — needs the Deck's built-in controller as the input device; check `journalctl -u bt-controller-emulator` for "no FF_RUMBLE support")
 
 Each profile sets bluetoothd's Device ID in `/etc/bluetooth/main.conf` (Xbox `045E:0B13`, Pro `057E:2009`) and restarts bluetooth once when switching. macOS caches the vendor/product ID per Deck address, so **after switching profiles, Forget the device on the Mac and pair again** — `system_profiler SPBluetoothDataType` on the Mac must show Vendor ID 0x045E / Product ID 0x0B13 for the Xbox profile.
+
+### DUALSHOCK 4 over Bluetooth (+ the Deck as a speaker)
+
+1. Select **Bluetooth** + **DS4** → **Start Service** — wait for **Active - Wireless Controller** (the first start restarts bluetooth once to publish Sony's Device ID 054C:09CC)
+2. On the Mac: **System Settings → Bluetooth** → **Wireless Controller** → **Connect**
+3. **Game Controllers** and Steam list a DUALSHOCK 4. The Controller tab shows the light bar color the game/host sets and a touchpad you can drag on (finger 1) with a **Pad Click** button
+4. **Deck as speaker:** with the controller connected, pick **Wireless Controller** under **System Settings → Sound → Output** (or the menu-bar sound menu). Audio plays through the Deck's speakers/headphone jack. The GUI shows *Deck speaker: available / connected / playing*
+
+The speaker is the Deck's standard Bluetooth audio sink (A2DP), provided by PipeWire/WirePlumber — the daemon only keeps classic Bluetooth on and reports its state. It needs a classic-Bluetooth profile (DS4 or Pro); the Xbox profile is Bluetooth LE-only, which cannot carry A2DP audio. If the GUI says *unavailable*, the session's PipeWire has no Bluetooth sink registered (`wpctl status` should list a bluez5 device once the Mac connects audio).
 
 ### Pro Controller over Bluetooth (macOS / Android / Linux)
 
@@ -139,7 +153,17 @@ Each profile sets bluetoothd's Device ID in `/etc/bluetooth/main.conf` (Xbox `04
 
 You can keep both pairings on the Mac and switch by stopping/starting the service with the desired profile. The Deck battery is exposed on the standard HOGP Battery Service (0x180F).
 
-### Gamepad over Wired USB
+### Gamepad over Wired USB (Xbox / DS4 / Pro)
+
+All three controller identities work wired; pick the profile, then **Wired USB** → **Start Service**:
+
+| Profile | Shows up on the Mac as | How it talks |
+|---|---|---|
+| **Xbox** | Xbox Series X\|S controller (045E:0B12) | GIP over a vendor USB interface (FunctionFS) — macOS's built-in `XboxGamepad` driver; Steam via SDL. Gamepad only. Rumble → Deck haptics |
+| **DS4** | DUALSHOCK 4 (054C:05C4) | USB HID; touchpad + light bar on the Controller tab; calibration/MAC feature reports preloaded on kernels with `GADGET_HID_WRITE_GET_REPORT` |
+| **Pro** | Switch Pro Controller (057E:2009) | USB HID with the Pro's USB handshake (0x80 commands) + subcommands; HD rumble → Deck haptics |
+
+Switching wired profiles rebuilds the gadget automatically — re-plug the cable if the Mac doesn't pick up the new identity.
 
 1. **BIOS:** Shut down → hold **Volume +** + **Power** → Setup Utility → **Advanced** → **USB Configuration** → **USB Dual Role Device** → **DRD** → save and exit. Cold boot.
 2. Connect Deck to host with a **data** USB-C cable.
@@ -298,6 +322,8 @@ Key modules:
 | [`src/hogp/bluez.py`](src/hogp/bluez.py) | BlueZ helpers: async registration, adapter snapshot/restore, btmgmt (no sudo) |
 | [`src/hogp/gatt_app.py`](src/hogp/gatt_app.py) | HID-over-GATT service (report maps, ATT notify throttle) |
 | [`src/hogp/xbox.py`](src/hogp/xbox.py) | Xbox Wireless Controller (BLE HoG, rumble → Deck haptics) |
+| [`src/hogp/ds4_bt.py`](src/hogp/ds4_bt.py) | DUALSHOCK 4 over classic Bluetooth (CRC'd 0x11 reports, feature reports, light bar, touchpad) |
+| [`src/hogp/connparams.py`](src/hogp/connparams.py) | Fast BLE connection interval (kernel default range + HCI connection update) |
 | [`src/hogp/pro_controller.py`](src/hogp/pro_controller.py) | Pro Controller emulator (L2CAP HIDP + subcommand engine, direct PSM bind) |
 | [`src/hogp/input_handler.py`](src/hogp/input_handler.py) | evdev gamepad detection + forwarding |
 | [`src/hogp/usb_gadget.py`](src/hogp/usb_gadget.py) / [`ds4.py`](src/hogp/ds4.py) | USB gadget HID + DualShock 4 identity |

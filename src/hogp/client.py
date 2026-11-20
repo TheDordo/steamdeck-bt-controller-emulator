@@ -167,3 +167,9 @@ class BtEmuClient:
 
     def set_hat(self, direction: int) -> None:
         self._call("SetHat", GLib.Variant("(y)", (direction,)))
+
+    def set_touch(self, finger: int, active: bool, x: int, y: int) -> None:
+        self._call("SetTouch", GLib.Variant("(ubqq)", (finger, active, x, y)))
+
+    def set_touch_click(self, pressed: bool) -> None:
+        self._call("SetTouchClick", GLib.Variant("(b)", (pressed,)))

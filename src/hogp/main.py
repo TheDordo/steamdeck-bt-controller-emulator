@@ -4,6 +4,7 @@ Command-line client for the emulator daemon.
     python3 -m src.hogp status
     python3 -m src.hogp start --mode bluetooth --profile gamepad
     python3 -m src.hogp start --mode bluetooth --profile xbox
+    python3 -m src.hogp start --mode bluetooth --profile ds4
     python3 -m src.hogp start --mode usb --profile keyboard
     python3 -m src.hogp stop
     python3 -m src.hogp watch
@@ -19,7 +20,7 @@ import argparse
 import sys
 
 from .api import (
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, PROFILE_DS4,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_CONNECTED, KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_BATTERY,
     KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
@@ -44,6 +45,11 @@ def _print_status(client: BtEmuClient) -> int:
         print(f"Device:   {device} ({status.get(KEY_DEVICE_ADDR, '')}) "
               f"paired={status.get(KEY_PAIRED, False)} trusted={status.get(KEY_TRUSTED, False)}")
     print(f"Input:    {status.get(KEY_INPUT, '') or 'none'}")
+    if status.get("speaker"):
+        print(f"Speaker:  {status['speaker']}")
+    lightbar = status.get("lightbar", -1)
+    if isinstance(lightbar, int) and lightbar >= 0:
+        print(f"Lightbar: #{lightbar:06x}")
     print(f"Battery:  {status.get(KEY_BATTERY, 0)}%")
     if status.get(KEY_ERROR):
         print(f"Error:    {status.get(KEY_ERROR)}")
@@ -66,11 +72,11 @@ def main(argv=None) -> int:
     sub.add_parser("stop", help="stop the active session")
 
     start = sub.add_parser("start", help="start a session")
-    start.add_argument("--mode", choices=("bluetooth", "usb", "pro", "hogp", "xbox"),
+    start.add_argument("--mode", choices=("bluetooth", "usb", "pro", "hogp", "xbox", "ds4"),
                        default="bluetooth",
                        help="transport (pro = bluetooth gamepad, hogp = bluetooth keyboard, "
-                            "xbox = bluetooth Xbox controller)")
-    start.add_argument("--profile", choices=("gamepad", "xbox", "keyboard"),
+                            "xbox = bluetooth Xbox controller, ds4 = bluetooth DualShock 4)")
+    start.add_argument("--profile", choices=("gamepad", "xbox", "ds4", "keyboard"),
                        help="HID identity (default: gamepad for pro, keyboard otherwise)")
 
     sub.add_parser("watch", help="follow status changes (Ctrl+C to exit)")
@@ -101,10 +107,11 @@ def main(argv=None) -> int:
             return 0
 
         if command == "start":
-            if args.mode in ("pro", "hogp", "xbox"):
+            if args.mode in ("pro", "hogp", "xbox", "ds4"):
                 mode = MODE_BLUETOOTH
                 profile = {
                     "pro": PROFILE_GAMEPAD, "hogp": PROFILE_KEYBOARD, "xbox": PROFILE_XBOX,
+                    "ds4": PROFILE_DS4,
                 }[args.mode]
                 if args.profile:
                     profile = args.profile

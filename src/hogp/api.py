@@ -32,13 +32,15 @@ STATUS_DEGRADED = "degraded"   # active session, but bluetoothd vanished; auto-r
 # Transport / profile values for Start(mode, profile)
 MODE_BLUETOOTH = "bluetooth"
 MODE_USB = "usb"
-PROFILE_GAMEPAD = "gamepad"    # BT: Pro Controller (BR/EDR) | USB: DUALSHOCK 4
+PROFILE_GAMEPAD = "gamepad"    # Switch Pro Controller (BT: BR/EDR HID | USB: HID gadget)
 PROFILE_KEYBOARD = "keyboard"  # BT: BLE HOGP gamepad/keyboard/mouse | USB: generic HID
-PROFILE_XBOX = "xbox"          # BT only: Xbox Wireless Controller (BLE HOGP, rumble)
+PROFILE_XBOX = "xbox"          # BT: Xbox Wireless (BLE HOGP) | USB: Xbox Series (GIP)
+PROFILE_DS4 = "ds4"            # BT: DualShock 4 (BR/EDR HID) | USB: DUALSHOCK 4 gadget
 
 VALID_MODES = (MODE_BLUETOOTH, MODE_USB)
-VALID_PROFILES = (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX)
+VALID_PROFILES = (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, PROFILE_DS4)
 HOGP_PROFILES = (PROFILE_KEYBOARD, PROFILE_XBOX)  # BT LE HID-over-GATT profiles
+BREDR_PROFILES = (PROFILE_GAMEPAD, PROFILE_DS4)   # BT classic HID profiles
 
 # Status dict keys returned by GetStatus()
 KEY_STATUS = "status"
@@ -60,6 +62,9 @@ KEY_BUTTONS = "buttons"        # 11-bit button mask (visualizer)
 KEY_AXES = "axes"              # 4 x int16
 KEY_TRIGGERS = "triggers"      # 2 x uint8
 KEY_HAT = "hat"                # 0-8
+KEY_LIGHTBAR = "lightbar"      # DS4 light bar 0xRRGGBB, -1 when not applicable
+KEY_TOUCH_CAPABLE = "touch_capable"  # True when the DS4 touchpad is live
+KEY_SPEAKER = "speaker"        # Deck-as-speaker state line ("" = n/a)
 
 MANAGER_XML = f"""
 <node>
@@ -97,6 +102,15 @@ MANAGER_XML = f"""
         </method>
         <method name="SetHat">
             <arg type="y" direction="in" name="direction"/>
+        </method>
+        <method name="SetTouch">
+            <arg type="u" direction="in" name="finger"/>
+            <arg type="b" direction="in" name="active"/>
+            <arg type="q" direction="in" name="x"/>
+            <arg type="q" direction="in" name="y"/>
+        </method>
+        <method name="SetTouchClick">
+            <arg type="b" direction="in" name="pressed"/>
         </method>
         <property name="Status" type="s" access="read"/>
         <signal name="StatusChanged">

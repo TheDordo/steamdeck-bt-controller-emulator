@@ -629,6 +629,7 @@ class ProControllerEmulator:
         self._conn_lock = threading.Lock()
 
         self._threads = []
+        self._report_interval_s = INPUT_REPORT_INTERVAL_S  # subclasses may change
         self._stream_gen = 0
         self.restarted_bluetoothd = False  # set by start() when a bind restarted bluetoothd
         self._timer = 0
@@ -640,6 +641,10 @@ class ProControllerEmulator:
 
         # Callbacks for UI
         self.on_state_change = None  # callable(connected: bool)
+        # callable(strong 0..1, weak 0..1, duration_ms) — host HD rumble,
+        # decoded to amplitudes for the Deck's haptics
+        self.on_rumble = None
+        self._last_rumble = (0.0, 0.0)
 
     # -- state setters (called from the input handler / GUI) -----------------
 
@@ -864,6 +869,10 @@ class ProControllerEmulator:
         if trans == HIDP_TRANS_GET_REPORT:
             report_type = param & 0x03
             report_id = data[1] if len(data) > 1 else 0
+            reply = self._get_report_reply(report_type, report_id)
+            if reply is not None:
+                self._write_control(reply)
+                return
             if report_type == HIDP_REPORT_INPUT and report_id in (0, INPUT_STANDARD_FULL):
                 self._write_control(
                     bytes([HIDP_TRANS_DATA | HIDP_REPORT_INPUT]) + self._build_standard_report()
@@ -884,10 +893,45 @@ class ProControllerEmulator:
             return
         self._write_control(bytes([HIDP_TRANS_HANDSHAKE | HIDP_HSHK_ERR_UNSUPPORTED_REQUEST]))
 
+    def _get_report_reply(self, report_type: int, report_id: int) -> Optional[bytes]:
+        """Hook: full HIDP reply (header + report) for a GET_REPORT, or None
+        for the default handling. Subclasses answer feature reports here."""
+        return None
+
+    def _peer_address(self) -> str:
+        """Address of the connected host (control channel), or ''."""
+        conn = self._ctl_conn
+        try:
+            return conn.getpeername()[0] if conn is not None else ""
+        except OSError:
+            return ""
+
+    def _handle_rumble(self, payload: bytes) -> None:
+        """Output reports 0x01/0x10 carry 8 bytes of HD rumble (left motor
+        4 bytes, right motor 4 bytes) at payload[2:10]."""
+        if self.on_rumble is None or len(payload) < 10:
+            return
+        strong = weak = 0.0
+        for side in (payload[2:6], payload[6:10]):
+            lf, hf = decode_hd_rumble(side)
+            strong = max(strong, lf)
+            weak = max(weak, hf)
+        level = (round(strong, 2), round(weak, 2))
+        if level != self._last_rumble:
+            self._last_rumble = level
+            try:
+                # Hosts refresh rumble every ~15 ms while it lasts and send
+                # neutral data to stop, so a short self-expiring effect fits.
+                self.on_rumble(strong, weak, 1000)
+            except Exception as e:
+                logger.debug("rumble callback: %s", e)
+
     def _handle_output_report(self, payload: bytes) -> None:
         if len(payload) < 1:
             return
         report_id = payload[0]
+        if report_id in (OUTPUT_RUMBLE_SUBCMD, OUTPUT_RUMBLE_ONLY):
+            self._handle_rumble(payload)
         if report_id == OUTPUT_RUMBLE_SUBCMD:
             if len(payload) < 11:
                 return
@@ -907,7 +951,9 @@ class ProControllerEmulator:
     # -- subcommand replies ---------------------------------------------------
 
     def _reply_to_subcommand(self, subcmd: int, data: bytes) -> None:
-        reply = bytearray(49)  # 0x21 input report, 49 data bytes
+        # 0x21 reply: 15-byte header (id..subcmd id) + 35 data bytes = 50
+        # (hid-nintendo JC_MAX_RESP_SIZE; joycontrol sends the same length).
+        reply = bytearray(50)
         ack, reply_id = 0x80, subcmd
 
         if subcmd == SUBCMD_REQ_DEVICE_INFO:
@@ -1073,7 +1119,7 @@ class ProControllerEmulator:
         failures = 0
         while self._running and self._streaming and gen == self._stream_gen:
             now = time.monotonic()
-            if now - last >= INPUT_REPORT_INTERVAL_S:
+            if now - last >= self._report_interval_s:
                 last = now
                 self._timer = (self._timer + 1) & 0xFF
                 if self._send_now(self._build_standard_report()):
@@ -1138,6 +1184,21 @@ class ProControllerEmulator:
     @property
     def hat(self) -> int:
         return self._hat
+
+
+def decode_hd_rumble(side: bytes):
+    """One motor's 4 HD-rumble bytes -> (low_band, high_band) amplitude 0..1.
+
+    Encoding (dekuNukem rumble_data_table): byte1 = HF amplitude code
+    (0x00-0xC8, even) | HF frequency bit 8; byte3 = LF amplitude code
+    (0x40-0x72) with its bit 8 in byte2 bit 7. Neutral is 00 01 40 40."""
+    if len(side) < 4:
+        return 0.0, 0.0
+    hf_code = side[1] & 0xFE
+    lf_code = side[3]
+    hf = max(0.0, min(1.0, hf_code / 0xC8))
+    lf = max(0.0, min(1.0, (lf_code - 0x40) / (0x72 - 0x40))) if lf_code >= 0x40 else 0.0
+    return lf, hf
 
 
 def _parse_mac(address: str) -> bytes:

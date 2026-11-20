@@ -18,7 +18,26 @@ import threading
 import time
 from typing import Optional
 
-from .ds4 import Ds4ReportBuilder
+import errno
+import fcntl
+
+from .ds4 import (
+    DS4_FEATURE_CALIBRATION,
+    DS4_FEATURE_FIRMWARE,
+    DS4_FEATURE_MAC_USB,
+    DS4_FEATURE_PAIRING_INFO,
+    Ds4ReportBuilder,
+    build_feature_report,
+    parse_output_report,
+)
+
+# include/uapi/linux/usb/g_hid.h: preload GET_REPORT responses per report ID.
+# struct usb_hidg_report { u8 report_id; u8 userspace_req; u16 length;
+#                          u8 data[64]; u8 padding[4]; }  (72 bytes)
+_HIDG_REPORT_FMT = "<BBH64s4x"
+GADGET_HID_WRITE_GET_REPORT = (1 << 30) | (struct.calcsize(_HIDG_REPORT_FMT) << 16) | (ord("g") << 8) | 0x42
+# Stable "device MAC" for the wired DS4 (shown by SDL/Steam as its serial).
+DS4_USB_MAC = bytes.fromhex("a01e0d000001")
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +106,11 @@ class USBGadgetHID:
         self._mouse_wheel = 0  # Wheel movement (signed 8-bit)
         self._mouse_h_wheel = 0  # Horizontal wheel (signed 8-bit)
         self._last_gamepad_send_ms = 0
+        self._flush_pending = False
+
+        # Switch Pro Controller engine (gamepad_profile == "pro"): owns all
+        # hidg0 traffic (handshake, subcommands, 64-byte reports).
+        self._pro = None
 
         # DualShock 4 report builder (used when gamepad_profile == "ds4")
         self._ds4: Optional[Ds4ReportBuilder] = None
@@ -94,6 +118,10 @@ class USBGadgetHID:
             self._ds4 = Ds4ReportBuilder()
         self._ds4_drain_thread: Optional[threading.Thread] = None
         self._ds4_drain_stop = threading.Event()
+        # DS4 host output (report 0x05): callables, invoked from the drain
+        # thread — the daemon marshals them onto its main loop.
+        self.on_lightbar = None   # callable(r, g, b)
+        self.on_rumble = None     # callable(strong 0..1, weak 0..1, duration_ms)
 
     def open(self) -> bool:
         """
@@ -133,7 +161,13 @@ class USBGadgetHID:
 
             self._active = True
             logger.info("USB gadget HID opened successfully")
+            self._preload_ds4_feature_reports()
             self._start_ds4_drain()
+            if self.gamepad_profile == "pro":
+                from .usb_pro import UsbProController
+                self._pro = UsbProController(self._gamepad_fd, verbose=self.verbose)
+                self._pro.on_rumble = self.on_rumble
+                self._pro.start()
             self._send_gamepad_report()
             return True
 
@@ -149,6 +183,9 @@ class USBGadgetHID:
 
         logger.info("Closing USB gadget HID devices...")
         self._ds4_drain_stop.set()
+        if self._pro is not None:
+            self._pro.stop()
+            self._pro = None
         if self._ds4_drain_thread is not None:
             self._ds4_drain_thread.join(timeout=1.0)
             self._ds4_drain_thread = None
@@ -191,6 +228,8 @@ class USBGadgetHID:
                     data = os.read(fd, 128)
                     if self.verbose and data:
                         logger.debug(f"DS4 host output report: {data.hex()}")
+                    if data:
+                        self._handle_ds4_output(data)
                 except BlockingIOError:
                     pass
                 except OSError:
@@ -245,6 +284,9 @@ class USBGadgetHID:
             self._buttons &= ~(1 << button_idx)
         if self._ds4:
             self._ds4.set_button(button_idx, pressed)
+        if self._pro:
+            self._pro.set_button(button_idx, pressed)
+            return
 
         self._send_gamepad_report()
 
@@ -265,6 +307,9 @@ class USBGadgetHID:
         self._axes[axis_idx] = value
         if self._ds4:
             self._ds4.set_axis(axis_idx, value)
+        if self._pro:
+            self._pro.set_axis(axis_idx, value)
+            return
         self._send_gamepad_report()
 
     def set_trigger(self, trigger_idx: int, value: int) -> None:
@@ -284,6 +329,9 @@ class USBGadgetHID:
         self._triggers[trigger_idx] = value
         if self._ds4:
             self._ds4.set_trigger(trigger_idx, value)
+        if self._pro:
+            self._pro.set_trigger(trigger_idx, value)
+            return
         self._send_gamepad_report()
 
     def set_hat(self, value: int) -> None:
@@ -302,19 +350,92 @@ class USBGadgetHID:
         self._hat = value
         if self._ds4:
             self._ds4.set_hat(value)
+        if self._pro:
+            self._pro.set_hat(value)
+            return
         self._send_gamepad_report()
+
+    def _preload_ds4_feature_reports(self) -> None:
+        """Answer the host's DS4 feature-report reads (calibration 0x02,
+        MAC 0x81, pairing 0x12, firmware 0xA3).
+
+        f_hid answers GET_REPORT itself: before the GADGET_HID_WRITE_GET_REPORT
+        ioctl (newer kernels) it always returned ALL ZEROS — the host then
+        reads zero calibration (divide-by-zero in its motion math) and a
+        zero MAC. With the ioctl, each report is preloaded once
+        (userspace_req=0 = answer immediately, every time)."""
+        if self._ds4 is None or self._gamepad_fd is None:
+            return
+        loaded = []
+        for rid in (DS4_FEATURE_CALIBRATION, DS4_FEATURE_MAC_USB,
+                    DS4_FEATURE_PAIRING_INFO, DS4_FEATURE_FIRMWARE):
+            data = build_feature_report(rid, bluetooth=False, device_mac=DS4_USB_MAC)
+            if data is None:
+                continue
+            buf = bytearray(struct.pack(_HIDG_REPORT_FMT, rid, 0, len(data), data))
+            try:
+                fcntl.ioctl(self._gamepad_fd, GADGET_HID_WRITE_GET_REPORT, buf)
+                loaded.append(f"0x{rid:02x}")
+            except OSError as e:
+                if e.errno in (errno.ENOTTY, errno.EINVAL):
+                    logger.warning(
+                        "This kernel's USB HID gadget cannot serve feature reports "
+                        "(no GADGET_HID_WRITE_GET_REPORT): the host reads all-zero "
+                        "DS4 calibration/MAC/firmware. Buttons, sticks, touchpad and "
+                        "rumble still work; motion calibration may be off."
+                    )
+                else:
+                    logger.warning("Preloading DS4 feature report 0x%02x failed: %s", rid, e)
+                return
+        logger.info("DS4 feature reports preloaded for GET_REPORT: %s", ", ".join(loaded))
+
+    def _deferred_flush(self) -> None:
+        self._flush_pending = False
+        self._send_gamepad_report()
+
+    def _handle_ds4_output(self, data: bytes) -> None:
+        out = parse_output_report(data, bluetooth=False)
+        if not out:
+            return
+        if "red" in out and self.on_lightbar:
+            self.on_lightbar(out["red"], out["green"], out["blue"])
+        if "motor_left" in out and self.on_rumble:
+            self.on_rumble(out["motor_left"] / 255.0, out["motor_right"] / 255.0, 10000)
+
+    def set_touch(self, finger: int, active: bool, x: int, y: int) -> None:
+        """DS4 touchpad contact (DS4 profile only)."""
+        if self._ds4:
+            self._ds4.set_touch(finger, active, x, y)
+            self._send_gamepad_report()
+
+    def set_touch_click(self, pressed: bool) -> None:
+        if self._ds4:
+            self._ds4.set_touch_click(pressed)
+            self._send_gamepad_report()
 
     def _now_ms(self) -> int:
         return time.monotonic_ns() // 1_000_000
 
     def _send_gamepad_report(self) -> None:
         """Send gamepad HID report to USB gadget."""
+        if self._pro is not None:
+            return  # the Pro engine owns hidg0 (handshake + its own stream)
         if not self._active or self._gamepad_fd is None:
             return
 
         now = self._now_ms()
-        if now - self._last_gamepad_send_ms < USB_GAMEPAD_MIN_INTERVAL_MS:
-            return  # later state changes supersede; nothing is dropped
+        wait_ms = USB_GAMEPAD_MIN_INTERVAL_MS - (now - self._last_gamepad_send_ms)
+        if wait_ms > 0:
+            # Too soon: flush the LATEST state once the interval elapses.
+            # (Returning without a deferred send dropped the final update —
+            # a released button/touch or the stick's resting position could
+            # stay stuck on the host until the next change.)
+            if not self._flush_pending:
+                self._flush_pending = True
+                t = threading.Timer(wait_ms / 1000.0, self._deferred_flush)
+                t.daemon = True
+                t.start()
+            return
         self._last_gamepad_send_ms = now
 
         try:

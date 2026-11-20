@@ -32,11 +32,13 @@ from .api import (
     BUS_NAME, OBJECT_PATH, MANAGER_IFACE, MANAGER_XML, ERROR_FAILED,
     STATUS_STOPPED, STATUS_STARTING, STATUS_STOPPING, STATUS_ACTIVE,
     STATUS_ERROR, STATUS_DEGRADED,
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, HOGP_PROFILES,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, PROFILE_DS4,
+    HOGP_PROFILES, BREDR_PROFILES,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_CONNECTED, KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_BATTERY,
     KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
     KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
+    KEY_LIGHTBAR, KEY_TOUCH_CAPABLE, KEY_SPEAKER,
 )
 from . import bluez, connparams
 from .adv import Advertisement
@@ -53,7 +55,16 @@ from .pro_controller import (
     SDP_RECORD_XML,
     ProControllerEmulator,
 )
+from .ds4_bt import (
+    DS4_BT_NAME,
+    DS4_BT_PRODUCT_ID,
+    DS4_BT_VENDOR_ID,
+    DS4_BT_VERSION,
+    DS4_SDP_RECORD_XML,
+    Ds4BtEmulator,
+)
 from .usb_gadget import USBGadgetHID
+from .usb_xbox import FFS_MOUNT, UsbXboxGip
 from .xbox import (
     XBOX_NAME,
     XBOX_PRODUCT_ID,
@@ -70,6 +81,28 @@ PRO_DEVICE_ID = bluez.pro_device_id_value(
     PRO_VENDOR_ID_SOURCE, PRO_VENDOR_ID, PRO_PRODUCT_ID, PRO_VERSION,
 )
 XBOX_DEVICE_ID = bluez.pro_device_id_value(0x0002, XBOX_VENDOR_ID, XBOX_PRODUCT_ID, XBOX_VERSION)
+DS4_DEVICE_ID = bluez.pro_device_id_value(0x0002, DS4_BT_VENDOR_ID, DS4_BT_PRODUCT_ID, DS4_BT_VERSION)
+
+# Wired USB gadget identity per profile (setup-usb-gadget.sh --profile)
+USB_PROFILE_TAGS = {
+    PROFILE_DS4: "ds4",
+    PROFILE_GAMEPAD: "pro",
+    PROFILE_XBOX: "xbox",
+    PROFILE_KEYBOARD: "generic",
+}
+
+# Classic-Bluetooth (BR/EDR HID) profiles: same L2CAP/SDP machinery,
+# different identity + protocol engine.
+BREDR_SPECS = {
+    PROFILE_GAMEPAD: {
+        "name": PRO_NAME, "device_id": PRO_DEVICE_ID,
+        "sdp": SDP_RECORD_XML, "engine": ProControllerEmulator,
+    },
+    PROFILE_DS4: {
+        "name": DS4_BT_NAME, "device_id": DS4_DEVICE_ID,
+        "sdp": DS4_SDP_RECORD_XML, "engine": Ds4BtEmulator,
+    },
+}
 STATIC_BLE_ADDRESS = "C2:12:34:56:78:9A"
 REPORT_RATE_HZ = 25
 
@@ -151,6 +184,10 @@ class EmulatorService:
         # concurrent write — the drain swaps them out under this lock).
         self._input_lock = threading.Lock()
         self._axis_flush_queued = False
+
+        # DS4 light bar (0xRRGGBB, -1 = n/a) and Deck-as-speaker status line
+        self._lightbar = -1
+        self._speaker = ""
 
         # LE connection-interval tuning (Xbox profile): handles already
         # requested, and whether a tuning worker is in flight.
@@ -398,6 +435,18 @@ class EmulatorService:
             direction = params.unpack()[0]
             self._set_hat(direction)
             invoc.return_value(None)
+        elif method == "SetTouch":
+            finger, active, x, y = params.unpack()
+            engine = self._engine()
+            if engine is not None and hasattr(engine, "set_touch"):
+                engine.set_touch(finger, active, x, y)
+            invoc.return_value(None)
+        elif method == "SetTouchClick":
+            pressed = params.unpack()[0]
+            engine = self._engine()
+            if engine is not None and hasattr(engine, "set_touch_click"):
+                engine.set_touch_click(pressed)
+            invoc.return_value(None)
         else:
             invoc.return_dbus_error(
                 "org.freedesktop.DBus.Error.UnknownMethod",
@@ -418,7 +467,9 @@ class EmulatorService:
         if session is None:
             return False
         if session.get("mode") == MODE_USB:
-            return True
+            # Wired Xbox is gamepad-only (like the real controller): no
+            # keyboard/mouse interfaces on that gadget.
+            return session.get("profile") != PROFILE_XBOX
         return session.get("profile") == PROFILE_KEYBOARD
 
     def _ready(self) -> bool:
@@ -500,10 +551,10 @@ class EmulatorService:
     def _handle_start(self, mode: str, profile: str) -> None:
         if mode not in (MODE_BLUETOOTH, MODE_USB):
             raise RuntimeError(f"invalid mode {mode!r} (use 'bluetooth' or 'usb')")
-        if profile not in (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX):
-            raise RuntimeError(f"invalid profile {profile!r} (use 'gamepad', 'xbox' or 'keyboard')")
-        if profile == PROFILE_XBOX and mode != MODE_BLUETOOTH:
-            raise RuntimeError("the Xbox profile is Bluetooth-only — use 'gamepad' (DUALSHOCK 4) for USB")
+        if profile not in (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, PROFILE_DS4):
+            raise RuntimeError(
+                f"invalid profile {profile!r} (use 'xbox', 'ds4', 'gamepad' or 'keyboard')"
+            )
         if self._session is not None:
             if self._status == STATUS_ERROR:
                 raise RuntimeError("previous session is still shutting down — try again in a moment")
@@ -613,16 +664,17 @@ class EmulatorService:
 
             session["adapter_snapshot"] = bluez.snapshot_adapter_settings(bus, adapter_path, idx)
 
-            if session.get("profile") == PROFILE_GAMEPAD:
+            if session.get("profile") in BREDR_PROFILES:
                 # Anything that may restart bluetoothd (Device ID config,
                 # PSM bind last resort) runs BEFORE the posture/agent/SDP
                 # registration — a restart wipes all of those.
                 if not self._prepare_pro_worker(gen):
                     return
-                bluez.configure_adapter_for_pro_controller(idx)
-                bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
-                # BR/EDR discoverable so hosts can find "Pro Controller".
-                bluez.set_adapter_discoverable(bus, adapter_path, True)
+                name = BREDR_SPECS[session["profile"]]["name"]
+                bluez.configure_adapter_for_pro_controller(idx, name)
+                bluez.set_adapter_alias(bus, session["adapter_path"], name)
+                # BR/EDR discoverable so hosts can find the controller.
+                bluez.set_adapter_discoverable(bus, session["adapter_path"], True)
             else:
                 if session.get("profile") == PROFILE_XBOX:
                     if not self._apply_device_id_worker(
@@ -647,12 +699,13 @@ class EmulatorService:
             bus = self.bus
             adapter_path = session["adapter_path"]
             idx = bluez.get_adapter_index(ADAPTER_NAME)
-            if session.get("profile") == PROFILE_GAMEPAD:
+            if session.get("profile") in BREDR_PROFILES:
                 if not self._prepare_pro_worker(gen):
                     return
-                bluez.configure_adapter_for_pro_controller(idx)
-                bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
-                bluez.set_adapter_discoverable(bus, adapter_path, True)
+                name = BREDR_SPECS[session["profile"]]["name"]
+                bluez.configure_adapter_for_pro_controller(idx, name)
+                bluez.set_adapter_alias(bus, session["adapter_path"], name)
+                bluez.set_adapter_discoverable(bus, session["adapter_path"], True)
             else:
                 if session.get("profile") == PROFILE_XBOX:
                     if not self._apply_device_id_worker(
@@ -740,7 +793,8 @@ class EmulatorService:
 
         # 1) VID/PID: macOS's GameController framework only adopts a Pro
         #    Controller whose SDP Device ID record says 057E:2009.
-        if not self._apply_device_id_worker(gen, PRO_DEVICE_ID, "Pro Controller"):
+        spec = BREDR_SPECS[session["profile"]]
+        if not self._apply_device_id_worker(gen, spec["device_id"], spec["name"]):
             return False
 
         # 2) HID L2CAP PSMs 0x11/0x13. Binding may itself restart
@@ -751,8 +805,9 @@ class EmulatorService:
             bluez.get_adapter_address(self.bus, session["adapter_path"])
             or "00:00:00:00:00:00"
         )
-        pro = ProControllerEmulator(adapter_address=adapter_address)
+        pro = spec["engine"](adapter_address=adapter_address)
         pro.on_state_change = lambda connected: GLib.idle_add(self._on_pro_state, gen, connected)
+        self._hook_ds4_outputs(pro)  # rumble for both; light bar on DS4
         if not pro.start():
             return fail(
                 "Could not bind HID L2CAP sockets: "
@@ -774,7 +829,7 @@ class EmulatorService:
         session = self._session
         if session is None or session.get("generation") != gen:
             return False
-        if session.get("profile") == PROFILE_GAMEPAD:
+        if session.get("profile") in BREDR_PROFILES:
             self._start_pro_session(gen)
         else:
             self._start_hogp_session(gen)
@@ -909,6 +964,51 @@ class EmulatorService:
         self._conn = "Waiting for connection..."
         self._emit_status()
 
+    # ------------------------------------------------ DS4 outputs / speaker
+
+    def _hook_ds4_outputs(self, engine: Any) -> None:
+        """DS4 light bar -> status (GUI swatch); rumble -> Deck haptics.
+        Engines call these from their reader threads: marshal to the loop."""
+        def lightbar(r: int, g: int, b: int) -> None:
+            GLib.idle_add(self._set_lightbar, (r << 16) | (g << 8) | b)
+
+        def rumble(strong: float, weak: float, duration_ms: int) -> None:
+            GLib.idle_add(lambda: (self._on_host_rumble(strong, weak, duration_ms), False)[1])
+
+        engine.on_lightbar = lightbar
+        engine.on_rumble = rumble
+
+    def _set_lightbar(self, rgb: int) -> bool:
+        if rgb != self._lightbar:
+            self._lightbar = rgb
+            self._emit_status()
+        return False
+
+    def _touch_capable(self) -> bool:
+        engine = self._engine()
+        if isinstance(engine, Ds4BtEmulator):
+            return True
+        return isinstance(engine, USBGadgetHID) and engine._ds4 is not None
+
+    def _refresh_speaker(self, session: Dict[str, Any]) -> None:
+        """Deck-as-speaker status for BR/EDR profiles (A2DP needs BR/EDR)."""
+        adapter_path = session.get("adapter_path")
+        if not adapter_path:
+            return
+        state = bluez.get_speaker_state(self.bus, adapter_path)
+        if state["streams"]:
+            active = [s for s in state["streams"] if s["state"] == "active"]
+            line = "Deck speaker: playing" if active else "Deck speaker: connected (idle)"
+        elif state["sink"]:
+            line = ("Deck speaker: available — on the Mac choose the controller "
+                    "under Sound → Output")
+        else:
+            line = ("Deck speaker: unavailable — no A2DP sink registered "
+                    "(PipeWire/WirePlumber bluez5 a2dp_sink role)")
+        if line != self._speaker:
+            logger.info(line)
+            self._speaker = line
+
     @staticmethod
     def _hogp_name(session: Dict[str, Any]) -> str:
         return XBOX_NAME if session.get("profile") == PROFILE_XBOX else HOGP_DEVICE_NAME
@@ -984,7 +1084,8 @@ class EmulatorService:
             return
         session["agent"] = agent
 
-        if not bluez.register_hid_sdp_profile(self.bus, SDP_RECORD_XML):
+        spec = BREDR_SPECS[session["profile"]]
+        if not bluez.register_hid_sdp_profile(self.bus, spec["sdp"]):
             self._fail_session(
                 gen,
                 "Could not register HID SDP record: "
@@ -996,13 +1097,13 @@ class EmulatorService:
         # Listeners were bound by the adapter worker (_prepare_pro_worker).
         pro = session.get("pro")
         if pro is None or not pro.running:
-            self._fail_session(gen, "Pro Controller listeners are not running")
+            self._fail_session(gen, f"{spec['name']} listeners are not running")
             return
         session["registered"] = True
         session["recoveries"] = 0
 
         self._start_input(gen)
-        self._set_status(STATUS_ACTIVE, "Active - Pro Controller")
+        self._set_status(STATUS_ACTIVE, f"Active - {spec['name']}")
         self._conn = "Waiting for Mac to connect…"
         self._emit_status()
 
@@ -1010,7 +1111,8 @@ class EmulatorService:
         if self._session is None or self._session.get("generation") != gen:
             return False
         if connected:
-            self._conn = "✓ Paired — streaming as Pro Controller"
+            spec = BREDR_SPECS.get(self._profile, BREDR_SPECS[PROFILE_GAMEPAD])
+            self._conn = f"✓ Paired — streaming as {spec['name']}"
         else:
             self._conn = "Waiting for Mac to connect…"
         self._connected = connected
@@ -1032,9 +1134,13 @@ class EmulatorService:
             )
 
         try:
-            profile_tag = "ds4" if session.get("profile") == PROFILE_GAMEPAD else "generic"
+            profile_tag = USB_PROFILE_TAGS.get(session.get("profile"), "generic")
             need_setup = False
-            for dev in ("/dev/hidg0", "/dev/hidg1", "/dev/hidg2"):
+            required = (
+                (f"{FFS_MOUNT}/ep0",) if profile_tag == "xbox"
+                else ("/dev/hidg0", "/dev/hidg1", "/dev/hidg2")
+            )
+            for dev in required:
                 if not os.path.exists(dev):
                     need_setup = True
                     break
@@ -1066,7 +1172,30 @@ class EmulatorService:
                     )
                     return
 
+            if profile_tag == "xbox":
+                usb = UsbXboxGip()
+                self._hook_ds4_outputs(usb)   # rumble -> Deck haptics
+                if not usb.open():
+                    self._fail_session(
+                        gen,
+                        f"Wired Xbox setup failed: {usb.last_error or 'unknown error'}. "
+                        "Run scripts/cleanup-usb-gadget.sh in Konsole and start again.",
+                    )
+                    return
+                if not session_valid():
+                    usb.close()
+                    return
+                session["usb"] = usb
+                session["registered"] = True
+                self._start_input(gen)
+                self._set_status(STATUS_ACTIVE, "Active - Wired USB (Xbox Series)")
+                self._conn = "Connected via USB (cable)"
+                self._emit_status()
+                return
+
             usb = USBGadgetHID(gamepad_profile=profile_tag)
+            if profile_tag in ("ds4", "pro"):
+                self._hook_ds4_outputs(usb)   # rumble (+ DS4 light bar)
             if not usb.open():
                 self._fail_session(
                     gen,
@@ -1095,7 +1224,10 @@ class EmulatorService:
                 session["usb"] = None
                 return
             self._start_input(gen)
-            self._set_status(STATUS_ACTIVE, "Active - Wired USB")
+            self._set_status(STATUS_ACTIVE, {
+                "ds4": "Active - Wired USB (DUALSHOCK 4)",
+                "pro": "Active - Wired USB (Pro Controller)",
+            }.get(profile_tag, "Active - Wired USB"))
             self._conn = "Connected via USB (cable)"
             self._emit_status()
         except subprocess.TimeoutExpired:
@@ -1382,6 +1514,8 @@ class EmulatorService:
             self._adapter_poll_source = None
 
     def _reset_connection_state(self) -> None:
+        self._lightbar = -1
+        self._speaker = ""
         self._connected = False
         self._paired = False
         self._trusted = False
@@ -1458,7 +1592,8 @@ class EmulatorService:
         mode = session.get("mode")
 
         if mode == MODE_USB:
-            if not os.path.exists("/dev/hidg0"):
+            usb_node = f"{FFS_MOUNT}/ep0" if isinstance(session.get("usb"), UsbXboxGip) else "/dev/hidg0"
+            if not os.path.exists(usb_node):
                 self._fail_session(
                     gen,
                     "USB gadget disappeared — re-plug the USB-C cable, "
@@ -1494,7 +1629,8 @@ class EmulatorService:
                     return True
                 self._register_advertisement(gen, 0, restart_input=False)
 
-        if session.get("profile") == PROFILE_GAMEPAD:
+        if session.get("profile") in BREDR_PROFILES:
+            self._refresh_speaker(session)
             # Steam/SteamOS can re-assert the hostname identity (name "steamdeck"
             # + laptop class) and flip pairing settings. Keep the Pro Controller
             # identity and pairing posture pinned while the session runs — without
@@ -1521,7 +1657,8 @@ class EmulatorService:
         try:
             idx = bluez.get_adapter_index(ADAPTER_NAME)
             if self._session is not None and self._session.get("generation") == gen:
-                bluez.ensure_pro_controller_identity(idx, allow_power_cycle=False)
+                name = BREDR_SPECS.get(self._session.get("profile"), BREDR_SPECS[PROFILE_GAMEPAD])["name"]
+                bluez.ensure_pro_controller_identity(idx, allow_power_cycle=False, name=name)
                 bluez.ensure_pro_controller_posture(idx)
         except Exception as e:
             logger.warning("identity worker: %s", e)
@@ -1538,8 +1675,8 @@ class EmulatorService:
             self._connected = False
             self._device_name = ""
             self._device_addr = ""
-            if self._status == STATUS_ACTIVE and self._profile == PROFILE_GAMEPAD:
-                pass  # pro mode conn line is managed by on_state_change
+            if self._status == STATUS_ACTIVE and self._profile in BREDR_PROFILES:
+                pass  # BR/EDR conn line is managed by on_state_change
             elif self._status == STATUS_ACTIVE and self._profile in HOGP_PROFILES:
                 self._conn = "Waiting for connection..."
             return
@@ -1667,6 +1804,9 @@ class EmulatorService:
             KEY_AXES: axes,
             KEY_TRIGGERS: triggers,
             KEY_HAT: hat,
+            KEY_LIGHTBAR: self._lightbar,
+            KEY_TOUCH_CAPABLE: self._touch_capable(),
+            KEY_SPEAKER: self._speaker if self._mode == MODE_BLUETOOTH else "",
         }
 
     def _status_variant_dict(self) -> Dict[str, GLib.Variant]:
@@ -1681,6 +1821,8 @@ class EmulatorService:
                 variants[key] = GLib.Variant("ai", value)
             elif key in (KEY_HAT, KEY_BATTERY):
                 variants[key] = GLib.Variant("y", value)
+            elif key == KEY_LIGHTBAR:
+                variants[key] = GLib.Variant("i", value)
             elif isinstance(value, bool):
                 variants[key] = GLib.Variant("b", value)
             else:

@@ -49,6 +49,12 @@ echo "Removing function links..."
 rm -f configs/c.1/hid.usb0 2>/dev/null || true
 rm -f configs/c.1/hid.usb1 2>/dev/null || true
 rm -f configs/c.1/hid.usb2 2>/dev/null || true
+rm -f configs/c.1/ffs.xbox 2>/dev/null || true
+
+# Xbox profile: FunctionFS must be unmounted before its function is removed
+if mountpoint -q /dev/ffs-xbox 2>/dev/null; then
+    umount /dev/ffs-xbox 2>/dev/null || umount -l /dev/ffs-xbox 2>/dev/null || true
+fi
 
 # Remove configurations
 echo "Removing configurations..."
@@ -60,6 +66,7 @@ echo "Removing functions..."
 rmdir functions/hid.usb0 2>/dev/null || true
 rmdir functions/hid.usb1 2>/dev/null || true
 rmdir functions/hid.usb2 2>/dev/null || true
+rmdir functions/ffs.xbox 2>/dev/null || true
 
 # Remove strings
 echo "Removing strings..."

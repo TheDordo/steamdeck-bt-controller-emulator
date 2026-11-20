@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from hogp.gatt_app import REPORT_MAP
 from hogp.ds4 import DS4_REPORT_DESCRIPTOR
+from hogp.pro_controller import PRO_HID_REPORT_DESCRIPTOR
 
 def get_item_size(byte):
     """Get the size of an HID item from its first byte."""
@@ -150,7 +151,7 @@ def main():
         args = args[2:]
 
     if len(args) != 3:
-        print("Usage: write-hid-descriptors.py [--profile generic|ds4] <gamepad_file> <keyboard_file> <mouse_file>")
+        print("Usage: write-hid-descriptors.py [--profile generic|ds4|pro] <gamepad_file> <keyboard_file> <mouse_file>")
         sys.exit(1)
 
     gamepad_file = args[0]
@@ -159,6 +160,10 @@ def main():
 
     if profile == "ds4":
         gamepad_desc = DS4_REPORT_DESCRIPTOR
+    elif profile == "pro":
+        # Same descriptor as the Bluetooth SDP record (the real Pro uses one
+        # descriptor for both transports; all reports 63 bytes + ID).
+        gamepad_desc = PRO_HID_REPORT_DESCRIPTOR
     else:
         # Extract each descriptor (Report ID 1=gamepad, 2=keyboard, 3=mouse)
         gamepad_desc = extract_descriptor(0x01)

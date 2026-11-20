@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hogp.api import (
     STATUS_STOPPED, STATUS_STARTING, STATUS_STOPPING, STATUS_ACTIVE,
     STATUS_ERROR, STATUS_DEGRADED,
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, PROFILE_DS4,
+    KEY_LIGHTBAR, KEY_TOUCH_CAPABLE, KEY_SPEAKER,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_DEVICE_NAME, KEY_DEVICE_ADDR,
     KEY_READY, KEY_KB_CAPABLE, KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
@@ -180,6 +181,134 @@ class ControllerVisualizer(Gtk.Box):
             8: "Center",
         }
         self._hat_label.set_label(f"D-pad: {hat_names.get(hat, f'0x{hat:02x}')}")
+
+
+DS4_PAD_W, DS4_PAD_H = 1920, 942
+TOUCH_SEND_INTERVAL_S = 0.008
+
+
+class Ds4Panel(Gtk.Box):
+    """DualShock 4 extras on the Controller tab: the light bar color the host
+    set (shown as a swatch) and an on-screen touchpad that drives the DS4
+    touchpad (finger 0) plus a touchpad-click button."""
+
+    def __init__(self, set_touch_cb, set_touch_click_cb):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.set_margin_top(10)
+        self.set_touch_cb = set_touch_cb
+        self.set_touch_click_cb = set_touch_click_cb
+        self._rgb = None
+        self._touch = None            # (x, y) in widget coords while touching
+        self._last_send = 0.0
+        self._origin = (0.0, 0.0)
+
+        # Light bar
+        bar_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar_row.append(Gtk.Label(label="Light bar:"))
+        self.lightbar = Gtk.DrawingArea()
+        self.lightbar.set_size_request(220, 22)
+        self.lightbar.set_hexpand(True)
+        self.lightbar.set_draw_func(self._draw_lightbar, None)
+        bar_row.append(self.lightbar)
+        self.lightbar_label = Gtk.Label(label="—")
+        bar_row.append(self.lightbar_label)
+        self.append(bar_row)
+
+        # Touchpad
+        self.pad_title = Gtk.Label()
+        self.pad_title.set_markup("<b>DS4 touchpad</b> <small>— drag to touch, button to click</small>")
+        self.pad_title.set_halign(Gtk.Align.START)
+        self.append(self.pad_title)
+
+        pad_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.pad = Gtk.DrawingArea()
+        # Keep the real pad's ~2:1 aspect ratio.
+        self.pad.set_size_request(384, 188)
+        self.pad.set_hexpand(True)
+        self.pad.set_draw_func(self._draw_pad, None)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        drag.connect("drag-end", self._on_drag_end)
+        self.pad.add_controller(drag)
+        frame = Gtk.Frame()
+        frame.set_child(self.pad)
+        frame.set_hexpand(True)
+        pad_row.append(frame)
+
+        self.click_button = Gtk.Button(label="Pad\nClick")
+        self.click_button.set_size_request(80, 80)
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *a: self._click(True))
+        click.connect("released", lambda *a: self._click(False))
+        click.connect("cancel", lambda *a: self._click(False))
+        self.click_button.add_controller(click)
+        pad_row.append(self.click_button)
+        self.append(pad_row)
+
+    # -- state from the daemon ------------------------------------------------
+
+    def update(self, lightbar: int, touch_capable: bool) -> None:
+        rgb = None
+        if isinstance(lightbar, int) and lightbar >= 0:
+            rgb = ((lightbar >> 16) & 0xFF, (lightbar >> 8) & 0xFF, lightbar & 0xFF)
+        if rgb != self._rgb:
+            self._rgb = rgb
+            self.lightbar_label.set_label("#%02x%02x%02x" % rgb if rgb else "—")
+            self.lightbar.queue_draw()
+        self.pad.set_sensitive(touch_capable)
+        self.click_button.set_sensitive(touch_capable)
+        self.set_visible(touch_capable or rgb is not None)
+
+    # -- drawing ---------------------------------------------------------------
+
+    def _draw_lightbar(self, area, cr, width, height, _data):
+        r, g, b = self._rgb or (40, 40, 40)
+        cr.set_source_rgb(r / 255.0, g / 255.0, b / 255.0)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+    def _draw_pad(self, area, cr, width, height, _data):
+        cr.set_source_rgb(0.12, 0.12, 0.14)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        if self._touch is not None:
+            x, y = self._touch
+            cr.set_source_rgba(0.3, 0.7, 1.0, 0.85)
+            cr.arc(x, y, 14, 0, 6.2832)
+            cr.fill()
+
+    # -- touch -----------------------------------------------------------------
+
+    def _to_pad(self, x: float, y: float):
+        w = max(1, self.pad.get_width())
+        h = max(1, self.pad.get_height())
+        x = min(max(x, 0.0), w)
+        y = min(max(y, 0.0), h)
+        return int(x / w * (DS4_PAD_W - 1)), int(y / h * (DS4_PAD_H - 1)), x, y
+
+    def _send_touch(self, active: bool, x: float, y: float, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_send < TOUCH_SEND_INTERVAL_S:
+            return
+        self._last_send = now
+        px, py, wx, wy = self._to_pad(x, y)
+        self._touch = (wx, wy) if active else None
+        self.pad.queue_draw()
+        self.set_touch_cb(0, active, px, py)
+
+    def _on_drag_begin(self, gesture, x, y):
+        self._origin = (x, y)
+        self._send_touch(True, x, y, force=True)
+
+    def _on_drag_update(self, gesture, dx, dy):
+        self._send_touch(True, self._origin[0] + dx, self._origin[1] + dy)
+
+    def _on_drag_end(self, gesture, dx, dy):
+        self._send_touch(False, self._origin[0] + dx, self._origin[1] + dy, force=True)
+
+    def _click(self, pressed: bool) -> None:
+        self.set_touch_click_cb(pressed)
 
 
 class VirtualKeyboard(Gtk.Box):
@@ -710,11 +839,15 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         profile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         profile_box.set_halign(Gtk.Align.CENTER)
         profile_box.append(Gtk.Label(label="Profile:"))
-        self.xbox_radio = Gtk.CheckButton(label="Xbox (BT)")
+        self.xbox_radio = Gtk.CheckButton(label="Xbox")
         self.xbox_radio.set_active(True)
         self.xbox_radio.connect("toggled", self._on_xbox_toggled)
         profile_box.append(self.xbox_radio)
-        self.gamepad_radio = Gtk.CheckButton(label="Pro / DS4")
+        self.ds4_radio = Gtk.CheckButton(label="DS4")
+        self.ds4_radio.set_group(self.xbox_radio)
+        self.ds4_radio.connect("toggled", self._on_ds4_toggled)
+        profile_box.append(self.ds4_radio)
+        self.gamepad_radio = Gtk.CheckButton(label="Pro")
         self.gamepad_radio.set_group(self.xbox_radio)
         self.gamepad_radio.connect("toggled", self._on_gamepad_toggled)
         profile_box.append(self.gamepad_radio)
@@ -734,6 +867,11 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         self.connection_label = Gtk.Label(label="Not connected")
         status_box.append(self.connection_label)
 
+        self.speaker_label = Gtk.Label(label="")
+        self.speaker_label.set_wrap(True)
+        self.speaker_label.set_visible(False)
+        status_box.append(self.speaker_label)
+
         self.device_info_label = Gtk.Label(label="")
         self.device_info_label.set_wrap(True)
         status_box.append(self.device_info_label)
@@ -746,7 +884,12 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
         # Controller tab
         self.visualizer = ControllerVisualizer(self._send_key_via_daemon, self._get_cached_status)
-        notebook.append_page(self.visualizer, Gtk.Label(label="Controller"))
+        self.ds4_panel = Ds4Panel(self._set_touch_via_daemon, self._set_touch_click_via_daemon)
+        self.ds4_panel.set_visible(False)
+        self.visualizer.append(self.ds4_panel)
+        controller_scroll = Gtk.ScrolledWindow()
+        controller_scroll.set_child(self.visualizer)
+        notebook.append_page(controller_scroll, Gtk.Label(label="Controller"))
 
         # Keyboard tab
         self.keyboard = VirtualKeyboard(self._send_key_via_daemon, self._get_cached_status)
@@ -788,19 +931,18 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _on_wired_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Mode: Wired USB")
-            if self.xbox_radio.get_active():
-                self.gamepad_radio.set_active(True)  # USB gamepad = DUALSHOCK 4
 
     def _on_gamepad_toggled(self, button):
         if button.get_active() and self._radios_enabled():
-            logger.info("Profile: Gamepad")
+            logger.info("Profile: Pro Controller")
+
+    def _on_ds4_toggled(self, button):
+        if button.get_active() and self._radios_enabled():
+            logger.info("Profile: DS4")
 
     def _on_xbox_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: Xbox")
-            if self.wired_radio.get_active():
-                # Xbox is Bluetooth-only; USB gamepad is the DUALSHOCK 4.
-                self.bluetooth_radio.set_active(True)
 
     def _on_keyboard_toggled(self, button):
         if button.get_active() and self._radios_enabled():
@@ -812,6 +954,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _selected_profile(self) -> str:
         if self.xbox_radio.get_active():
             return PROFILE_XBOX
+        if self.ds4_radio.get_active():
+            return PROFILE_DS4
         return PROFILE_GAMEPAD if self.gamepad_radio.get_active() else PROFILE_KEYBOARD
 
     # ------------------------------------------------------------ callbacks
@@ -824,6 +968,18 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             self.client.send_key(code, modifiers, hold_ms)
         except BtEmuError as e:
             logger.warning("send_key: %s", e)
+
+    def _set_touch_via_daemon(self, finger, active, x, y):
+        try:
+            self.client.set_touch(finger, active, x, y)
+        except BtEmuError as e:
+            logger.warning("set_touch: %s", e)
+
+    def _set_touch_click_via_daemon(self, pressed):
+        try:
+            self.client.set_touch_click(pressed)
+        except BtEmuError as e:
+            logger.warning("set_touch_click: %s", e)
 
     def _send_mouse_via_daemon(self, dx, dy, buttons, wheel):
         try:
@@ -921,13 +1077,33 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                     "Connect, accept the pairing request. Game Controllers and Steam "
                     "will list an Xbox controller; rumble plays on the Deck."
                 )
+            elif mode == MODE_BLUETOOTH and profile == PROFILE_DS4:
+                self.device_info_label.set_label(
+                    "macOS: System Settings → Bluetooth → Wireless Controller → "
+                    "Connect. Game Controllers and Steam list a DUALSHOCK 4; the "
+                    "light bar color and on-screen touchpad are on the Controller "
+                    "tab. To use the Deck as a speaker, pick it under Sound → Output."
+                )
             elif mode == MODE_BLUETOOTH and profile == PROFILE_GAMEPAD:
                 self.device_info_label.set_label(
                     "macOS: System Settings → Bluetooth → Pro Controller → Connect, "
                     "accept the pairing request. Game Controllers will then list a "
                     "Pro Controller."
                 )
+            elif mode == MODE_USB and profile == PROFILE_XBOX:
+                self.device_info_label.set_label(
+                    "USB gamepad presents as a wired Xbox Series X|S controller "
+                    "(045E:0B12, GIP — macOS's built-in Xbox driver). Gamepad only: "
+                    "no keyboard/mouse interfaces in this mode. Rumble plays on the Deck."
+                )
             elif mode == MODE_USB and profile == PROFILE_GAMEPAD:
+                self.device_info_label.set_label(
+                    "USB gamepad presents as a Switch Pro Controller (057E:2009). "
+                    "Steam and Game Controllers run the Pro USB handshake; HD rumble "
+                    "plays on the Deck. HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, "
+                    "/dev/hidg2 mouse."
+                )
+            elif mode == MODE_USB and profile == PROFILE_DS4:
                 self.device_info_label.set_label(
                     "USB gamepad presents as a DUALSHOCK 4 (054C:05C4). On the Mac "
                     "check System Settings → Game Controllers — a Wireless Controller "
@@ -979,13 +1155,21 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             )
         input_label = status.get(KEY_INPUT, "")
         self.visualizer.set_input_source(input_label or "waiting for service…")
+        running_now = st in (STATUS_ACTIVE, STATUS_DEGRADED)
+        speaker = status.get(KEY_SPEAKER, "") if running_now else ""
+        self.speaker_label.set_label(speaker)
+        self.speaker_label.set_visible(bool(speaker))
+        self.ds4_panel.update(
+            status.get(KEY_LIGHTBAR, -1) if running_now else -1,
+            bool(status.get(KEY_TOUCH_CAPABLE, False)) and running_now,
+        )
 
     def _radios_enabled(self) -> bool:
         return self.bluetooth_radio.get_sensitive()
 
     def _set_controls_locked(self, locked: bool) -> None:
         for radio in (self.bluetooth_radio, self.wired_radio,
-                      self.xbox_radio, self.gamepad_radio, self.keyboard_radio):
+                      self.xbox_radio, self.ds4_radio, self.gamepad_radio, self.keyboard_radio):
             radio.set_sensitive(not locked)
 
 

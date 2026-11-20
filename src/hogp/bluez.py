@@ -676,6 +676,7 @@ def adapter_matches(adapter_index: int, want_name: str, want_class: str) -> bool
 
 def ensure_pro_controller_identity(
     adapter_index: int = 0, allow_power_cycle: bool = True,
+    name: str = "Pro Controller",
 ) -> bool:
     """Make the adapter advertise name 'Pro Controller' + class 0x002508.
 
@@ -688,19 +689,19 @@ def ensure_pro_controller_identity(
 
     Returns True when the identity was verified at the end."""
     for attempt in (1, 2, 3):
-        if adapter_matches(adapter_index, "Pro Controller", "0x002508"):
+        if adapter_matches(adapter_index, name, "0x002508"):
             return True
         logger.warning("Adapter identity drifted (attempt %d) — re-applying name/class", attempt)
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "off")
-        btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=8.0)
+        btmgmt_ok(adapter_index, "name", name, timeout=8.0)
         btmgmt_set_class(adapter_index, 0x002508)
         if allow_power_cycle:
             btmgmt_ok(adapter_index, "power", "on")
         time.sleep(0.5)
-    ok = adapter_matches(adapter_index, "Pro Controller", "0x002508")
+    ok = adapter_matches(adapter_index, name, "0x002508")
     if ok:
-        logger.info("Adapter identity verified: Pro Controller / 0x002508")
+        logger.info("Adapter identity verified: %s / 0x002508", name)
     else:
         logger.error("Could not apply the Pro Controller name/class — the Mac may see the Deck as a laptop")
     return ok
@@ -725,7 +726,7 @@ def ensure_pro_controller_posture(adapter_index: int = 0) -> None:
             btmgmt_ok(adapter_index, setting, "on")
 
 
-def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
+def configure_adapter_for_pro_controller(adapter_index: int = 0, name: str = "Pro Controller") -> bool:
     """
     Classic BR/EDR posture for the Pro Controller gamepad mode.
 
@@ -750,13 +751,13 @@ def configure_adapter_for_pro_controller(adapter_index: int = 0) -> bool:
 
     # Identity LAST: every settings toggle can make bluetoothd re-apply its
     # stored name/class, so write ours after everything else has settled.
-    btmgmt_ok(adapter_index, "name", "Pro Controller", timeout=8.0)
+    btmgmt_ok(adapter_index, "name", name, timeout=8.0)
     btmgmt_set_class(adapter_index, 0x002508)
     time.sleep(0.5)
 
     # Verify and, if needed, re-apply (no power-cycle here — the session
     # starts right after and re-applying name/class is safe while powered).
-    return ensure_pro_controller_identity(adapter_index, allow_power_cycle=False)
+    return ensure_pro_controller_identity(adapter_index, allow_power_cycle=False, name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +878,49 @@ def get_connected_devices(bus: Gio.DBusConnection, adapter_path: str) -> List[Di
         logger.error(f"Error getting connected devices: {e}")
 
     return devices
+
+
+AUDIO_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+MEDIA_TRANSPORT_IFACE = "org.bluez.MediaTransport1"
+
+
+def get_speaker_state(bus: Gio.DBusConnection, adapter_path: str) -> Dict[str, Any]:
+    """Deck-as-speaker (A2DP sink) state.
+
+    The sink itself is PipeWire/WirePlumber's: it registers an A2DP sink
+    endpoint with BlueZ, which then lists the AudioSink UUID on the adapter
+    (and sets the Audio/Rendering Class-of-Device bits). When a host streams,
+    BlueZ exposes an org.bluez.MediaTransport1 object for it.
+
+    Returns {"sink": bool, "streams": [{"device", "state"}]}."""
+    state: Dict[str, Any] = {"sink": False, "streams": []}
+    uuids = get_adapter_property(bus, adapter_path, "UUIDs")
+    if uuids is not None:
+        try:
+            state["sink"] = AUDIO_SINK_UUID in [u.lower() for u in uuids.unpack()]
+        except Exception:
+            pass
+    try:
+        result = bus.call_sync(
+            BLUEZ_SERVICE, "/", DBUS_OM_IFACE, "GetManagedObjects", None,
+            GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE, 5000, None,
+        )
+        for path, ifaces in result.unpack()[0].items():
+            if not path.startswith(adapter_path):
+                continue
+            transport = ifaces.get(MEDIA_TRANSPORT_IFACE)
+            if transport is None:
+                continue
+            # Only the sink direction: the host sends, the Deck renders.
+            if str(transport.get("UUID", "")).lower() != AUDIO_SINK_UUID:
+                continue
+            state["streams"].append({
+                "device": str(transport.get("Device", "")),
+                "state": str(transport.get("State", "")),
+            })
+    except GLib.Error as e:
+        logger.debug("speaker state: %s", e)
+    return state
 
 
 def get_device_property(bus: Gio.DBusConnection, device_path: str, prop_name: str) -> Any:
