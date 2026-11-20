@@ -42,7 +42,10 @@ OCF_LE_CONN_UPDATE = 0x0013
 OPCODE_LE_CONN_UPDATE = (OGF_LE << 10) | OCF_LE_CONN_UPDATE
 HCIGETCONNLIST = 0x800448D4  # _IOR('H', 212, int)
 LE_LINK = 0x80
+BT_CONNECTED = 1   # include/net/bluetooth/bluetooth.h
 MAX_CONNS = 10
+
+DEBUGFS_ROOT = "/sys/kernel/debug"
 
 # Requested parameters. Units: interval 1.25 ms, timeout 10 ms.
 # 11.25-15 ms is the fastest range Apple's accessory guidelines allow for
@@ -56,9 +59,22 @@ FALLBACK_MIN_INTERVAL = 12  # 15 ms
 FALLBACK_MAX_INTERVAL = 24  # 30 ms
 
 
+def _step(name: str, fn, *args):
+    """Run one HCI step, tagging OSErrors with the step that failed."""
+    try:
+        return fn(*args)
+    except OSError as e:
+        raise OSError(e.errno, f"{name}: {e.strerror}") from e
+
+
 def _hci_socket(dev_id: int) -> socket.socket:
-    sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-    sock.bind((dev_id,))
+    sock = _step("open raw HCI socket", socket.socket,
+                 socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+    try:
+        _step(f"bind hci{dev_id}", sock.bind, (dev_id,))
+    except OSError:
+        sock.close()
+        raise
     return sock
 
 
@@ -70,14 +86,15 @@ def list_le_connections(dev_id: int = 0) -> List[Dict]:
         #   struct hci_conn_info { u16 handle; bdaddr_t bdaddr; u8 type;
         #   u8 out; u16 state; u32 link_mode; } conn_info[]; }  (16 bytes each)
         buf = bytearray(struct.pack("<HH", dev_id, MAX_CONNS) + bytes(16 * MAX_CONNS))
-        fcntl.ioctl(sock.fileno(), HCIGETCONNLIST, buf, True)
+        _step("HCIGETCONNLIST ioctl", fcntl.ioctl, sock.fileno(), HCIGETCONNLIST, buf, True)
         _dev, num = struct.unpack_from("<HH", buf, 0)
         conns = []
         for i in range(num):
             handle, bdaddr, link_type, _out, _state, _mode = struct.unpack_from(
                 "<H6sBBHI", buf, 4 + 16 * i,
             )
-            if link_type == LE_LINK:
+            # The list includes links still being set up — only tune live ones.
+            if link_type == LE_LINK and _state == BT_CONNECTED:
                 conns.append({
                     "handle": handle,
                     "address": ":".join(f"{b:02X}" for b in reversed(bdaddr)),
@@ -88,11 +105,13 @@ def list_le_connections(dev_id: int = 0) -> List[Dict]:
 
 
 def _set_event_filter(sock: socket.socket) -> None:
-    # struct hci_filter { u32 type_mask; u32 event_mask[2]; u16 opcode; }
+    # struct hci_ufilter { u32 type_mask; u32 event_mask[2]; u16 opcode; }
+    # is 16 bytes with tail padding. Newer kernels (copy_safe_from_sockptr)
+    # reject a shorter optlen with EINVAL, so pad explicitly.
     type_mask = 1 << HCI_EVENT_PKT
     events = (1 << EVT_CMD_STATUS) | (1 << (EVT_LE_META - 32) << 32)
     sock.setsockopt(SOL_HCI, HCI_FILTER, struct.pack(
-        "<IIIH", type_mask, events & 0xFFFFFFFF, events >> 32, 0,
+        "<IIIH2x", type_mask, events & 0xFFFFFFFF, events >> 32, 0,
     ))
 
 
@@ -108,11 +127,12 @@ def request_connection_update(
     or None when the command/procedure failed or nothing came back in time."""
     sock = _hci_socket(dev_id)
     try:
-        _set_event_filter(sock)
+        _step("set HCI event filter", _set_event_filter, sock)
         params = struct.pack(
             "<HHHHHHH", handle, min_interval, max_interval, latency, timeout, 0, 0,
         )
-        sock.send(struct.pack("<BHB", HCI_COMMAND_PKT, OPCODE_LE_CONN_UPDATE, len(params)) + params)
+        _step("send LE Connection Update", sock.send,
+              struct.pack("<BHB", HCI_COMMAND_PKT, OPCODE_LE_CONN_UPDATE, len(params)) + params)
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
             ready, _, _ = select.select([sock], [], [], max(0.0, deadline - time.monotonic()))
@@ -153,6 +173,76 @@ def request_connection_update(
         return None
     finally:
         sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Kernel default range for PERIPHERAL connections
+# ---------------------------------------------------------------------------
+#
+# net/bluetooth: for an incoming LE connection (we are the peripheral),
+# hci_event.c copies hdev->le_conn_{min,max}_interval into the connection,
+# and l2cap_le_conn_ready() sends an L2CAP Connection Parameter Update
+# Request whenever the central's interval is OUTSIDE that range. The
+# defaults (hci_core.c) are 0x0018-0x0028 = 30-50 ms: left alone, the kernel
+# itself asks the Mac to slow a fast link down to 30-50 ms. The range is
+# writable in debugfs (hci_debugfs.c), takes effect for new connections,
+# and needs no bluetoothd restart.
+
+def _debugfs_dir(dev_id: int) -> Optional[str]:
+    import os
+    import subprocess
+    path = f"{DEBUGFS_ROOT}/bluetooth/hci{dev_id}"
+    if not os.path.isdir(path):
+        subprocess.run(["mount", "-t", "debugfs", "debugfs", DEBUGFS_ROOT],
+                       capture_output=True, timeout=10)
+    return path if os.path.isdir(path) else None
+
+
+def _read_u(path: str) -> int:
+    with open(path) as f:
+        return int(f.read().strip())
+
+
+def _write_u(path: str, value: int) -> None:
+    with open(path, "w") as f:
+        f.write(f"{value}\n")
+
+
+def get_default_interval_range(dev_id: int = 0) -> Optional[tuple]:
+    d = _debugfs_dir(dev_id)
+    if d is None:
+        return None
+    try:
+        return _read_u(f"{d}/conn_min_interval"), _read_u(f"{d}/conn_max_interval")
+    except OSError:
+        return None
+
+
+def set_default_interval_range(min_interval: int, max_interval: int,
+                               dev_id: int = 0) -> bool:
+    """Set the kernel's peripheral interval range (units of 1.25 ms).
+    The kernel enforces min <= max on every single write, so order the two
+    writes so the intermediate state is always valid."""
+    d = _debugfs_dir(dev_id)
+    if d is None:
+        logger.warning("debugfs unavailable — cannot change the kernel's LE "
+                       "interval range (the kernel will request 30-50 ms)")
+        return False
+    lo, hi = f"{d}/conn_min_interval", f"{d}/conn_max_interval"
+    try:
+        current_max = _read_u(hi)
+        if min_interval <= current_max:
+            _write_u(lo, min_interval)
+            _write_u(hi, max_interval)
+        else:
+            _write_u(hi, max_interval)
+            _write_u(lo, min_interval)
+        logger.info("Kernel LE peripheral interval range set to %.2f-%.2f ms",
+                    min_interval * 1.25, max_interval * 1.25)
+        return True
+    except OSError as e:
+        logger.warning("Could not set kernel LE interval range: %s", e)
+        return False
 
 
 def tune_connection(handle: int, dev_id: int = 0) -> Optional[float]:

@@ -624,10 +624,12 @@ class EmulatorService:
                 # BR/EDR discoverable so hosts can find "Pro Controller".
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
-                if session.get("profile") == PROFILE_XBOX and not self._apply_device_id_worker(
-                    gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
-                ):
-                    return
+                if session.get("profile") == PROFILE_XBOX:
+                    if not self._apply_device_id_worker(
+                        gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
+                    ):
+                        return
+                    self._apply_fast_le_range(session)
                 bluez.set_static_ble_address(idx, STATIC_BLE_ADDRESS)
                 bluez.configure_adapter_for_hog_peripheral(idx)
                 bluez.set_adapter_alias(bus, adapter_path, self._hogp_name(session))
@@ -652,10 +654,12 @@ class EmulatorService:
                 bluez.set_adapter_alias(bus, adapter_path, PRO_NAME)
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
-                if session.get("profile") == PROFILE_XBOX and not self._apply_device_id_worker(
-                    gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
-                ):
-                    return
+                if session.get("profile") == PROFILE_XBOX:
+                    if not self._apply_device_id_worker(
+                        gen, XBOX_DEVICE_ID, "Xbox Wireless Controller",
+                    ):
+                        return
+                    self._apply_fast_le_range(session)
                 bluez.configure_adapter_for_hog_peripheral(idx)
                 bluez.set_adapter_alias(bus, session["adapter_path"], self._hogp_name(session))
                 bluez.set_adapter_discoverable(bus, session["adapter_path"], False)
@@ -674,6 +678,17 @@ class EmulatorService:
                     return path
             time.sleep(0.5)
         return None
+
+    def _apply_fast_le_range(self, session: Dict[str, Any]) -> None:
+        """Worker: make the KERNEL ask for a fast interval on every new
+        connection (see connparams: its 30-50 ms default otherwise drags a
+        fast link back down). The original range is restored on stop."""
+        dev_id = bluez.get_adapter_index(ADAPTER_NAME)
+        if session.get("kernel_le_range") is None:
+            session["kernel_le_range"] = connparams.get_default_interval_range(dev_id)
+        connparams.set_default_interval_range(
+            connparams.FAST_MIN_INTERVAL, connparams.FAST_MAX_INTERVAL, dev_id,
+        )
 
     def _apply_device_id_worker(self, gen: int, did: str, label: str) -> bool:
         """Worker (under _adapter_lock): make bluetoothd publish `did`.
@@ -1284,6 +1299,12 @@ class EmulatorService:
         # any in-flight posture worker; its own cancelled/gen re-check under
         # the same lock guarantees nothing re-applies the emulator posture
         # afterwards.
+        original_range = session.get("kernel_le_range")
+        if original_range is not None:
+            connparams.set_default_interval_range(
+                original_range[0], original_range[1], bluez.get_adapter_index(ADAPTER_NAME),
+            )
+
         snapshot = session.get("adapter_snapshot")
         adapter_path = session.get("adapter_path")
         if session.get("mode") == MODE_BLUETOOTH and adapter_path:
