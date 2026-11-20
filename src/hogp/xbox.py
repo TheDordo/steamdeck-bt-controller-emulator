@@ -65,9 +65,11 @@ RUMBLE_REPORT_ID = 0x03
 INPUT_REPORT_LEN = 16      # GATT value length (without the report ID)
 RUMBLE_REPORT_LEN = 8
 
-# ATT notifications: event-driven with a small floor + a keep-alive so the
-# host sees a steady stream while sticks are held still.
-NOTIFY_MIN_INTERVAL_MS = 8
+# ATT notifications: event-driven, latest-state-wins, with a floor matched
+# to the requested LE connection interval (11.25-15 ms, see connparams.py).
+# Sending faster than the link drains only queues STALE reports in the
+# kernel/controller buffers, and every new input then waits behind them.
+NOTIFY_MIN_INTERVAL_MS = 11
 KEEPALIVE_INTERVAL_MS = 100
 
 # fmt: off
@@ -343,6 +345,7 @@ class XboxGattApplication:
         self._last_report: bytes = build_input_report(0, self._axes, self._triggers, 8)
         self._last_sent_ms = 0
         self._flush_source: Optional[int] = None
+        self._batch_source: Optional[int] = None
         self._keepalive_source: Optional[int] = None
 
         self._on_notify_start: Optional[Callable[[], None]] = None
@@ -637,7 +640,7 @@ class XboxGattApplication:
         self._notifying = False
         self._streaming = False
         self._battery_notifying = False
-        for attr in ("_keepalive_source", "_flush_source"):
+        for attr in ("_keepalive_source", "_flush_source", "_batch_source"):
             src = getattr(self, attr)
             if src is not None:
                 GLib.source_remove(src)
@@ -652,11 +655,20 @@ class XboxGattApplication:
         return True
 
     def _state_changed(self) -> None:
+        # Batch: several setters run back-to-back for one controller update
+        # (4 axes + 2 triggers); build + send ONCE after they all landed, at
+        # high priority so it beats the rest of the main loop's work.
+        if self._batch_source is None:
+            self._batch_source = GLib.idle_add(self._apply_batch, priority=GLib.PRIORITY_HIGH)
+
+    def _apply_batch(self) -> bool:
+        self._batch_source = None
         self._last_report = build_input_report(
             self._buttons, self._axes, self._triggers, self._hat,
         )
         if self._streaming:
             self._send_report()
+        return False
 
     def _send_report(self, force: bool = False) -> None:
         """Rate-limited notify; a deferred flush makes sure the latest state

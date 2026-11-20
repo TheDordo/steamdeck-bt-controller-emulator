@@ -38,7 +38,7 @@ from .api import (
     KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
     KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
 )
-from . import bluez
+from . import bluez, connparams
 from .adv import Advertisement
 from .battery import read_battery_percent
 from .gatt_app import GattApplication
@@ -150,6 +150,12 @@ class EmulatorService:
         # the main thread drains them (dicts must never be iterated during a
         # concurrent write — the drain swaps them out under this lock).
         self._input_lock = threading.Lock()
+        self._axis_flush_queued = False
+
+        # LE connection-interval tuning (Xbox profile): handles already
+        # requested, and whether a tuning worker is in flight.
+        self._tuned_le_handles: set = set()
+        self._conn_tune_busy = False
 
         # Bonding throttle
         self._bond_in_progress = False
@@ -900,11 +906,50 @@ class EmulatorService:
         if ih is not None:
             ih.rumble(strong, weak, duration_ms)
 
+    def _maybe_tune_connection(self, gen: int) -> None:
+        """Xbox profile: ask the Mac for a fast LE connection interval on
+        every new connection (worker thread — the HCI round trip can take a
+        few connection events). Each connection handle is tuned once."""
+        session = self._session
+        if (
+            session is None or session.get("generation") != gen
+            or session.get("profile") != PROFILE_XBOX or self._conn_tune_busy
+        ):
+            return
+        self._conn_tune_busy = True
+
+        def run():
+            try:
+                dev_id = bluez.get_adapter_index(ADAPTER_NAME)
+                conns = connparams.list_le_connections(dev_id)
+                live = {c["handle"] for c in conns}
+                self._tuned_le_handles &= live  # forget closed connections
+                for conn in conns:
+                    if conn["handle"] in self._tuned_le_handles:
+                        continue
+                    self._tuned_le_handles.add(conn["handle"])
+                    logger.info(
+                        "Requesting fast LE connection interval from %s (handle 0x%04x)",
+                        conn["address"], conn["handle"],
+                    )
+                    connparams.tune_connection(conn["handle"], dev_id)
+            except Exception as e:
+                logger.warning("LE connection tuning failed: %s", e)
+            finally:
+                def done():
+                    self._conn_tune_busy = False
+                    return False
+                GLib.idle_add(done)
+
+        self._spawn_worker(run)
+
     def _on_hogp_notify_start(self, gen: int) -> None:
         """macOS subscribed to HID notifications — complete the bond."""
         if self._session is None or self._session.get("generation") != gen:
             return
         self._maybe_complete_bond(gen)
+        # Give pairing/encryption a moment to settle before renegotiating.
+        GLib.timeout_add(2000, lambda: (self._maybe_tune_connection(gen), False)[1])
 
     # ------------------------------------------------- Pro Controller start
 
@@ -1085,7 +1130,7 @@ class EmulatorService:
 
     def _on_button_cb(self, index: int, pressed: bool) -> None:
         self._pending_buttons[index] = pressed
-        GLib.idle_add(self._apply_pending_button, index)
+        GLib.idle_add(self._apply_pending_button, index, priority=GLib.PRIORITY_HIGH)
 
     def _apply_pending_button(self, index: int) -> bool:
         if self._session is None:
@@ -1098,17 +1143,25 @@ class EmulatorService:
     def _on_axis_cb(self, index: int, value: int) -> None:
         with self._input_lock:
             self._pending_axes[index] = value
-        # GLib.timeout_add is only safe on the main thread — marshal there.
-        GLib.idle_add(self._schedule_coalesce)
+            queue = not self._axis_flush_queued
+            self._axis_flush_queued = True
+        # One queued flush per batch (the evdev thread produces hundreds of
+        # axis events per second — one main-loop callback each starved the
+        # loop). High priority so input beats status/D-Bus housekeeping.
+        if queue:
+            GLib.idle_add(self._flush_coalesced_input, priority=GLib.PRIORITY_HIGH)
 
     def _on_trigger_cb(self, index: int, value: int) -> None:
         with self._input_lock:
             self._pending_triggers[index] = value
-        GLib.idle_add(self._schedule_coalesce)
+            queue = not self._axis_flush_queued
+            self._axis_flush_queued = True
+        if queue:
+            GLib.idle_add(self._flush_coalesced_input, priority=GLib.PRIORITY_HIGH)
 
     def _on_hat_cb(self, direction: int) -> None:
         self._pending_hat = direction
-        GLib.idle_add(self._apply_pending_hat)
+        GLib.idle_add(self._apply_pending_hat, priority=GLib.PRIORITY_HIGH)
 
     def _apply_pending_hat(self) -> bool:
         if self._session is None:
@@ -1136,6 +1189,7 @@ class EmulatorService:
             self._pending_axes = {}
             triggers = self._pending_triggers
             self._pending_triggers = {}
+            self._axis_flush_queued = False
         if self._session is not None:
             for index, value in axes.items():
                 self._set_axis(index, value)
@@ -1396,6 +1450,8 @@ class EmulatorService:
         if adapter_path:
             device = bluez.get_primary_connected_device(self.bus, adapter_path)
             self._update_device_status(device)
+            if device is not None:
+                self._maybe_tune_connection(gen)
             if device and not (device.get("paired") or device.get("bonded")):
                 self._maybe_complete_bond(gen)
 
