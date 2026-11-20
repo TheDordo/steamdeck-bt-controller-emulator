@@ -173,6 +173,7 @@ _CHAR_XML = f"""
     <property name="Service" type="o" access="read"/>
     <property name="Flags" type="as" access="read"/>
     <property name="Descriptors" type="ao" access="read"/>
+    <property name="Handle" type="q" access="readwrite"/>
   </interface>
 </node>"""
 
@@ -183,6 +184,7 @@ _DESC_XML = f"""
     <property name="UUID" type="s" access="read"/>
     <property name="Characteristic" type="o" access="read"/>
     <property name="Flags" type="as" access="read"/>
+    <property name="Handle" type="q" access="readwrite"/>
   </interface>
 </node>"""
 
@@ -415,6 +417,10 @@ class XboxGattApplication:
                 "Service": GLib.Variant("o", service),
                 "Flags": GLib.Variant("as", flags),
                 "Descriptors": GLib.Variant("ao", list(descs)),
+                # 0 = let BlueZ allocate (sequentially inside the pinned
+                # service) and write the result back via Properties.Set,
+                # which we log so the real attribute table is visible.
+                "Handle": GLib.Variant("q", 0),
             }, **handlers))
 
         def desc(path, char_path, uuid, value):
@@ -422,6 +428,7 @@ class XboxGattApplication:
                 "UUID": GLib.Variant("s", uuid),
                 "Characteristic": GLib.Variant("o", char_path),
                 "Flags": GLib.Variant("as", ENC_READ),
+                "Handle": GLib.Variant("q", 0),
             }, read=lambda: value))
 
         # HID service
@@ -488,7 +495,12 @@ class XboxGattApplication:
                     self._handle_get_property, None))
                 self._registrations.append(self.bus.register_object(
                     attr.path, props_iface, self._handle_call, None, None))
-            logger.info("Xbox GATT objects registered under %s", self.APP_PATH)
+            logger.info(
+                "Xbox GATT objects registered under %s (pinned service handles "
+                "HID 0x%04x, DIS 0x%04x, Battery 0x%04x — the per-attribute "
+                "handle lines that follow come from BlueZ)",
+                self.APP_PATH, HID_SERVICE_HANDLE, DIS_SERVICE_HANDLE, BATTERY_SERVICE_HANDLE,
+            )
             # Stream from the start instead of waiting for StartNotify: a
             # bonded host does NOT re-write the CCC on reconnect (the spec
             # says the server persists it), and BlueZ keeps that CCC state
@@ -541,7 +553,13 @@ class XboxGattApplication:
                 elif method == "GetAll":
                     invoc.return_value(GLib.Variant("(a{sv})", (attr.props,)))
                 elif method == "Set":
-                    # BlueZ writes back allocated handles; ours are fixed.
+                    _iface_name, prop, value = params.unpack()
+                    if prop == "Handle":
+                        handle = int(value)
+                        attr.props["Handle"] = GLib.Variant("q", handle)
+                        uuid = attr.props["UUID"].unpack()
+                        logger.info("Xbox GATT: %s %s at handle 0x%04x",
+                                    path.rsplit("/", 2)[-2:], uuid[4:8], handle)
                     invoc.return_value(None)
                 else:
                     invoc.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
