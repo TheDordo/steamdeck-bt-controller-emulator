@@ -32,7 +32,7 @@ from .api import (
     BUS_NAME, OBJECT_PATH, MANAGER_IFACE, MANAGER_XML, ERROR_FAILED,
     STATUS_STOPPED, STATUS_STARTING, STATUS_STOPPING, STATUS_ACTIVE,
     STATUS_ERROR, STATUS_DEGRADED,
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX, HOGP_PROFILES,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_CONNECTED, KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_BATTERY,
     KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
@@ -54,12 +54,16 @@ from .pro_controller import (
     ProControllerEmulator,
 )
 from .usb_gadget import USBGadgetHID
+from .xbox import XBOX_NAME, XboxGattApplication
 
 logger = logging.getLogger(__name__)
 
 ADAPTER_NAME = "hci0"
 HOGP_DEVICE_NAME = "SteamDeckPad"
 STATIC_BLE_ADDRESS = "C2:12:34:56:78:9A"
+# Separate LE identity for the Xbox profile: macOS caches the GATT database
+# per address, so sharing SteamDeckPad's address would serve a stale map.
+XBOX_STATIC_BLE_ADDRESS = "C2:12:34:56:78:9B"
 REPORT_RATE_HZ = 25
 
 # Recovery bounds for the self-healing watchdog
@@ -483,8 +487,10 @@ class EmulatorService:
     def _handle_start(self, mode: str, profile: str) -> None:
         if mode not in (MODE_BLUETOOTH, MODE_USB):
             raise RuntimeError(f"invalid mode {mode!r} (use 'bluetooth' or 'usb')")
-        if profile not in (PROFILE_GAMEPAD, PROFILE_KEYBOARD):
-            raise RuntimeError(f"invalid profile {profile!r} (use 'gamepad' or 'keyboard')")
+        if profile not in (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX):
+            raise RuntimeError(f"invalid profile {profile!r} (use 'gamepad', 'xbox' or 'keyboard')")
+        if profile == PROFILE_XBOX and mode != MODE_BLUETOOTH:
+            raise RuntimeError("the Xbox profile is Bluetooth-only — use 'gamepad' (DUALSHOCK 4) for USB")
         if self._session is not None:
             if self._status == STATUS_ERROR:
                 raise RuntimeError("previous session is still shutting down — try again in a moment")
@@ -605,9 +611,13 @@ class EmulatorService:
                 # BR/EDR discoverable so hosts can find "Pro Controller".
                 bluez.set_adapter_discoverable(bus, adapter_path, True)
             else:
-                bluez.set_static_ble_address(idx, STATIC_BLE_ADDRESS)
+                bluez.set_static_ble_address(
+                    idx,
+                    XBOX_STATIC_BLE_ADDRESS
+                    if session.get("profile") == PROFILE_XBOX else STATIC_BLE_ADDRESS,
+                )
                 bluez.configure_adapter_for_hog_peripheral(idx)
-                bluez.set_adapter_alias(bus, adapter_path, HOGP_DEVICE_NAME)
+                bluez.set_adapter_alias(bus, adapter_path, self._hogp_name(session))
                 # LE mode: the advertisement handles visibility.
                 bluez.set_adapter_discoverable(bus, adapter_path, False)
             bluez.ensure_adapter_powered(bus, adapter_path)
@@ -739,7 +749,11 @@ class EmulatorService:
             return
         session["agent"] = agent
 
-        gatt = GattApplication(self.bus, device_name=HOGP_DEVICE_NAME)
+        if session.get("profile") == PROFILE_XBOX:
+            gatt = XboxGattApplication(self.bus)
+            gatt.on_rumble = self._on_host_rumble
+        else:
+            gatt = GattApplication(self.bus, device_name=HOGP_DEVICE_NAME)
         gatt.set_report_rate(REPORT_RATE_HZ)
         if not gatt.register():
             self._fail_session(gen, "Failed to register GATT service")
@@ -747,7 +761,7 @@ class EmulatorService:
         gatt._on_notify_start = lambda: self._on_hogp_notify_start(gen)
         session["gatt"] = gatt
 
-        adv = Advertisement(self.bus, HOGP_DEVICE_NAME)
+        adv = Advertisement(self.bus, self._hogp_name(session))
         if not adv.register():
             self._fail_session(gen, "Failed to register advertisement")
             return
@@ -845,6 +859,18 @@ class EmulatorService:
         self._set_status(STATUS_ACTIVE, "Active - Discoverable")
         self._conn = "Waiting for connection..."
         self._emit_status()
+
+    @staticmethod
+    def _hogp_name(session: Dict[str, Any]) -> str:
+        return XBOX_NAME if session.get("profile") == PROFILE_XBOX else HOGP_DEVICE_NAME
+
+    def _on_host_rumble(self, strong: float, weak: float, duration_ms: int) -> None:
+        """Host rumble (Xbox output report) -> Deck haptics via evdev FF.
+        Called on the main loop (GATT WriteValue); the FF ioctl is quick."""
+        session = self._session
+        ih = session.get("input") if session else None
+        if ih is not None:
+            ih.rumble(strong, weak, duration_ms)
 
     def _on_hogp_notify_start(self, gen: int) -> None:
         """macOS subscribed to HID notifications — complete the bond."""
@@ -1348,7 +1374,7 @@ class EmulatorService:
         if not bluez.bluez_has_owner(self.bus):
             return True  # degraded already handled by the owner watch
 
-        if session.get("registered") and session.get("profile") == PROFILE_KEYBOARD:
+        if session.get("registered") and session.get("profile") in HOGP_PROFILES:
             active = bluez.get_le_advertising_active_instances(self.bus, adapter_path)
             if active == 0:
                 logger.warning("Advertisement lost (ActiveInstances=0) — re-registering")
@@ -1409,7 +1435,7 @@ class EmulatorService:
             self._device_addr = ""
             if self._status == STATUS_ACTIVE and self._profile == PROFILE_GAMEPAD:
                 pass  # pro mode conn line is managed by on_state_change
-            elif self._status == STATUS_ACTIVE and self._profile == PROFILE_KEYBOARD:
+            elif self._status == STATUS_ACTIVE and self._profile in HOGP_PROFILES:
                 self._conn = "Waiting for connection..."
             return
         self._connected = True
@@ -1417,7 +1443,7 @@ class EmulatorService:
         self._device_addr = device.get("address", "")
         self._paired = bool(device.get("paired") or device.get("bonded"))
         self._trusted = bool(device.get("trusted"))
-        if self._profile == PROFILE_KEYBOARD:
+        if self._profile in HOGP_PROFILES:
             notifying = False
             gatt = self._session.get("gatt") if self._session else None
             if gatt is not None:
@@ -1478,6 +1504,9 @@ class EmulatorService:
 
     def _battery_tick(self) -> bool:
         self._battery = read_battery_percent()
+        gatt = self._session.get("gatt") if self._session else None
+        if gatt is not None and hasattr(gatt, "set_battery_level"):
+            gatt.set_battery_level(self._battery)
         if self._session is not None:
             self._emit_status()
         return True

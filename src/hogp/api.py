@@ -34,9 +34,11 @@ MODE_BLUETOOTH = "bluetooth"
 MODE_USB = "usb"
 PROFILE_GAMEPAD = "gamepad"    # BT: Pro Controller (BR/EDR) | USB: DUALSHOCK 4
 PROFILE_KEYBOARD = "keyboard"  # BT: BLE HOGP gamepad/keyboard/mouse | USB: generic HID
+PROFILE_XBOX = "xbox"          # BT only: Xbox Wireless Controller (BLE HOGP, rumble)
 
 VALID_MODES = (MODE_BLUETOOTH, MODE_USB)
-VALID_PROFILES = (PROFILE_GAMEPAD, PROFILE_KEYBOARD)
+VALID_PROFILES = (PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX)
+HOGP_PROFILES = (PROFILE_KEYBOARD, PROFILE_XBOX)  # BT LE HID-over-GATT profiles
 
 # Status dict keys returned by GetStatus()
 KEY_STATUS = "status"

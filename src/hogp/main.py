@@ -3,6 +3,7 @@ Command-line client for the emulator daemon.
 
     python3 -m src.hogp status
     python3 -m src.hogp start --mode bluetooth --profile gamepad
+    python3 -m src.hogp start --mode bluetooth --profile xbox
     python3 -m src.hogp start --mode usb --profile keyboard
     python3 -m src.hogp stop
     python3 -m src.hogp watch
@@ -18,7 +19,7 @@ import argparse
 import sys
 
 from .api import (
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_CONNECTED, KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_BATTERY,
     KEY_DEVICE_NAME, KEY_DEVICE_ADDR, KEY_READY, KEY_KB_CAPABLE,
@@ -65,10 +66,11 @@ def main(argv=None) -> int:
     sub.add_parser("stop", help="stop the active session")
 
     start = sub.add_parser("start", help="start a session")
-    start.add_argument("--mode", choices=("bluetooth", "usb", "pro", "hogp"),
+    start.add_argument("--mode", choices=("bluetooth", "usb", "pro", "hogp", "xbox"),
                        default="bluetooth",
-                       help="transport (pro = bluetooth gamepad, hogp = bluetooth keyboard)")
-    start.add_argument("--profile", choices=("gamepad", "keyboard"),
+                       help="transport (pro = bluetooth gamepad, hogp = bluetooth keyboard, "
+                            "xbox = bluetooth Xbox controller)")
+    start.add_argument("--profile", choices=("gamepad", "xbox", "keyboard"),
                        help="HID identity (default: gamepad for pro, keyboard otherwise)")
 
     sub.add_parser("watch", help="follow status changes (Ctrl+C to exit)")
@@ -99,9 +101,11 @@ def main(argv=None) -> int:
             return 0
 
         if command == "start":
-            if args.mode in ("pro", "hogp"):
+            if args.mode in ("pro", "hogp", "xbox"):
                 mode = MODE_BLUETOOTH
-                profile = PROFILE_GAMEPAD if args.mode == "pro" else PROFILE_KEYBOARD
+                profile = {
+                    "pro": PROFILE_GAMEPAD, "hogp": PROFILE_KEYBOARD, "xbox": PROFILE_XBOX,
+                }[args.mode]
                 if args.profile:
                     profile = args.profile
             else:

@@ -6,6 +6,7 @@ Emulates a Bluetooth or **wired USB** gamepad / keyboard / trackpad peripheral t
 
 | Transport | Gamepad identity on the Mac | Keyboard/mouse |
 |-----------|-----------------------------|----------------|
+| Bluetooth (LE) — **recommended** | **Xbox Wireless Controller** (Series X\|S, 045E:0B13) with rumble on the Deck | not in this mode |
 | Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") | not in this mode |
 | Bluetooth (LE) | — | HID-over-GATT gamepad/keyboard/mouse ("SteamDeckPad") |
 | Wired USB | **DUALSHOCK 4** (VID 0x054C / PID 0x05C4) | separate HID interfaces, always present |
@@ -95,7 +96,8 @@ cd ~/steamdeck-bt-controller-emulator
 
 Pick **Bluetooth** or **Wired USB**, then pick a **Profile**:
 
-- **Gamepad (macOS)** — the Deck appears to the host as a natively supported game controller (Pro Controller over Bluetooth, DUALSHOCK 4 over USB).
+- **Xbox (BT)** — Bluetooth LE Xbox Wireless Controller. Works with macOS Game Controllers and Steam on the Mac; host rumble plays on the Deck's haptics. Bluetooth only.
+- **Pro / DS4** — Pro Controller over Bluetooth, DUALSHOCK 4 over USB.
 - **Keyboard** — BLE HOGP gamepad/keyboard/mouse (Bluetooth) or generic HID gamepad + keyboard + mouse (USB).
 
 Switching profiles requires **Stop Service → switch → Start** (and re-pair/re-plug on the host) — the identity changes at connect time.
@@ -103,6 +105,7 @@ Switching profiles requires **Stop Service → switch → Start** (and re-pair/r
 CLI (no GUI):
 
 ```bash
+python3 -m src.hogp start --mode bluetooth --profile xbox      # Xbox Wireless Controller (BLE)
 python3 -m src.hogp start --mode bluetooth --profile gamepad   # Pro Controller
 python3 -m src.hogp start --mode bluetooth --profile keyboard  # SteamDeckPad (HOGP)
 python3 -m src.hogp start --mode usb --profile gamepad         # DUALSHOCK 4
@@ -110,7 +113,16 @@ python3 -m src.hogp status
 python3 -m src.hogp stop
 ```
 
-### Gamepad over Bluetooth (macOS / Android / Linux)
+### Xbox controller over Bluetooth (recommended for macOS + Steam)
+
+1. Select **Bluetooth** + **Xbox (BT)** → **Start Service** — wait for **Active - Discoverable**
+2. On the Mac: **System Settings → Bluetooth** → **Xbox Wireless Controller** → **Connect**, accept the pairing request
+3. **System Settings → Game Controllers** lists an Xbox controller; Steam on the Mac sees it as an Xbox Series controller
+4. Rumble from games is played on the Deck's haptics (evdev force feedback — needs the Deck's built-in controller as the input device; check `journalctl -u bt-controller-emulator` for "no FF_RUMBLE support")
+
+The Xbox profile uses its own Bluetooth LE address (`C2:12:34:56:78:9B`), so it pairs as a separate device from SteamDeckPad. If you change the Xbox profile's GATT layout later, forget the device on the Mac and pair again (macOS caches GATT).
+
+### Pro Controller over Bluetooth (macOS / Android / Linux)
 
 1. Select **Bluetooth** + **Gamepad (macOS)** → **Start Service** — wait for **Active - Pro Controller**
 2. On the Mac: **System Settings → Bluetooth** → find **Pro Controller** → **Connect**
@@ -285,6 +297,7 @@ Key modules:
 | [`src/hogp/api.py`](src/hogp/api.py) | D-Bus contract (name, path, interface, status keys) |
 | [`src/hogp/bluez.py`](src/hogp/bluez.py) | BlueZ helpers: async registration, adapter snapshot/restore, btmgmt (no sudo) |
 | [`src/hogp/gatt_app.py`](src/hogp/gatt_app.py) | HID-over-GATT service (report maps, ATT notify throttle) |
+| [`src/hogp/xbox.py`](src/hogp/xbox.py) | Xbox Wireless Controller (BLE HoG, rumble → Deck haptics) |
 | [`src/hogp/pro_controller.py`](src/hogp/pro_controller.py) | Pro Controller emulator (L2CAP HIDP + subcommand engine, direct PSM bind) |
 | [`src/hogp/input_handler.py`](src/hogp/input_handler.py) | evdev gamepad detection + forwarding |
 | [`src/hogp/usb_gadget.py`](src/hogp/usb_gadget.py) / [`ds4.py`](src/hogp/ds4.py) | USB gadget HID + DualShock 4 identity |

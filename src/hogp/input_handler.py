@@ -9,7 +9,7 @@ import logging
 import threading
 from typing import Optional, Callable
 import evdev
-from evdev import InputDevice, ecodes, categorize
+from evdev import InputDevice, ecodes, categorize, ff
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,11 @@ class InputHandler:
         # D-pad state (for converting hat axes to buttons)
         self._dpad_x = 0  # -1 left, 0 center, 1 right
         self._dpad_y = 0  # -1 up, 0 center, 1 down
+
+        # Force feedback (host rumble -> Deck haptics)
+        self._ff_lock = threading.Lock()
+        self._ff_effect_id: Optional[int] = None
+        self._ff_supported: Optional[bool] = None
 
     def find_gamepad_device(self) -> Optional[str]:
         """
@@ -219,6 +224,13 @@ class InputHandler:
             self._thread.join(timeout=1.0)
         
         if self._device:
+            if self._ff_effect_id is not None:
+                try:
+                    self._device.write(ecodes.EV_FF, self._ff_effect_id, 0)
+                    self._device.erase_effect(self._ff_effect_id)
+                except Exception:
+                    pass
+                self._ff_effect_id = None
             try:
                 self._device.ungrab()
             except:
@@ -227,6 +239,48 @@ class InputHandler:
             self._device = None
         
         logger.info("Input handler stopped")
+
+    # -- force feedback (rumble from the host -> Deck haptics) ---------------
+
+    MAX_RUMBLE_MS = 10000  # cap "loop forever" requests; hosts refresh rumble
+
+    def rumble(self, strong: float, weak: float, duration_ms: int) -> bool:
+        """Play (or stop, when both magnitudes are 0) a rumble effect on the
+        forwarded device. The Deck's hid-steam driver maps FF_RUMBLE onto
+        its haptic actuators; Steam's virtual pad forwards it the same way.
+        Best effort: returns False when the device has no FF support."""
+        dev = self._device
+        if dev is None:
+            return False
+        try:
+            if self._ff_supported is None:
+                self._ff_supported = ecodes.FF_RUMBLE in dev.capabilities().get(ecodes.EV_FF, [])
+                if not self._ff_supported:
+                    logger.info("Input device has no FF_RUMBLE support — host rumble ignored")
+            if not self._ff_supported:
+                return False
+            with self._ff_lock:
+                if strong <= 0 and weak <= 0:
+                    if self._ff_effect_id is not None:
+                        dev.write(ecodes.EV_FF, self._ff_effect_id, 0)
+                    return True
+                effect = ff.Effect(
+                    ecodes.FF_RUMBLE,
+                    -1 if self._ff_effect_id is None else self._ff_effect_id,
+                    0,
+                    ff.Trigger(0, 0),
+                    ff.Replay(max(1, min(int(duration_ms), self.MAX_RUMBLE_MS)), 0),
+                    ff.EffectType(ff_rumble_effect=ff.Rumble(
+                        strong_magnitude=int(max(0.0, min(1.0, strong)) * 0xFFFF),
+                        weak_magnitude=int(max(0.0, min(1.0, weak)) * 0xFFFF),
+                    )),
+                )
+                self._ff_effect_id = dev.upload_effect(effect)
+                dev.write(ecodes.EV_FF, self._ff_effect_id, 1)
+            return True
+        except Exception as e:
+            logger.debug(f"rumble failed: {e}")
+            return False
 
     def _read_loop(self) -> None:
         """Main loop for reading input events."""

@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hogp.api import (
     STATUS_STOPPED, STATUS_STARTING, STATUS_STOPPING, STATUS_ACTIVE,
     STATUS_ERROR, STATUS_DEGRADED,
-    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD,
+    MODE_BLUETOOTH, MODE_USB, PROFILE_GAMEPAD, PROFILE_KEYBOARD, PROFILE_XBOX,
     KEY_STATUS, KEY_MODE, KEY_PROFILE, KEY_DETAIL, KEY_ERROR, KEY_CONN,
     KEY_PAIRED, KEY_TRUSTED, KEY_INPUT, KEY_DEVICE_NAME, KEY_DEVICE_ADDR,
     KEY_READY, KEY_KB_CAPABLE, KEY_BUTTONS, KEY_AXES, KEY_TRIGGERS, KEY_HAT,
@@ -710,12 +710,16 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         profile_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         profile_box.set_halign(Gtk.Align.CENTER)
         profile_box.append(Gtk.Label(label="Profile:"))
-        self.gamepad_radio = Gtk.CheckButton(label="Gamepad (macOS)")
-        self.gamepad_radio.set_active(True)
+        self.xbox_radio = Gtk.CheckButton(label="Xbox (BT)")
+        self.xbox_radio.set_active(True)
+        self.xbox_radio.connect("toggled", self._on_xbox_toggled)
+        profile_box.append(self.xbox_radio)
+        self.gamepad_radio = Gtk.CheckButton(label="Pro / DS4")
+        self.gamepad_radio.set_group(self.xbox_radio)
         self.gamepad_radio.connect("toggled", self._on_gamepad_toggled)
         profile_box.append(self.gamepad_radio)
         self.keyboard_radio = Gtk.CheckButton(label="Keyboard")
-        self.keyboard_radio.set_group(self.gamepad_radio)
+        self.keyboard_radio.set_group(self.xbox_radio)
         self.keyboard_radio.connect("toggled", self._on_keyboard_toggled)
         profile_box.append(self.keyboard_radio)
         main_box.append(profile_box)
@@ -784,10 +788,19 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _on_wired_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Mode: Wired USB")
+            if self.xbox_radio.get_active():
+                self.gamepad_radio.set_active(True)  # USB gamepad = DUALSHOCK 4
 
     def _on_gamepad_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: Gamepad")
+
+    def _on_xbox_toggled(self, button):
+        if button.get_active() and self._radios_enabled():
+            logger.info("Profile: Xbox")
+            if self.wired_radio.get_active():
+                # Xbox is Bluetooth-only; USB gamepad is the DUALSHOCK 4.
+                self.bluetooth_radio.set_active(True)
 
     def _on_keyboard_toggled(self, button):
         if button.get_active() and self._radios_enabled():
@@ -797,6 +810,8 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         return MODE_BLUETOOTH if self.bluetooth_radio.get_active() else MODE_USB
 
     def _selected_profile(self) -> str:
+        if self.xbox_radio.get_active():
+            return PROFILE_XBOX
         return PROFILE_GAMEPAD if self.gamepad_radio.get_active() else PROFILE_KEYBOARD
 
     # ------------------------------------------------------------ callbacks
@@ -900,7 +915,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         elif st == STATUS_ACTIVE:
             mode = status.get(KEY_MODE)
             profile = status.get(KEY_PROFILE)
-            if mode == MODE_BLUETOOTH and profile == PROFILE_GAMEPAD:
+            if mode == MODE_BLUETOOTH and profile == PROFILE_XBOX:
+                self.device_info_label.set_label(
+                    "macOS: System Settings → Bluetooth → Xbox Wireless Controller → "
+                    "Connect, accept the pairing request. Game Controllers and Steam "
+                    "will list an Xbox controller; rumble plays on the Deck."
+                )
+            elif mode == MODE_BLUETOOTH and profile == PROFILE_GAMEPAD:
                 self.device_info_label.set_label(
                     "macOS: System Settings → Bluetooth → Pro Controller → Connect, "
                     "accept the pairing request. Game Controllers will then list a "
@@ -964,7 +985,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
 
     def _set_controls_locked(self, locked: bool) -> None:
         for radio in (self.bluetooth_radio, self.wired_radio,
-                      self.gamepad_radio, self.keyboard_radio):
+                      self.xbox_radio, self.gamepad_radio, self.keyboard_radio):
             radio.set_sensitive(not locked)
 
 
