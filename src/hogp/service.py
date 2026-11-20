@@ -1476,6 +1476,10 @@ class EmulatorService:
             gatt = self._session.get("gatt") if self._session else None
             if gatt is not None:
                 notifying = gatt.notifying
+            if self._profile == PROFILE_XBOX and (self._paired or self._trusted):
+                # A bonded host reconnects without re-subscribing (its CCC
+                # persists); the Xbox engine streams regardless.
+                notifying = True
             if notifying:
                 if self._paired or self._trusted:
                     self._conn = "✓ Paired — sending HID data"

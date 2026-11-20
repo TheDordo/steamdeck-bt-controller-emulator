@@ -54,6 +54,12 @@ XBOX_APPEARANCE = 0x03C4   # BLE Appearance: HID Gamepad
 # PnP ID: vendor ID source 0x02 (USB-IF), VID, PID, version (all LE)
 XBOX_PNP_ID = struct.pack("<BHHH", 0x02, XBOX_VENDOR_ID, XBOX_PRODUCT_ID, XBOX_VERSION)
 
+# Fixed GATT service handles, far above BlueZ's own GAP/GATT/DIS services
+# (which sit at the bottom of the table) with room to grow.
+HID_SERVICE_HANDLE = 0x0100
+DIS_SERVICE_HANDLE = 0x0180
+BATTERY_SERVICE_HANDLE = 0x01C0
+
 INPUT_REPORT_ID = 0x01
 RUMBLE_REPORT_ID = 0x03
 INPUT_REPORT_LEN = 16      # GATT value length (without the report ID)
@@ -186,6 +192,7 @@ _SERVICE_XML = f"""
     <property name="UUID" type="s" access="read"/>
     <property name="Primary" type="b" access="read"/>
     <property name="Characteristics" type="ao" access="read"/>
+    <property name="Handle" type="q" access="readwrite"/>
   </interface>
 </node>"""
 
@@ -194,6 +201,7 @@ _PROPS_XML = f"""
   <interface name="{DBUS_PROPS_IFACE}">
     <method name="Get"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
     <method name="GetAll"><arg type="s" direction="in"/><arg type="a{{sv}}" direction="out"/></method>
+    <method name="Set"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/></method>
     <signal name="PropertiesChanged">
       <arg type="s"/><arg type="a{{sv}}"/><arg type="as"/>
     </signal>
@@ -327,7 +335,8 @@ class XboxGattApplication:
         self._protocol_mode = 0x01
         self._battery_level = 100
 
-        self._notifying = False
+        self._notifying = False         # host called StartNotify (status only)
+        self._streaming = False         # emit reports (from registration on)
         self._battery_notifying = False
         self._last_report: bytes = build_input_report(0, self._axes, self._triggers, 8)
         self._last_sent_ms = 0
@@ -374,7 +383,7 @@ class XboxGattApplication:
         percent = max(0, min(100, int(percent)))
         if percent != self._battery_level:
             self._battery_level = percent
-            if self._battery_notifying:
+            if self._streaming or self._battery_notifying:
                 self._emit_value(f"{self.APP_PATH}/service2/char0", bytes([percent]))
 
     # -- tree -----------------------------------------------------------------
@@ -386,11 +395,18 @@ class XboxGattApplication:
         bat = f"{root}/service2"
         p = lambda *parts: "/".join(parts)
 
-        def svc(path, uuid, chars):
+        def svc(path, uuid, chars, handle):
+            # Fixed service handles: BlueZ then allocates the characteristics
+            # sequentially inside, so the attribute table is IDENTICAL on
+            # every registration. macOS caches handles per bonded device and
+            # does not reliably re-discover — after a bluetoothd restart
+            # (e.g. Steam taking over Bluetooth in Game Mode) shifted handles
+            # made it read garbage VID/PID, no battery and no input.
             self._add(_Attr(path, GATT_SERVICE_IFACE, {
                 "UUID": GLib.Variant("s", uuid),
                 "Primary": GLib.Variant("b", True),
                 "Characteristics": GLib.Variant("ao", chars),
+                "Handle": GLib.Variant("q", handle),
             }))
 
         def char(path, service, uuid, flags, descs=(), **handlers):
@@ -410,7 +426,7 @@ class XboxGattApplication:
 
         # HID service
         hid_chars = [p(hid, f"char{i}") for i in range(6)]
-        svc(hid, HID_SERVICE_UUID, hid_chars)
+        svc(hid, HID_SERVICE_UUID, hid_chars, HID_SERVICE_HANDLE)
         char(hid_chars[0], hid, HID_INFO_UUID, ENC_READ, read=lambda: HID_INFO)
         char(hid_chars[1], hid, REPORT_MAP_UUID, ENC_READ, read=lambda: XBOX_REPORT_MAP)
         char(hid_chars[2], hid, HID_CONTROL_POINT_UUID, CONTROL_POINT_FLAGS,
@@ -433,14 +449,14 @@ class XboxGattApplication:
         # Device Information service — the PnP ID here is what makes the
         # host load its Xbox driver.
         dis_chars = [p(dis, f"char{i}") for i in range(3)]
-        svc(dis, DEVICE_INFO_SERVICE_UUID, dis_chars)
+        svc(dis, DEVICE_INFO_SERVICE_UUID, dis_chars, DIS_SERVICE_HANDLE)
         char(dis_chars[0], dis, MANUFACTURER_NAME_UUID, ["read"], read=lambda: b"Microsoft")
         char(dis_chars[1], dis, MODEL_NUMBER_UUID, ["read"], read=lambda: b"1914")
         char(dis_chars[2], dis, PNP_ID_UUID, ["read"], read=lambda: XBOX_PNP_ID)
 
         # Battery service (Deck battery)
         bat_char = p(bat, "char0")
-        svc(bat, BATTERY_SERVICE_UUID, [bat_char])
+        svc(bat, BATTERY_SERVICE_UUID, [bat_char], BATTERY_SERVICE_HANDLE)
         char(bat_char, bat, BATTERY_LEVEL_UUID, BATTERY_FLAGS,
              read=lambda: bytes([self._battery_level]),
              start_notify=lambda: setattr(self, "_battery_notifying", True),
@@ -473,6 +489,16 @@ class XboxGattApplication:
                 self._registrations.append(self.bus.register_object(
                     attr.path, props_iface, self._handle_call, None, None))
             logger.info("Xbox GATT objects registered under %s", self.APP_PATH)
+            # Stream from the start instead of waiting for StartNotify: a
+            # bonded host does NOT re-write the CCC on reconnect (the spec
+            # says the server persists it), and BlueZ keeps that CCC state
+            # but never re-calls StartNotify on an app that re-registered
+            # (daemon restart, Steam restarting bluetoothd in Game Mode).
+            # Gating on StartNotify left such hosts connected but silent.
+            # BlueZ only forwards notifications to subscribed clients, so
+            # emitting with nobody subscribed costs one D-Bus signal.
+            self._streaming = True
+            self._ensure_keepalive()
             return True
         except Exception as e:
             logger.error("Failed to register Xbox GATT objects: %s", e)
@@ -514,6 +540,9 @@ class XboxGattApplication:
                         invoc.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", prop)
                 elif method == "GetAll":
                     invoc.return_value(GLib.Variant("(a{sv})", (attr.props,)))
+                elif method == "Set":
+                    # BlueZ writes back allocated handles; ours are fixed.
+                    invoc.return_value(None)
                 else:
                     invoc.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
                 return
@@ -567,20 +596,28 @@ class XboxGattApplication:
     def _start_report_notify(self) -> None:
         logger.info("Xbox: host subscribed to input reports")
         self._notifying = True
+        self._streaming = True
         self._send_report(force=True)
-        if self._keepalive_source is None:
-            self._keepalive_source = GLib.timeout_add(KEEPALIVE_INTERVAL_MS, self._keepalive)
+        self._ensure_keepalive()
         if self._on_notify_start:
             self._on_notify_start()
 
     def _stop_report_notify(self) -> None:
+        # Keep streaming: BlueZ calls StopNotify when the LAST subscriber
+        # leaves, but a bonded host's CCC state survives disconnects and it
+        # will expect reports again on reconnect without re-subscribing.
         logger.info("Xbox: host unsubscribed from input reports")
-        self.stop_notify()
+        self._notifying = False
         if self._on_notify_stop:
             self._on_notify_stop()
 
+    def _ensure_keepalive(self) -> None:
+        if self._keepalive_source is None:
+            self._keepalive_source = GLib.timeout_add(KEEPALIVE_INTERVAL_MS, self._keepalive)
+
     def stop_notify(self) -> None:
         self._notifying = False
+        self._streaming = False
         self._battery_notifying = False
         for attr in ("_keepalive_source", "_flush_source"):
             src = getattr(self, attr)
@@ -589,7 +626,7 @@ class XboxGattApplication:
                 setattr(self, attr, None)
 
     def _keepalive(self) -> bool:
-        if not self._notifying:
+        if not self._streaming:
             self._keepalive_source = None
             return False
         if self._now_ms() - self._last_sent_ms >= KEEPALIVE_INTERVAL_MS:
@@ -600,7 +637,7 @@ class XboxGattApplication:
         self._last_report = build_input_report(
             self._buttons, self._axes, self._triggers, self._hat,
         )
-        if self._notifying:
+        if self._streaming:
             self._send_report()
 
     def _send_report(self, force: bool = False) -> None:
@@ -616,7 +653,7 @@ class XboxGattApplication:
 
     def _flush(self) -> bool:
         self._flush_source = None
-        if self._notifying:
+        if self._streaming:
             self._send_report(force=True)
         return False
 
