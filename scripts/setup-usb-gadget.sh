@@ -168,8 +168,19 @@ if [ "$PROFILE" = "xbox" ]; then
     exit 0
 fi
 
-# Create HID functions (3 separate interfaces for gamepad, keyboard, mouse)
-echo "Creating HID functions..."
+# Gamepad identities (ds4/pro) are gamepad-only, like the real controllers
+# (and like the xbox profile). Extra keyboard/mouse interfaces under a
+# Sony/Nintendo VID:PID get claimed by macOS's DS4/Switch drivers along with
+# the gamepad: the Switch driver writes its 0x80 handshake to every
+# interface, the keyboard's OUT endpoint (never read) NAKs forever, and the
+# Mac's HID event system stalls — no input from ANY device. Only the generic
+# profile carries keyboard + mouse.
+if [ "$PROFILE" = "generic" ]; then
+    HID_FUNCS="hid.usb0 hid.usb1 hid.usb2"
+else
+    HID_FUNCS="hid.usb0"
+fi
+echo "Creating HID functions (${HID_FUNCS})..."
 
 # Function 1: Gamepad
 mkdir -p functions/hid.usb0
@@ -177,37 +188,44 @@ echo 0 > functions/hid.usb0/protocol   # 0 = none (gamepad is not boot keyboard/
 echo 0 > functions/hid.usb0/subclass  # 0 = no subclass
 echo "${GAMEPAD_REPORT_LENGTH}" > functions/hid.usb0/report_length  # Must match exact write() size to /dev/hidg0
 
-# Function 2: Keyboard
-mkdir -p functions/hid.usb1
-echo 1 > functions/hid.usb1/protocol  # 1 = keyboard
-echo 1 > functions/hid.usb1/subclass  # 1 = boot interface
-echo 8 > functions/hid.usb1/report_length  # Keyboard report size (8 bytes without Report ID)
+if [ "$PROFILE" = "generic" ]; then
+    # Function 2: Keyboard
+    mkdir -p functions/hid.usb1
+    echo 1 > functions/hid.usb1/protocol  # 1 = keyboard
+    echo 1 > functions/hid.usb1/subclass  # 1 = boot interface
+    echo 8 > functions/hid.usb1/report_length  # Keyboard report size (8 bytes without Report ID)
 
-# Function 3: Mouse
-mkdir -p functions/hid.usb2
-echo 2 > functions/hid.usb2/protocol  # 2 = mouse
-echo 1 > functions/hid.usb2/subclass  # 1 = boot interface
-echo 6 > functions/hid.usb2/report_length  # Mouse report size (6 bytes without Report ID)
+    # Function 3: Mouse
+    mkdir -p functions/hid.usb2
+    echo 2 > functions/hid.usb2/protocol  # 2 = mouse
+    echo 1 > functions/hid.usb2/subclass  # 1 = boot interface
+    echo 6 > functions/hid.usb2/report_length  # Mouse report size (6 bytes without Report ID)
+fi
 
 # Reduce the interrupt endpoint polling interval where the kernel supports it
 # (f_hid poll_interval sysfs attribute, ms; ignored on kernels without it).
-for f in functions/hid.usb0/poll_interval functions/hid.usb1/poll_interval functions/hid.usb2/poll_interval; do
-    if [ -f "$f" ]; then
-        echo 1 > "$f" 2>/dev/null || true
+for fn in ${HID_FUNCS}; do
+    if [ -f "functions/${fn}/poll_interval" ]; then
+        echo 1 > "functions/${fn}/poll_interval" 2>/dev/null || true
     fi
 done
 
 # Write HID report descriptors using Python script
 echo "Writing HID report descriptors..."
-python3 "${SCRIPT_DIR}/write-hid-descriptors.py" --profile "${PROFILE}" \
-    "${GADGET_DIR}/functions/hid.usb0/report_desc" \
-    "${GADGET_DIR}/functions/hid.usb1/report_desc" \
-    "${GADGET_DIR}/functions/hid.usb2/report_desc"
+if [ "$PROFILE" = "generic" ]; then
+    python3 "${SCRIPT_DIR}/write-hid-descriptors.py" --profile "${PROFILE}" \
+        "${GADGET_DIR}/functions/hid.usb0/report_desc" \
+        "${GADGET_DIR}/functions/hid.usb1/report_desc" \
+        "${GADGET_DIR}/functions/hid.usb2/report_desc"
+else
+    python3 "${SCRIPT_DIR}/write-hid-descriptors.py" --profile "${PROFILE}" \
+        "${GADGET_DIR}/functions/hid.usb0/report_desc"
+fi
 
 # Link functions to configuration
-ln -s functions/hid.usb0 "configs/${CONFIG_NAME}/"
-ln -s functions/hid.usb1 "configs/${CONFIG_NAME}/"
-ln -s functions/hid.usb2 "configs/${CONFIG_NAME}/"
+for fn in ${HID_FUNCS}; do
+    ln -s "functions/${fn}" "configs/${CONFIG_NAME}/"
+done
 
 # Find available UDC
 echo "Finding UDC (USB Device Controller)..."
@@ -225,19 +243,25 @@ echo "Using UDC: ${UDC_DEVICE}"
 echo "Enabling USB gadget..."
 echo "${UDC_DEVICE}" > UDC
 
+# DS4/Pro: stay off the bus until the daemon has preloaded the GET_REPORT
+# answers (newer f_hid stalls ep0 2.5 s per unanswered GET_REPORT, and the
+# host's DS4/Switch drivers read several while the device starts). The
+# daemon writes "connect" once /dev/hidg0 is ready.
+if [ "$PROFILE" != "generic" ] && [ -w "/sys/class/udc/${UDC_DEVICE}/soft_connect" ]; then
+    echo disconnect > "/sys/class/udc/${UDC_DEVICE}/soft_connect" 2>/dev/null || true
+    echo "Held off the bus until the daemon is ready (soft_connect)."
+fi
+
 # Wait for devices to appear
 sleep 1
 echo "UDC bound to: $(cat UDC 2>/dev/null || echo 'NONE — check the cable and BIOS DRD')"
 
 # Check if HID devices were created
-if [ -c /dev/hidg0 ] && [ -c /dev/hidg1 ] && [ -c /dev/hidg2 ]; then
-    echo "✓ USB HID gadget devices created successfully!"
-    echo "  - /dev/hidg0 (Gamepad, ${PROFILE})"
-    echo "  - /dev/hidg1 (Keyboard)"
-    echo "  - /dev/hidg2 (Mouse)"
+if [ -c /dev/hidg0 ]; then
+    echo "✓ USB HID gadget devices created:"
     ls -l /dev/hidg*
 else
-    echo "Warning: Not all HID devices created yet. They may take a few seconds."
+    echo "Warning: /dev/hidg0 not created yet. It may take a few seconds."
 fi
 
 # Set permissions for hidg devices
@@ -251,11 +275,14 @@ echo "${PROFILE}" > /tmp/steamdeck_hid.profile
 echo
 echo "=== USB Gadget HID Setup Complete ==="
 echo
-echo "The Steam Deck will now appear as 3 separate USB HID devices when connected via USB-C."
-echo "Write HID reports to:"
-echo "  - /dev/hidg0 for gamepad input"
-echo "  - /dev/hidg1 for keyboard input"
-echo "  - /dev/hidg2 for mouse input"
+if [ "$PROFILE" = "generic" ]; then
+    echo "The Steam Deck now appears as 3 USB HID interfaces:"
+    echo "  - /dev/hidg0 for gamepad input"
+    echo "  - /dev/hidg1 for keyboard input"
+    echo "  - /dev/hidg2 for mouse input"
+else
+    echo "The Steam Deck now appears as a single gamepad interface (/dev/hidg0)."
+fi
 if [ "$PROFILE" = "ds4" ]; then
     echo
     echo "Gamepad presents as a DUALSHOCK 4 (054C:05C4) — macOS Game Controllers"

@@ -39,7 +39,63 @@ GADGET_HID_WRITE_GET_REPORT = (1 << 30) | (struct.calcsize(_HIDG_REPORT_FMT) << 
 # Stable "device MAC" for the wired DS4 (shown by SDL/Steam as its serial).
 DS4_USB_MAC = bytes.fromhex("a01e0d000001")
 
+GADGET_DIR = "/sys/kernel/config/usb_gadget/steamdeck_hid"
+
 logger = logging.getLogger(__name__)
+
+
+def report_sizes(descriptor: bytes) -> dict:
+    """{report_id: largest report size in bytes INCLUDING the ID byte}
+    over the Input/Output/Feature reports of a HID report descriptor.
+    A descriptor without Report ID items yields {0: size}."""
+    bits: dict = {}
+    size = count = rid = 0
+    stack = []
+    i = 0
+    while i < len(descriptor):
+        b = descriptor[i]
+        if b == 0xFE:  # long item
+            i += 3 + (descriptor[i + 1] if i + 1 < len(descriptor) else 0)
+            continue
+        n = (0, 1, 2, 4)[b & 0x03]
+        val = int.from_bytes(descriptor[i + 1:i + 1 + n], "little")
+        kind, tag = (b >> 2) & 0x03, b >> 4
+        if kind == 1:            # global
+            if tag == 0x7:
+                size = val
+            elif tag == 0x9:
+                count = val
+            elif tag == 0x8:
+                rid = val
+            elif tag == 0xA:
+                stack.append((size, count, rid))
+            elif tag == 0xB and stack:
+                size, count, rid = stack.pop()
+        elif kind == 0 and tag in (0x8, 0x9, 0xB):   # Input / Output / Feature
+            key = (tag, rid)
+            bits[key] = bits.get(key, 0) + size * count
+        i += 1 + n
+    out: dict = {}
+    for (_tag, r), nbits in bits.items():
+        nbytes = (nbits + 7) // 8 + (1 if r else 0)
+        out[r] = max(out.get(r, 0), nbytes)
+    return out
+
+
+def set_soft_connect(connect: bool) -> bool:
+    """Attach/detach the gadget from the bus without unbinding it
+    (/sys/class/udc/<udc>/soft_connect). False when unavailable."""
+    try:
+        with open(f"{GADGET_DIR}/UDC") as f:
+            udc = f.read().strip()
+        if not udc:
+            return False
+        with open(f"/sys/class/udc/{udc}/soft_connect", "w") as f:
+            f.write("connect" if connect else "disconnect")
+        return True
+    except OSError as e:
+        logger.debug("soft_connect %s: %s", connect, e)
+        return False
 
 # Absolute floor between gamepad writes. The host polls the interrupt endpoint
 # at sub-millisecond intervals on high-speed links, so 1 ms is only a guard
@@ -161,7 +217,7 @@ class USBGadgetHID:
 
             self._active = True
             logger.info("USB gadget HID opened successfully")
-            self._preload_ds4_feature_reports()
+            self._preload_get_reports()
             self._start_ds4_drain()
             if self.gamepad_profile == "pro":
                 from .usb_pro import UsbProController
@@ -215,26 +271,47 @@ class USBGadgetHID:
         logger.info("USB gadget HID closed")
 
     def _start_ds4_drain(self) -> None:
-        """Drain host->device output reports (rumble/lightbar) so the HID
-        queue never fills. Only meaningful for the DS4 descriptor."""
-        if self.gamepad_profile != "ds4" or self._gamepad_fd is None:
+        """Drain host->device OUT reports so f_hid keeps an OUT request
+        queued: f_hid only requeues an OUT request once userspace read() it,
+        so after 4 unread reports the endpoint NAKs every further host write
+        and the host's setReport blocks (on macOS that stalls the HID event
+        system — keyboard LED sync goes to every keyboard).
+
+        DS4 gamepad: rumble/light bar (0x05). Keyboard: LED reports. The Pro
+        engine reads hidg0 itself."""
+        fds = []
+        if self.gamepad_profile == "ds4" and self._gamepad_fd is not None:
+            fds.append(self._gamepad_fd)
+        if self._keyboard_fd is not None:
+            fds.append(self._keyboard_fd)
+        if not fds:
             return
         self._ds4_drain_stop.clear()
 
         def drain():
-            fd = self._gamepad_fd
-            while not self._ds4_drain_stop.is_set():
+            import select
+            live = list(fds)
+            while live and not self._ds4_drain_stop.is_set():
                 try:
-                    data = os.read(fd, 128)
-                    if self.verbose and data:
-                        logger.debug(f"DS4 host output report: {data.hex()}")
-                    if data:
-                        self._handle_ds4_output(data)
-                except BlockingIOError:
-                    pass
-                except OSError:
+                    ready, _, _ = select.select(live, [], [], 0.2)
+                except (OSError, ValueError):
                     break
-                time.sleep(0.01)
+                for fd in ready:
+                    try:
+                        data = os.read(fd, 128)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        live.remove(fd)
+                        continue
+                    if not data:
+                        continue
+                    if fd == self._gamepad_fd:
+                        if self.verbose:
+                            logger.debug(f"DS4 host output report: {data.hex()}")
+                        self._handle_ds4_output(data)
+                    elif self.verbose:
+                        logger.debug(f"Keyboard LED report: {data.hex()}")
 
         self._ds4_drain_thread = threading.Thread(target=drain, daemon=True)
         self._ds4_drain_thread.start()
@@ -355,39 +432,57 @@ class USBGadgetHID:
             return
         self._send_gamepad_report()
 
-    def _preload_ds4_feature_reports(self) -> None:
-        """Answer the host's DS4 feature-report reads (calibration 0x02,
-        MAC 0x81, pairing 0x12, firmware 0xA3).
+    def _gamepad_descriptor(self) -> bytes:
+        if self.gamepad_profile == "ds4":
+            from .ds4 import DS4_REPORT_DESCRIPTOR
+            return DS4_REPORT_DESCRIPTOR
+        if self.gamepad_profile == "pro":
+            from .pro_controller import PRO_HID_REPORT_DESCRIPTOR
+            return PRO_HID_REPORT_DESCRIPTOR
+        return b""
 
-        f_hid answers GET_REPORT itself: before the GADGET_HID_WRITE_GET_REPORT
-        ioctl (newer kernels) it always returned ALL ZEROS — the host then
-        reads zero calibration (divide-by-zero in its motion math) and a
-        zero MAC. With the ioctl, each report is preloaded once
-        (userspace_req=0 = answer immediately, every time)."""
-        if self._ds4 is None or self._gamepad_fd is None:
+    def _preload_get_reports(self) -> None:
+        """Preload a GET_REPORT answer for EVERY report ID of the gamepad
+        descriptor (newer kernels: GADGET_HID_WRITE_GET_REPORT).
+
+        On those kernels f_hid no longer answers GET_REPORT itself: for an ID
+        with nothing preloaded it holds ep0 for 2.5 s waiting on userspace,
+        then sends zeros. The host's DS4/Switch drivers read feature/input
+        reports while starting the device, so every miss stalls the whole
+        device's control pipe (macOS gives up on the accessory). DS4
+        calibration/MAC/pairing/firmware get real contents; every other ID
+        gets [id] + zeros. userspace_req=0: answer immediately, every time."""
+        if self._gamepad_fd is None:
             return
+        desc = self._gamepad_descriptor()
+        sizes = report_sizes(desc) if desc else {}
         loaded = []
-        for rid in (DS4_FEATURE_CALIBRATION, DS4_FEATURE_MAC_USB,
-                    DS4_FEATURE_PAIRING_INFO, DS4_FEATURE_FIRMWARE):
-            data = build_feature_report(rid, bluetooth=False, device_mac=DS4_USB_MAC)
+        for rid, size in sorted(sizes.items()):
+            data = None
+            if self._ds4 is not None:
+                if rid in (DS4_FEATURE_CALIBRATION, DS4_FEATURE_MAC_USB,
+                           DS4_FEATURE_PAIRING_INFO, DS4_FEATURE_FIRMWARE):
+                    data = build_feature_report(rid, bluetooth=False, device_mac=DS4_USB_MAC)
+                elif rid == 0x01:
+                    data = self._ds4.build()
             if data is None:
-                continue
+                data = (bytes([rid]) if rid else b"") + bytes(max(0, size - (1 if rid else 0)))
+            data = data[:64]
             buf = bytearray(struct.pack(_HIDG_REPORT_FMT, rid, 0, len(data), data))
             try:
                 fcntl.ioctl(self._gamepad_fd, GADGET_HID_WRITE_GET_REPORT, buf)
                 loaded.append(f"0x{rid:02x}")
             except OSError as e:
                 if e.errno in (errno.ENOTTY, errno.EINVAL):
-                    logger.warning(
-                        "This kernel's USB HID gadget cannot serve feature reports "
-                        "(no GADGET_HID_WRITE_GET_REPORT): the host reads all-zero "
-                        "DS4 calibration/MAC/firmware. Buttons, sticks, touchpad and "
-                        "rumble still work; motion calibration may be off."
+                    logger.info(
+                        "Kernel f_hid has no GADGET_HID_WRITE_GET_REPORT: it answers "
+                        "GET_REPORT with zeros itself (DS4 motion calibration may be off)."
                     )
                 else:
-                    logger.warning("Preloading DS4 feature report 0x%02x failed: %s", rid, e)
+                    logger.warning("Preloading GET_REPORT 0x%02x failed: %s", rid, e)
                 return
-        logger.info("DS4 feature reports preloaded for GET_REPORT: %s", ", ".join(loaded))
+        logger.info("GET_REPORT answers preloaded for %d report IDs: %s",
+                    len(loaded), ", ".join(loaded))
 
     def _deferred_flush(self) -> None:
         self._flush_pending = False

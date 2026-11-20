@@ -891,17 +891,36 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
         controller_scroll.set_child(self.visualizer)
         notebook.append_page(controller_scroll, Gtk.Label(label="Controller"))
 
+        # Keyboard / Media / Trackpad tabs need the keyboard+mouse interfaces,
+        # which only the Keyboard profile has: grayed out (with a tooltip and
+        # a notice on the page) for the gamepad identities.
+        self._kb_tabs = []   # (tab label, page content, notice label)
+
+        def kb_tab(content, title):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            notice = Gtk.Label()
+            notice.set_wrap(True)
+            notice.set_margin_top(8)
+            notice.add_css_class("dim-label")
+            notice.set_visible(False)
+            page.append(notice)
+            content.set_vexpand(True)
+            page.append(content)
+            label = Gtk.Label(label=title)
+            notebook.append_page(page, label)
+            self._kb_tabs.append((label, content, notice))
+
         # Keyboard tab
         self.keyboard = VirtualKeyboard(self._send_key_via_daemon, self._get_cached_status)
-        notebook.append_page(self.keyboard, Gtk.Label(label="Keyboard"))
+        kb_tab(self.keyboard, "Keyboard")
 
         # Media controls tab
         self.media = VirtualMediaControls(self._send_key_via_daemon, self._get_cached_status)
-        notebook.append_page(self.media, Gtk.Label(label="Media"))
+        kb_tab(self.media, "Media")
 
         # Trackpad tab
         self.trackpad = VirtualTrackpad(self._send_mouse_via_daemon, self._get_cached_status)
-        notebook.append_page(self.trackpad, Gtk.Label(label="Trackpad"))
+        kb_tab(self.trackpad, "Trackpad")
 
         main_box.append(notebook)
 
@@ -927,26 +946,64 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
     def _on_bluetooth_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Mode: Bluetooth")
+        self._update_kb_availability()
 
     def _on_wired_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Mode: Wired USB")
+        self._update_kb_availability()
 
     def _on_gamepad_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: Pro Controller")
+        self._update_kb_availability()
 
     def _on_ds4_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: DS4")
+        self._update_kb_availability()
 
     def _on_xbox_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: Xbox")
+        self._update_kb_availability()
 
     def _on_keyboard_toggled(self, button):
         if button.get_active() and self._radios_enabled():
             logger.info("Profile: Keyboard")
+        self._update_kb_availability()
+
+    KB_UNAVAILABLE_TIP = (
+        "Not available with the {name} profile: it presents only a gamepad, "
+        "like the real controller. Pick the Keyboard profile for keyboard, "
+        "media keys and trackpad."
+    )
+
+    def _update_kb_availability(self) -> None:
+        """Gray out keyboard/mouse features unless the profile has them —
+        the running session's profile, else the selected one."""
+        if not hasattr(self, "_kb_tabs"):
+            return  # radios fire toggled during construction
+        status = self._status or {}
+        running = status.get(KEY_STATUS) in (STATUS_STARTING, STATUS_ACTIVE, STATUS_DEGRADED)
+        profile = status.get(KEY_PROFILE) if running and status.get(KEY_PROFILE) else self._selected_profile()
+        available = profile == PROFILE_KEYBOARD
+        name = {PROFILE_XBOX: "Xbox", PROFILE_DS4: "DS4", PROFILE_GAMEPAD: "Pro"}.get(profile, str(profile))
+        tip = None if available else self.KB_UNAVAILABLE_TIP.format(name=name)
+        for label, content, notice in self._kb_tabs:
+            content.set_sensitive(available)
+            label.set_tooltip_text(tip)
+            if available:
+                label.remove_css_class("dim-label")
+            else:
+                label.add_css_class("dim-label")
+            notice.set_label(tip or "")
+            notice.set_visible(not available)
+        for button in (self.visualizer.home_button, self.visualizer.qam_button):
+            button.set_sensitive(available)
+            button.set_tooltip_text(
+                tip if tip else "Sends Ctrl+1 / Ctrl+2 over the keyboard interface"
+            )
 
     def _selected_mode(self) -> str:
         return MODE_BLUETOOTH if self.bluetooth_radio.get_active() else MODE_USB
@@ -1040,6 +1097,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             self._set_controls_locked(False)
             self.start_button.set_sensitive(True)
             self.stop_button.set_sensitive(False)
+            self._update_kb_availability()
             return
 
         st = status.get(KEY_STATUS)
@@ -1100,15 +1158,13 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
                 self.device_info_label.set_label(
                     "USB gamepad presents as a Switch Pro Controller (057E:2009). "
                     "Steam and Game Controllers run the Pro USB handshake; HD rumble "
-                    "plays on the Deck. HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, "
-                    "/dev/hidg2 mouse."
+                    "plays on the Deck. Gamepad only (/dev/hidg0), like the real controller."
                 )
             elif mode == MODE_USB and profile == PROFILE_DS4:
                 self.device_info_label.set_label(
                     "USB gamepad presents as a DUALSHOCK 4 (054C:05C4). On the Mac "
                     "check System Settings → Game Controllers — a Wireless Controller "
-                    "should be listed. HID: /dev/hidg0 gamepad, /dev/hidg1 keyboard, "
-                    "/dev/hidg2 mouse on Deck."
+                    "should be listed. Gamepad only (/dev/hidg0), like the real controller."
                 )
             elif mode == MODE_USB:
                 self.device_info_label.set_label(
@@ -1163,6 +1219,7 @@ class HoGPeripheralGUI(Gtk.ApplicationWindow):
             status.get(KEY_LIGHTBAR, -1) if running_now else -1,
             bool(status.get(KEY_TOUCH_CAPABLE, False)) and running_now,
         )
+        self._update_kb_availability()
 
     def _radios_enabled(self) -> bool:
         return self.bluetooth_radio.get_sensitive()

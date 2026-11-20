@@ -10,7 +10,7 @@ Emulates a Bluetooth or **wired USB** gamepad / keyboard / trackpad peripheral t
 | Bluetooth (BR/EDR) | **DUALSHOCK 4** v2 ("Wireless Controller", 054C:09CC) — light bar shown on screen, on-screen touchpad, rumble on the Deck; **Deck works as a Bluetooth speaker** | not in this mode |
 | Bluetooth (BR/EDR) | **Nintendo Switch Pro Controller** ("Pro Controller") | not in this mode |
 | Bluetooth (LE) | — | HID-over-GATT gamepad/keyboard/mouse ("SteamDeckPad") |
-| Wired USB | **Xbox Series X\|S** (045E:0B12, GIP — macOS's built-in XboxGamepad driver), **DUALSHOCK 4** (054C:05C4) or **Switch Pro Controller** (057E:2009) | separate HID interfaces with DS4/Pro; none with Xbox (gamepad-only, like the real one) |
+| Wired USB | **Xbox Series X\|S** (045E:0B12, GIP — macOS's built-in XboxGamepad driver), **DUALSHOCK 4** (054C:05C4) or **Switch Pro Controller** (057E:2009) | none — gamepad-only, like the real controllers (the **Keyboard** profile has keyboard + mouse) |
 
 ![controller view](assets/controller-tab.png) ![keyboard view](assets/keyboard-tab.png) ![media view](assets/media-tab.png) ![trackpad view](assets/trackpad-tab.png)
 
@@ -168,7 +168,7 @@ Switching wired profiles rebuilds the gadget automatically — re-plug the cable
 1. **BIOS:** Shut down → hold **Volume +** + **Power** → Setup Utility → **Advanced** → **USB Configuration** → **USB Dual Role Device** → **DRD** → save and exit. Cold boot.
 2. Connect Deck to host with a **data** USB-C cable.
 3. In the app: **Wired USB** + **Gamepad (macOS)** → **Start Service**. The daemon configures the gadget itself (no password prompt).
-4. On the Mac: **System Settings → Game Controllers** — a **Wireless Controller** (DUALSHOCK 4) should appear. **System Report → USB** shows the composite device (054C:05C4) with gamepad, keyboard and mouse interfaces.
+4. On the Mac: **System Settings → Game Controllers** — a **Wireless Controller** (DUALSHOCK 4) should appear. **System Report → USB** shows 054C:05C4 with a single gamepad interface.
 
 The **Keyboard** profile keeps the generic gamepad identity for hosts that don't support DS4 descriptors.
 

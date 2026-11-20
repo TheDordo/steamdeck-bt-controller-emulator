@@ -63,7 +63,7 @@ from .ds4_bt import (
     DS4_SDP_RECORD_XML,
     Ds4BtEmulator,
 )
-from .usb_gadget import USBGadgetHID
+from .usb_gadget import USBGadgetHID, set_soft_connect
 from .usb_xbox import FFS_MOUNT, UsbXboxGip
 from .xbox import (
     XBOX_NAME,
@@ -467,9 +467,9 @@ class EmulatorService:
         if session is None:
             return False
         if session.get("mode") == MODE_USB:
-            # Wired Xbox is gamepad-only (like the real controller): no
-            # keyboard/mouse interfaces on that gadget.
-            return session.get("profile") != PROFILE_XBOX
+            # Wired Xbox/DS4/Pro are gamepad-only (like the real
+            # controllers): only the Keyboard profile has keyboard/mouse.
+            return session.get("profile") == PROFILE_KEYBOARD
         return session.get("profile") == PROFILE_KEYBOARD
 
     def _ready(self) -> bool:
@@ -1136,14 +1136,20 @@ class EmulatorService:
         try:
             profile_tag = USB_PROFILE_TAGS.get(session.get("profile"), "generic")
             need_setup = False
-            required = (
-                (f"{FFS_MOUNT}/ep0",) if profile_tag == "xbox"
-                else ("/dev/hidg0", "/dev/hidg1", "/dev/hidg2")
-            )
+            if profile_tag == "xbox":
+                required = (f"{FFS_MOUNT}/ep0",)
+            elif profile_tag == "generic":
+                required = ("/dev/hidg0", "/dev/hidg1", "/dev/hidg2")
+            else:
+                required = ("/dev/hidg0",)
             for dev in required:
                 if not os.path.exists(dev):
                     need_setup = True
                     break
+            # DS4/Pro gadgets are gamepad-only now: rebuild one left over
+            # from an older setup that still carries keyboard/mouse.
+            if profile_tag in ("ds4", "pro") and os.path.exists("/dev/hidg1"):
+                need_setup = True
             if not need_setup:
                 try:
                     with open("/tmp/steamdeck_hid.profile") as f:
@@ -1218,6 +1224,10 @@ class EmulatorService:
                 return
             session["usb"] = usb
             session["registered"] = True
+            if profile_tag in ("ds4", "pro"):
+                # setup-usb-gadget.sh held the gadget off the bus until the
+                # GET_REPORT answers were preloaded (USBGadgetHID.open).
+                set_soft_connect(True)
 
             if not session_valid():
                 usb.close()

@@ -150,13 +150,12 @@ def main():
         profile = args[1]
         args = args[2:]
 
-    if len(args) != 3:
-        print("Usage: write-hid-descriptors.py [--profile generic|ds4|pro] <gamepad_file> <keyboard_file> <mouse_file>")
+    # ds4/pro are gamepad-only gadgets: just the gamepad file.
+    if len(args) not in (1, 3):
+        print("Usage: write-hid-descriptors.py [--profile generic|ds4|pro] <gamepad_file> [<keyboard_file> <mouse_file>]")
         sys.exit(1)
 
     gamepad_file = args[0]
-    keyboard_file = args[1]
-    mouse_file = args[2]
 
     if profile == "ds4":
         gamepad_desc = DS4_REPORT_DESCRIPTOR
@@ -167,13 +166,15 @@ def main():
     else:
         # Extract each descriptor (Report ID 1=gamepad, 2=keyboard, 3=mouse)
         gamepad_desc = extract_descriptor(0x01)
-    keyboard_desc = extract_descriptor(0x02)
-    mouse_desc = extract_descriptor(0x03)
-
-    # Write to files
     with open(gamepad_file, 'wb') as f:
         f.write(gamepad_desc)
     print(f"Wrote {len(gamepad_desc)} bytes to {gamepad_file} (profile={profile})")
+
+    if len(args) == 1:
+        return
+    keyboard_file, mouse_file = args[1], args[2]
+    keyboard_desc = extract_descriptor(0x02)
+    mouse_desc = extract_descriptor(0x03)
 
     with open(keyboard_file, 'wb') as f:
         f.write(keyboard_desc)
